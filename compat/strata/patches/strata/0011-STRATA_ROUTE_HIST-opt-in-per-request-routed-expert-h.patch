@@ -1,0 +1,491 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Seabraid <seabraid@example.invalid>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH 11/16] STRATA_ROUTE_HIST: opt-in per-request routed-expert
+ histograms, plus card-1 own-work vs wait split in the decode timing line
+
+Unset = one load of a const bool at each counting site and a byte-identical timing line (route_hist_test runs the same
+binary with the variable set and unset).  Reader: tools/route_hist_report.py in the seabraid tree.
+---
+ cmake/strata_gpu_engine.cmake          |   7 ++
+ include/strata/core/remote_experts.hpp |   7 +-
+ include/strata/core/route_hist.hpp     | 131 +++++++++++++++++++++++++
+ src/core/expert_source.cpp             |   3 +
+ src/core/remote_experts.cpp            |   7 +-
+ src/prefill/prefill.cpp                |  13 +++
+ src/program/generate.cpp               |  34 ++++++-
+ tests/core/route_hist_test.cpp         |  82 ++++++++++++++++
+ 8 files changed, 277 insertions(+), 7 deletions(-)
+ create mode 100644 include/strata/core/route_hist.hpp
+ create mode 100644 tests/core/route_hist_test.cpp
+
+diff --git a/cmake/strata_gpu_engine.cmake b/cmake/strata_gpu_engine.cmake
+index ff55c12c8..6929c6cf0 100644
+--- a/cmake/strata_gpu_engine.cmake
++++ b/cmake/strata_gpu_engine.cmake
+@@ -355,6 +355,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     add_test(NAME remote_experts_seabraid_opt_test COMMAND remote_experts_seabraid_opt_test)
+     set_tests_properties(remote_experts_seabraid_opt_test PROPERTIES TIMEOUT 60)
+   endif()
++  # STRATA_ROUTE_HIST: the per-request routed-pair histogram.  The same binary twice: env set (counts and file) / unset (inert).
++  add_executable(route_hist_test tests/core/route_hist_test.cpp)
++  target_link_libraries(route_hist_test PRIVATE strata_engine)
++  add_test(NAME route_hist_on COMMAND route_hist_test on)
++  set_tests_properties(route_hist_on PROPERTIES ENVIRONMENT "STRATA_ROUTE_HIST=${CMAKE_CURRENT_BINARY_DIR}/route_hist_test_out" TIMEOUT 60)
++  add_test(NAME route_hist_off COMMAND route_hist_test off)
++  set_tests_properties(route_hist_off PROPERTIES ENVIRONMENT "STRATA_ROUTE_HIST=" TIMEOUT 60)
+   # #477: the learned expert profile (--expert-profile-save): its order and make_profile.py's file format (CPU only)
+   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/expert_profile_save_test.cpp")
+     enable_testing()
+diff --git a/include/strata/core/remote_experts.hpp b/include/strata/core/remote_experts.hpp
+index 33aa9efc5..2cfee6383 100644
+--- a/include/strata/core/remote_experts.hpp
++++ b/include/strata/core/remote_experts.hpp
+@@ -9,6 +9,7 @@
+ #include <memory>
+ 
+ #include <atomic>
++#include <chrono>
+ #include <cstdint>
+ #include <mutex>
+ #include <thread>
+@@ -63,6 +64,9 @@ public:
+     /// host time spent in begin() (staging + launches) and in finish() (waiting for this GPU), cumulative
+     double ms_begin() const { return ms_begin_; }
+     double ms_wait() const { return ms_wait_; }
++    /// STRATA_ROUTE_HIST only: host time between begin() returning and finish() starting, i.e. the work card 1 did of its
++    /// own while this GPU computed (cumulative).  ms_wait() is then the time it stalled past that.
++    double ms_own() const { return ms_own_; }
+     /// seabraid only: the helper's own cumulative service (requests, ms total, ms in its begin()); zeros otherwise
+     void helper_service(uint64_t& n, double& ms, double& ms_begin) const {
+         n = 0; ms = ms_begin = 0;
+@@ -165,7 +169,8 @@ private:
+     int64_t launched_layers_ = 0;
+     uint64_t returned_bytes_ = 0;
+     uint64_t full_row_bytes_ = 0;
+-    double ms_begin_ = 0, ms_wait_ = 0;
++    double ms_begin_ = 0, ms_wait_ = 0, ms_own_ = 0;
++    std::chrono::steady_clock::time_point begin_end_{};   // when the last begin() returned (STRATA_ROUTE_HIST)
+     ExpertCache cache_;
+     cudaStream_t stream_ = nullptr;
+     cudaStream_t read_stream_ = nullptr;   ///< STRATA_PREFILL_HELPER_SOURCE: cache -> host copies
+diff --git a/include/strata/core/route_hist.hpp b/include/strata/core/route_hist.hpp
+new file mode 100644
+index 000000000..36063d172
+--- /dev/null
++++ b/include/strata/core/route_hist.hpp
+@@ -0,0 +1,131 @@
++#pragma once
++// STRATA_ROUTE_HIST=<dir> (opt-in; unset = every call below is one load of a const bool and nothing else).
++//
++// Per request, one file `<dir>/req-NNNNNN.json`: how many routed (token, expert) pairs each (layer, expert) took, split
++// into the PROMPT phase (everything routed before the first decode window of the request) and the DECODE phase, plus
++// which tier held each expert when the request ended.  tools/route_hist_report.py (seabraid) reads the directory.
++//
++// OWNER / WHY a second table beside ExpertDispatch::usage: `usage` is the existing routed-count owner and is counted at
++// the same site (expert_pool_dispatch_multi), but it is decayed every adaptive round and exists only when the adaptive
++// tier is on.  A per-request histogram needs raw, undecayed counts that exist whether or not re-tiering runs, so it is
++// the undecayed twin, fed from the SAME loop; nothing else counts routing.
++//
++// WHERE the phase boundary is: the driver flips the phase at the moment a request's decode clock starts, not by code
++// path.  A prompt read through batched prefill and a prompt read through verify windows are both "prompt" because both
++// happen before that moment; "decode" is exactly the windows that produce the answer.
++//
++// WHY JSON: the reader is a stdlib Python tool and a human debugging at 2 a.m.; json.load needs no schema code, the
++// file is greppable, and a request is ~50 KB (sparse [expert, count] pairs, not a dense 48 x 512 matrix).  Size is
++// irrelevant against the seconds a request takes; a binary format would buy nothing and cost a reader.
++//
++// FAILURE: observability, fail-open-loud.  Any write error warns once on stderr and turns the whole facility off for
++// the rest of the run; counting itself cannot fail and never blocks.  Single writer: the counting sites run on the
++// request's own thread (the decode loop, the prompt's compute thread), one phase at a time, so there is no locking.
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <filesystem>
++#include <string>
++#include <vector>
++
++namespace strata::core {
++
++class RouteHist {
++public:
++    enum Phase { kPrompt = 0, kDecode = 1 };
++
++    static RouteHist& get() {
++        static RouteHist h;
++        return h;
++    }
++    bool on() const { return on_; }
++
++    /// A request starts: zero both phases, sized for the model, phase = prompt.
++    void begin(int64_t layers, int64_t experts) {
++        if (!on_) return;
++        layers_ = layers;
++        experts_ = experts;
++        for (auto& c : cnt_) c.assign((size_t) (layers * experts), 0u);
++        phase_ = kPrompt;
++    }
++    void set_phase(Phase p) { phase_ = p; }
++
++    /// `n` routed expert ids of one layer (token-major, k per token) in the current phase.
++    void note(int64_t layer, const int32_t* ids, int64_t n) {
++        if (!on_ || layer < 0 || layer >= layers_) return;
++        uint32_t* row = cnt_[phase_].data() + (size_t) layer * (size_t) experts_;
++        for (int64_t i = 0; i < n; ++i)
++            if (ids[i] >= 0 && ids[i] < experts_) ++row[ids[i]];
++    }
++
++    /// Write the request.  `holder(layer, expert)` returns '1' (card 1's VRAM), '2' (card 2), 'p' (peer), '0' (neither:
++    /// host memory).  Called once, after the last decode window, so it sees the tiers as they ended.
++    template <class Holder>
++    void dump(int64_t prompt_tokens, int64_t decode_tokens, Holder holder) {
++        if (!on_ || layers_ <= 0) return;
++        std::error_code ec;
++        std::filesystem::create_directories(dir_, ec);
++        char name[64];
++        std::snprintf(name, sizeof name, "req-%06u.json", ++request_);
++        const std::string path = (std::filesystem::path(dir_) / name).string();
++        std::FILE* f = ec ? nullptr : std::fopen(path.c_str(), "w");
++        bool ok = f != nullptr;
++        if (ok) {
++            ok = std::fprintf(f, "{\"format\":\"strata-route-hist\",\"version\":1,\"request\":%u,\"layers\":%lld,\"experts\":%lld,"
++                                 "\"prompt_tokens\":%lld,\"decode_tokens\":%lld",
++                              request_, (long long) layers_, (long long) experts_, (long long) prompt_tokens,
++                              (long long) decode_tokens) > 0;
++            static const char* const kName[2] = {"prompt", "decode"};
++            for (int p = 0; ok && p < 2; ++p) {
++                std::fprintf(f, ",\n\"%s\":[", kName[p]);
++                for (int64_t l = 0; l < layers_; ++l) {
++                    std::fputs(l ? ",\n[" : "\n[", f);
++                    bool first = true;
++                    const uint32_t* row = cnt_[p].data() + (size_t) l * (size_t) experts_;
++                    for (int64_t e = 0; e < experts_; ++e)
++                        if (row[e]) { std::fprintf(f, first ? "[%lld,%u]" : ",[%lld,%u]", (long long) e, row[e]); first = false; }
++                    std::fputc(']', f);
++                }
++                std::fputc(']', f);
++            }
++            std::fputs(",\n\"holder\":[", f);
++            std::string s((size_t) experts_, '0');
++            for (int64_t l = 0; l < layers_; ++l) {
++                for (int64_t e = 0; e < experts_; ++e) s[(size_t) e] = holder(l, e);
++                std::fprintf(f, l ? ",\n\"%s\"" : "\n\"%s\"", s.c_str());
++            }
++            ok = std::fputs("]}\n", f) >= 0;
++            ok = std::fclose(f) == 0 && ok;
++        }
++        if (!ok) {
++            std::fprintf(stderr, "strata route-hist: cannot write %s: the histogram is off for the rest of this run\n", path.c_str());
++            on_ = false;
++        }
++    }
++
++private:
++    RouteHist() {
++        const char* d = std::getenv("STRATA_ROUTE_HIST");
++        if (d != nullptr && d[0] != '\0') { dir_ = d; on_ = true; }
++    }
++    bool on_ = false;
++    std::string dir_;
++    int64_t layers_ = 0, experts_ = 0;
++    uint32_t request_ = 0;
++    Phase phase_ = kPrompt;
++    std::vector<uint32_t> cnt_[2];
++};
++
++/// The decode timing line's suffix for card `card` (1-based): card 1's own expert work per layer request, between
++/// handing card `card` its rows and needing its answer, and the time it then waited past that.  own + wait is what the
++/// request cost the layer; own is the part that overlapped card 1's work, wait the part that was pure stall.
++/// Empty when STRATA_ROUTE_HIST is unset (the line is then byte-identical to a build without this) or nothing was asked.
++inline std::string route_hist_card_split(bool on, int card, int64_t requests, double own_ms, double wait_ms) {
++    if (!on || requests <= 0) return std::string();
++    char b[200];
++    std::snprintf(b, sizeof b, "; card %d: %lld layer requests, own expert work %.1f us + waited past it %.1f us each",
++                  card, (long long) requests, 1000.0 * own_ms / (double) requests, 1000.0 * wait_ms / (double) requests);
++    return b;
++}
++
++}  // namespace strata::core
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index 7e9b81e1d..fe808fdcc 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -9,6 +9,7 @@
+ #include "strata/core/resident_ram_copy.hpp"
+ #include "strata/platform/aux_cpus.hpp"
+ #include "strata/core/remote_experts.hpp"
++#include "strata/core/route_hist.hpp"
+ #include "strata/core/peer_experts.hpp"
+ #include "strata/kernels/cpu/expert_layout.hpp"
+ #include "strata/kernels/window_limits.hpp"
+@@ -4976,6 +4977,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+     pt("begin");
+     d.src->begin_layer(d.layers, ids, n_tok * k);
+     pt("begun");
++    // STRATA_ROUTE_HIST: the raw per-request twin of `usage`, counted at this one site (see route_hist.hpp)
++    if (RouteHist::get().on()) RouteHist::get().note(d.layers, ids, n_tok * k);
+     if (!d.usage.empty())
+         for (int64_t i = 0; i < n_tok * k; ++i)
+             if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
+diff --git a/src/core/remote_experts.cpp b/src/core/remote_experts.cpp
+index 05aa27604..f269ab007 100644
+--- a/src/core/remote_experts.cpp
++++ b/src/core/remote_experts.cpp
+@@ -1,6 +1,7 @@
+ #include "strata/core/remote_experts.hpp"
+ #include "strata/core/device.hpp"   // primary_device() (STRATA_PRIMARY_DEVICE)
+ #include "strata/core/remote_expert_opt.hpp"
++#include "strata/core/route_hist.hpp"
+ 
+ #include "strata/kernels/cpu/expert_layout.hpp"
+ #include "strata/kernels/cpu/hadamard.hpp"
+@@ -298,8 +299,8 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
+                           int64_t k, const int32_t* kind, const int32_t* primary_res,
+                           std::string& err) {
+     // cumulative host time in here (staging and launches), reported per request by the driver
+-    struct Timer { double& acc; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+-        ~Timer() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); } } timer{ms_begin_};
++    struct Timer { double& acc; std::chrono::steady_clock::time_point& end; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
++        ~Timer() { end = std::chrono::steady_clock::now(); acc += std::chrono::duration<double, std::milli>(end - t0).count(); } } timer{ms_begin_, begin_end_};
+     if (bl_) return seabraid_helper_begin(layer, x, ids, n_tok, k, kind, primary_res, err);
+     const int64_t n = n_tok * k;
+     if (n <= 0 || n > CAP || n_tok > strata::kernels::kWindowMaxT || k != (int) strata::core::kCompiledGeometry.n_expert_used || layer < 0 ||
+@@ -397,6 +398,7 @@ bool RemoteExperts::finish(float* out, std::string& err) {
+     DeviceScope scope(device_);
+     if (!scope.ok) { err = scope.error(device_); return false; }
+     const auto w0 = std::chrono::steady_clock::now();
++    if (RouteHist::get().on()) ms_own_ += std::chrono::duration<double, std::milli>(w0 - begin_end_).count();
+     // Spin on the stream like PeerExperts::finish instead of the blocking sync: the layer waits for this helper
+     // on the CPU pool's critical path, and a blocking sync's wake-up costs more than the helper's small batch
+     // takes - on HIP especially, where the CUDA branch's cudaInitDevice(ScheduleSpin) does not exist and the
+@@ -654,6 +656,7 @@ bool RemoteExperts::seabraid_helper_begin(int64_t layer, const float* x, const i
+ bool RemoteExperts::seabraid_helper_finish(float* out, std::string& err) {
+     if (!bl_pending_) return true;
+     const auto w0 = std::chrono::steady_clock::now();
++    if (RouteHist::get().on()) ms_own_ += std::chrono::duration<double, std::milli>(w0 - begin_end_).count();
+     seabraid::Header* hd = bl_->header();
+     if (!seabraid::Channel::wait([&] { return hd->resp_seq.load(std::memory_order_acquire) == bl_seq_; }, 30)) {
+         err = "seabraid: the helper did not answer layer " + std::to_string(hd->layer) + " within 30 s";
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index c15145860..9381ff220 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -1,6 +1,7 @@
+ // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
+ #include "strata/kernels/fused_gr.hpp"
+ #include "strata/prefill/prefill.hpp"
++#include "strata/core/route_hist.hpp"
+ #include "strata/prefill/copy_events.hpp"
+ #include "strata/prefill/timer_marks.hpp"
+ #include "strata/prefill/mmq_ids_margin.hpp"
+@@ -5323,6 +5324,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                     pt.mark(kPfRouter, cs);
+                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
+                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
++                    if (core::RouteHist::get().on()) {   // STRATA_ROUTE_HIST: opt-in, syncs the stream once per layer chunk
++                        std::vector<int32_t> rh((size_t) (T * K));
++                        if (cudaMemcpyAsync(rh.data(), m.ids, rh.size() * 4, cudaMemcpyDeviceToHost, m.cs) == cudaSuccess &&
++                            cudaStreamSynchronize(m.cs) == cudaSuccess)
++                            core::RouteHist::get().note(l, rh.data(), (int64_t) rh.size());
++                    }
+                     // RESEARCH HOOK (141-research, opt-in, never on by default): STRATA_DBG_FEAT=<file> dumps, per MoE layer and chunk,
+                     // the routed ids + weights (and for the layers in STRATA_DBG_FEAT_LAYERS the router-input hidden state, bf16);
+                     // STRATA_DBG_ROUTE_OVERRIDE=<file> replaces the routing of the layers listed in that file with the file's ids + weights.
+@@ -8821,6 +8828,12 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
+                         pt.mark(kPfRouter, cs);
+                         if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
+                         route(m.logits, lb.ids + t0 * K, lb.w + t0 * K, T, m.g->n_expert, cs);
++                        if (core::RouteHist::get().on()) {   // STRATA_ROUTE_HIST (layer-major walk): same as the walk above
++                            std::vector<int32_t> rh((size_t) (T * K));
++                            if (cudaMemcpyAsync(rh.data(), lb.ids + t0 * K, rh.size() * 4, cudaMemcpyDeviceToHost, cs) == cudaSuccess &&
++                                cudaStreamSynchronize(cs) == cudaSuccess)
++                                core::RouteHist::get().note(l, rh.data(), (int64_t) rh.size());
++                        }
+                         if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
+                         if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
+                         swiglu_pair(m.sgate, m.sup, m.sh_h, T, cs);
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index ba2d1cf84..508c5a08f 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -65,6 +65,7 @@
+ #include "strata/core/layer.hpp"
+ #include "strata/core/kv_grow_rules.hpp"
+ #include "strata/core/layout.hpp"
++#include "strata/core/route_hist.hpp"
+ #include "strata/core/session.hpp"
+ #include "strata/core/weights.hpp"
+ #include "strata/kernels/gfx_arch.hpp"
+@@ -17499,6 +17500,7 @@ int main(int argc, char** argv) {
+             }
+             cur = ids;
+             const Clock::time_point r0 = Clock::now();
++            strata::core::RouteHist::get().begin(g.n_layers, g.n_expert);   // STRATA_ROUTE_HIST: this request counts from zero, phase = prompt
+             tr("r0");
+             strata::core::conversation_checkpoint_join(nullptr);   // STRATA_CKPT_ASYNC: the last save's copy has landed
+             const int64_t streamed0 = sp.chain_experts_streamed();   // the DONE line's experts_streamed= is the difference
+@@ -19730,6 +19732,8 @@ int main(int argc, char** argv) {
+             bool hold_on = req_hold_n > 0 && req_hold_id >= 0;
+             auto cap_now = [&]() -> int64_t { return hold_on ? std::min<int64_t>(max_new, req_hold_n) : (int64_t) max_new; };
+             const Clock::time_point d0 = Clock::now();
++            // the prompt/decode split of STRATA_ROUTE_HIST is this instant: what routes from here on belongs to the answer
++            strata::core::RouteHist::get().set_phase(strata::core::RouteHist::kDecode);
+             // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
+             static const bool dec_timing = std::getenv("STRATA_DECODE_TIMING") != nullptr;
+             struct DecSnap {
+@@ -19742,6 +19746,14 @@ int main(int argc, char** argv) {
+                                drive.d.pcie_experts};
+             };
+             const DecSnap ds0 = dec_snap();
++            std::array<double, 3> rh_own0{}, rh_wait0{};   // STRATA_ROUTE_HIST: cards 2-4 own-work and wait clocks at decode start
++            std::array<int64_t, 3> rh_n0{};
++            if (strata::core::RouteHist::get().on())
++                for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0) {
++                    rh_own0[(size_t) r] = remote_experts[(size_t) r].ms_own();
++                    rh_wait0[(size_t) r] = remote_experts[(size_t) r].ms_wait();
++                    rh_n0[(size_t) r] = remote_experts[(size_t) r].launched_layers();
++                }
+             double dt_run = 0, dt_commit = 0, dt_draft = 0;
+             double dt_adapt_wait = 0, dt_adapt_join = 0;   // the tier's wait before a window / join after the draft (ms, summed)
+             const int64_t dt_sw0 = ajob ? a_swapped : adapt_nswaps;
+@@ -21171,8 +21183,22 @@ int main(int argc, char** argv) {
+                 std::printf("ERR %s\n", err.c_str());
+                 return 1;
+             }
++            if (strata::core::RouteHist::get().on()) {   // write this request histogram; the holder is each expert tier as the request ended
++                strata::core::RouteHist::get().dump(n, produced_n, [&](int64_t l, int64_t e) -> char {
++                    if (drive.d.host_res != nullptr && drive.d.host_res[(size_t) (l * g.n_expert + e)] >= 0) return '1';
++                    for (int r = 0; r < drive.d.remote_count; ++r) if (drive.d.remote[r]->holds(l, (int32_t) e)) return '2';
++                    if (drive.d.peer != nullptr && drive.d.peer->has(l, e)) return 'p';
++                    return '0';
++                });
++            }
+             if (dec_timing && dec_windows > 0) {
+                 const DecSnap d1 = dec_snap();
++                std::string rh_sfx;   // STRATA_ROUTE_HIST: card 1 own work vs the wait past it, per layer request; empty when unset
++                if (strata::core::RouteHist::get().on())
++                    for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
++                        rh_sfx += strata::core::route_hist_card_split(true, r + 2, remote_experts[(size_t) r].launched_layers() - rh_n0[(size_t) r],
++                                                                      remote_experts[(size_t) r].ms_own() - rh_own0[(size_t) r],
++                                                                      remote_experts[(size_t) r].ms_wait() - rh_wait0[(size_t) r]);
+                 const double w = (double) dec_windows, L = (double) g.n_layers;
+                 if (!pl_ran) {
+                     const double dt_other = decode_ms - dt_adapt_wait - dt_run - dt_commit - dt_draft - dt_adapt_join;
+@@ -21181,25 +21207,25 @@ int main(int argc, char** argv) {
+                                  "adapt wait %.2f + verify %.2f (GPU-reach wait %.2f + per-layer host %.2f "
+                                  "[plan %.2f actq %.2f jobs %.2f CPU %.2f] + stage %.2f) + commit/emit %.2f + "
+                                  "draft %.2f + adapt join %.2f + other %.2f; per layer-window: CPU experts "
+-                                 "%.2f (%.2f entries), VRAM hits %.2f, PCIe %.2f; %.1f swaps/window\n",
++                                 "%.2f (%.2f entries), VRAM hits %.2f, PCIe %.2f; %.1f swaps/window%s\n",
+                                  (long long) dec_windows, dec_T / w, produced_n / w, decode_ms / w, dt_adapt_wait / w,
+                                  dt_run / w, (d1.wait - ds0.wait) / w, (d1.pool - ds0.pool) / w,
+                                  (d1.plan - ds0.plan) / w, (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w,
+                                  (d1.run - ds0.run) / w, (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w,
+                                  dt_adapt_join / w, dt_other / w, (d1.misses - ds0.misses) / (w * L),
+                                  (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L),
+-                                 (d1.pcie - ds0.pcie) / (w * L), (double) ((ajob ? a_swapped : adapt_nswaps) - dt_sw0) / w);
++                                 (d1.pcie - ds0.pcie) / (w * L), (double) ((ajob ? a_swapped : adapt_nswaps) - dt_sw0) / w, rh_sfx.c_str());
+                 } else {   // Keep the pipeline's existing timing format.
+                     std::fprintf(stderr, "strata decode timing: %lld windows, avg T %.2f, %.2f tokens/window, %.2f ms/window = "
+                                          "verify %.2f (GPU-reach wait %.2f + per-layer host %.2f [plan %.2f actq %.2f jobs %.2f "
+                                          "CPU %.2f] + stage %.2f) + commit/emit %.2f + draft %.2f; per layer-window: CPU experts "
+-                                         "%.2f (%.2f entries), VRAM hits %.2f, PCIe %.2f; adapt wait %.2f join %.2f, %.1f swaps/window\n",
++                                         "%.2f (%.2f entries), VRAM hits %.2f, PCIe %.2f; adapt wait %.2f join %.2f, %.1f swaps/window%s\n",
+                                  (long long) dec_windows, dec_T / w, produced_n / w, decode_ms / w, dt_run / w,
+                                  (d1.wait - ds0.wait) / w, (d1.pool - ds0.pool) / w, (d1.plan - ds0.plan) / w,
+                                  (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
+                                  (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
+                                  (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L),
+-                                 dt_adapt_wait / w, dt_adapt_join / w, (double) ((ajob ? a_swapped : adapt_nswaps) - dt_sw0) / w);
++                                 dt_adapt_wait / w, dt_adapt_join / w, (double) ((ajob ? a_swapped : adapt_nswaps) - dt_sw0) / w, rh_sfx.c_str());
+                 }
+                 if (aov)
+                     std::fprintf(stderr, "strata decode adapt overlap: %lld windows took swaps still landing, a layer waited %.2f ms in all so far\n",
+diff --git a/tests/core/route_hist_test.cpp b/tests/core/route_hist_test.cpp
+new file mode 100644
+index 000000000..40a4c5531
+--- /dev/null
++++ b/tests/core/route_hist_test.cpp
+@@ -0,0 +1,82 @@
++// route_hist_test: the STRATA_ROUTE_HIST counter and writer (CPU only).  Two registrations of this one binary:
++//   "on"  (env STRATA_ROUTE_HIST=<dir>): the counts land in the right phase/layer/expert and the file says so;
++//   "off" (env unset): nothing is allocated, nothing is written, the timing suffix is exactly the empty string.
++#include "strata/core/route_hist.hpp"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <sstream>
++#include <string>
++
++using strata::core::RouteHist;
++using strata::core::route_hist_card_split;
++
++static int fails = 0;
++#define CHECK(c)                                                              \
++    do {                                                                      \
++        if (!(c)) { std::fprintf(stderr, "FAILED: %s (line %d)\n", #c, __LINE__); ++fails; } \
++    } while (0)
++
++static std::string slurp(const std::string& p) {
++    std::ifstream f(p);
++    std::stringstream s;
++    s << f.rdbuf();
++    return s.str();
++}
++
++int main(int argc, char** argv) {
++    const bool want_on = argc > 1 && std::strcmp(argv[1], "on") == 0;
++    RouteHist& h = RouteHist::get();
++    CHECK(h.on() == want_on);
++    CHECK(route_hist_card_split(false, 2, 100, 1.0, 1.0).empty());     // unset: the timing line gains nothing
++    CHECK(route_hist_card_split(true, 2, 0, 1.0, 1.0).empty());        // no request was made: nothing to say
++    // 2000 requests, 100 ms of own work and 50 ms of waiting: 50 us own, 25 us waited, each
++    CHECK(route_hist_card_split(true, 2, 2000, 100.0, 50.0) ==
++          "; card 2: 2000 layer requests, own expert work 50.0 us + waited past it 25.0 us each");
++
++    const char* dir = std::getenv("STRATA_ROUTE_HIST");
++    if (!want_on) {
++        h.begin(2, 8);
++        const int32_t ids[3] = {1, 2, 3};
++        h.note(0, ids, 3);
++        h.dump(5, 5, [](int64_t, int64_t) { return '0'; });
++        CHECK(dir == nullptr || dir[0] == 0);   // ctest sets it to the empty string
++        return fails == 0 ? 0 : 1;
++    }
++    CHECK(dir != nullptr);
++    std::filesystem::remove_all(dir);
++
++    h.begin(2, 8);   // 2 layers, 8 experts
++    const int32_t p0[6] = {1, 1, 2, 7, -1, 99};   // -1 and 99 are out of range: not counted
++    h.note(0, p0, 6);
++    h.note(5, p0, 6);                              // layer out of range: not counted
++    h.set_phase(RouteHist::kDecode);
++    const int32_t d1[4] = {3, 3, 3, 0};
++    h.note(1, d1, 4);
++    h.dump(7, 9, [](int64_t l, int64_t e) { return e == 3 ? (l == 1 ? '2' : '1') : '0'; });
++
++    const std::string j = slurp(std::string(dir) + "/req-000001.json");
++    CHECK(j.find("\"version\":1") != std::string::npos);
++    CHECK(j.find("\"prompt_tokens\":7,\"decode_tokens\":9") != std::string::npos);
++    CHECK(j.find("\"prompt\":[\n[[1,2],[2,1],[7,1]],\n[]]") != std::string::npos);
++    CHECK(j.find("\"decode\":[\n[],\n[[0,1],[3,3]]]") != std::string::npos);
++    CHECK(j.find("\"holder\":[\n\"00010000\",\n\"00020000\"]") != std::string::npos);
++
++    // a second request starts from zero and gets the next file number
++    h.begin(2, 8);
++    h.dump(0, 0, [](int64_t, int64_t) { return '0'; });
++    const std::string j2 = slurp(std::string(dir) + "/req-000002.json");
++    CHECK(j2.find("\"prompt\":[\n[],\n[]]") != std::string::npos);
++
++    // a write error turns it off for good, loudly, and does not throw
++    std::filesystem::remove_all(dir);
++    { std::ofstream blocker(dir); blocker << "a file where the directory should be"; }
++    h.begin(2, 8);
++    h.dump(0, 0, [](int64_t, int64_t) { return '0'; });
++    CHECK(!h.on());
++    std::filesystem::remove(dir);
++    return fails == 0 ? 0 : 1;
++}

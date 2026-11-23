@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 440" width="820" height="440" role="img" aria-labelledby="t d">
+<title id="t">Placement pyramid with the traced expert</title>
+<desc id="d">Four rungs, main, helper1, helper2 and rung F (engine RAM and NVMe). Expert 407 of layer 25 climbs from the SSD pack file to the main card in round 7 and is pushed back down in rounds 290, 333 and 388.</desc>
+<style>
+text{font-family:'Times New Roman',Times,Georgia,serif;fill:#000;font-size:13px}
+.s{font-size:12px}.e{text-anchor:end}.c{text-anchor:middle}
+.rule{stroke:#bbb;stroke-width:.75;fill:none}.box{fill:#fff;stroke:#000;stroke-width:1}
+.up{fill:#1f3a6e;stroke:#1f3a6e}.dn{fill:#888;stroke:#888}.ref{fill:#fff;stroke:#000;stroke-width:1}
+.gate{stroke:#000;stroke-width:1;stroke-dasharray:5 4;fill:none}.ln{stroke-width:1.5;fill:none}.dash{stroke-dasharray:5 3}
+</style>
+<rect width="820" height="440" fill="#fff"/>
+<rect x="170" y="24" width="240" height="56" class="box"/>
+<text x="290" y="48" class="c">main   R9700 (HIP)</text>
+<text x="290" y="66" class="s c">2,582 slots</text>
+<rect x="120" y="142" width="340" height="56" class="box"/>
+<text x="290" y="166" class="c">helper1   RTX 3090 (CUDA)</text>
+<text x="290" y="184" class="s c">1,500 slots</text>
+<rect x="70" y="260" width="440" height="56" class="box"/>
+<text x="290" y="284" class="c">helper2   HIP process, same R9700</text>
+<text x="290" y="302" class="s c">1,000 slots</text>
+<rect x="20" y="378" width="540" height="56" class="box"/>
+<line x1="203.6" y1="378" x2="203.6" y2="434" class="ln"/>
+<text x="111.8" y="402" class="c">RAM</text>
+<text x="111.8" y="420" class="s c">6 GiB budget</text>
+<text x="381.8" y="402" class="c">NVMe (SSD pack file)</text>
+<text x="381.8" y="420" class="s c">66% of the 24,576 experts</text>
+<line x1="230" y1="378" x2="230" y2="324" class="ln up"/>
+<polygon points="226,325 234,325 230,316" class="up"/>
+<text x="221" y="351" class="s e">round 7</text>
+<line x1="140" y1="260" x2="140" y2="206" class="ln up"/>
+<polygon points="136,207 144,207 140,198" class="up"/>
+<text x="131" y="233" class="s e">round 7</text>
+<line x1="140" y1="142" x2="140" y2="88" class="ln up"/>
+<polygon points="136,89 144,89 140,80" class="up"/>
+<text x="131" y="115" class="s e">round 7</text>
+<line x1="440" y1="80" x2="440" y2="134" class="ln dn dash"/>
+<polygon points="436,133 444,133 440,142" class="dn"/>
+<text x="449" y="115" class="s">round 290</text>
+<line x1="440" y1="198" x2="440" y2="252" class="ln dn dash"/>
+<polygon points="436,251 444,251 440,260" class="dn"/>
+<text x="449" y="233" class="s">round 333</text>
+<line x1="390" y1="316" x2="390" y2="370" class="ln dn dash"/>
+<polygon points="386,369 394,369 390,378" class="dn"/>
+<text x="399" y="351" class="s">round 388</text>
+<text x="600" y="36">Traced expert: layer 25, expert 407</text>
+<text x="600" y="54" class="s">2,329,600 bytes per hop;</text>
+<text x="600" y="70" class="s">verified at every hop.</text>
+<line x1="608" y1="156" x2="608" y2="124" class="ln up"/>
+<polygon points="604,125 612,125 608,116" class="up"/>
+<text x="626" y="122">up in round 7</text>
+<text x="626" y="140" class="s">SSD file &gt; helper2 &gt;</text>
+<text x="626" y="156" class="s">helper1 &gt; main</text>
+<line x1="608" y1="188" x2="608" y2="220" class="ln dn dash"/>
+<polygon points="604,219 612,219 608,228" class="dn"/>
+<text x="626" y="202">pushed back down</text>
+<text x="626" y="220" class="s">main &gt; helper1 (round 290),</text>
+<text x="626" y="236" class="s">helper1 &gt; helper2 (round 333),</text>
+<text x="626" y="252" class="s">helper2 &gt; rung F (round 388),</text>
+<text x="626" y="268" class="s">landing SSD-only</text>
+</svg>

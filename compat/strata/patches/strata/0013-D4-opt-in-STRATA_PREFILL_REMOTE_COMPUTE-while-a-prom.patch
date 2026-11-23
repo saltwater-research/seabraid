@@ -1,0 +1,2070 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Seabraid <seabraid@example.invalid>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH 13/16] D4 (opt-in STRATA_PREFILL_REMOTE_COMPUTE): while a
+ prompt is read, the expert card computes the experts it holds
+
+Card 1's own experts keep their (fused) path; the expert card gets the rows that path quantizes (f32 rows), channel v7 prefill
+regions sized by TOKENS, per-token reduce on the expert card, compute-vs-lend cost model, failure path on card 1, STRATA_D4_CHECK
+diagnostic (off).  Unset = the lending path exactly as before.  remote_prefill_test and d4_plan_test run on the CPU.
+
+The include/strata/seabraid/channel.hpp (and expert_spec.hpp) half of this change lives in Seabraid's
+adapters/strata/wire, the wire's one owner; this patch keeps only the engine side.
+---
+ cmake/strata_gpu_engine.cmake             |  17 +-
+ include/strata/core/remote_expert_opt.hpp |   9 +
+ include/strata/core/remote_experts.hpp    |  39 +++
+ include/strata/core/remote_prefill.hpp    | 122 ++++++++
+ include/strata/prefill/d4_check.hpp       |  51 +++
+ include/strata/prefill/d4_plan.hpp        |  74 +++++
+ include/strata/prefill/kernels.hpp        |   8 +
+ include/strata/prefill/prefill.hpp        |  11 +-
+ include/strata/seabraid/prefill_wire.hpp  | 172 ++++++++++
+ src/core/remote_expert_opt.cu             |  35 +++
+ src/core/remote_experts.cpp               |   2 +
+ src/core/remote_prefill.cpp               | 365 ++++++++++++++++++++++
+ src/prefill/d4_check.cpp                  | 106 +++++++
+ src/prefill/kernels.cu                    |  47 +++
+ src/prefill/prefill.cpp                   | 193 +++++++++++-
+ src/program/generate.cpp                  |  18 ++
+ tests/core/remote_prefill_test.cpp        | 305 ++++++++++++++++++
+ tests/prefill/d4_plan_test.cpp            |  82 +++++
+ 18 files changed, 1644 insertions(+), 12 deletions(-)
+ create mode 100644 include/strata/core/remote_prefill.hpp
+ create mode 100644 include/strata/prefill/d4_check.hpp
+ create mode 100644 include/strata/prefill/d4_plan.hpp
+ create mode 100644 include/strata/seabraid/prefill_wire.hpp
+ create mode 100644 src/core/remote_prefill.cpp
+ create mode 100644 src/prefill/d4_check.cpp
+ create mode 100644 tests/core/remote_prefill_test.cpp
+ create mode 100644 tests/prefill/d4_plan_test.cpp
+
+diff --git a/cmake/strata_gpu_engine.cmake b/cmake/strata_gpu_engine.cmake
+index c676db161..be30093c7 100644
+--- a/cmake/strata_gpu_engine.cmake
++++ b/cmake/strata_gpu_engine.cmake
+@@ -286,7 +286,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
+   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
+     src/core/ownership_map.cpp src/core/ownership_rungs.cpp
+-    src/core/remote_expert_opt.cu
++    src/core/remote_expert_opt.cu src/core/remote_prefill.cpp
+     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
+     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
+     src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
+@@ -355,6 +355,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     target_link_libraries(remote_experts_seabraid_opt_test PRIVATE strata_engine)
+     add_test(NAME remote_experts_seabraid_opt_test COMMAND remote_experts_seabraid_opt_test)
+     set_tests_properties(remote_experts_seabraid_opt_test PROPERTIES TIMEOUT 60)
++    # D4: card 1's real prefill request path (RemoteExperts::prefill_*) against an in-process expert process running the real
++    # serve_prefill with CPU experts, on a real shm channel: remote sums + card 1's own picks == card 1 computing them all,
++    # the region sized by tokens, the failure contract, the cost model.  CPU only.
++    add_executable(remote_prefill_test tests/core/remote_prefill_test.cpp)
++    target_link_libraries(remote_prefill_test PRIVATE strata_engine)
++    add_test(NAME remote_prefill_test COMMAND remote_prefill_test)
++    set_tests_properties(remote_prefill_test PROPERTIES TIMEOUT 120)
++    # D4's host-side layer plan (include/strata/prefill/d4_plan.hpp): D4 never changes card 1's own expert path; the split of a
++    # layer's picks.  CPU only.
++    add_executable(d4_plan_test tests/prefill/d4_plan_test.cpp)
++    target_include_directories(d4_plan_test PRIVATE include)
++    add_test(NAME d4_plan_test COMMAND d4_plan_test)
++    set_tests_properties(d4_plan_test PROPERTIES TIMEOUT 60)
+   endif()
+   # STRATA_ROUTE_HIST: the per-request routed-pair histogram.  The same binary twice: env set (counts and file) / unset (inert).
+   add_executable(route_hist_test tests/core/route_hist_test.cpp)
+@@ -457,7 +470,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   # what composes them into a token.  No tokenizer - the prompt arrives as ids - because Gate C1 compares logits
+   # against llama.cpp on the SAME ids and a tokenizer on one side of that comparison is a second variable.
+   # plan v0.3 P5: batched prompt processing (tensor-core GEMMs through cuBLAS).
+-  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
++  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp src/prefill/d4_check.cpp)
+   if(STRATA_ENABLE_HIP)
+     # #313: the RDNA3 WMMA GEMMs include hip_runtime.h: AMD builds only (a CUDA build never sees this file)
+     target_sources(strata_prefill PRIVATE src/prefill/wmma_gemm.cu)
+diff --git a/include/strata/core/remote_expert_opt.hpp b/include/strata/core/remote_expert_opt.hpp
+index a3a44745f..af95f4b22 100644
+--- a/include/strata/core/remote_expert_opt.hpp
++++ b/include/strata/core/remote_expert_opt.hpp
+@@ -10,6 +10,15 @@ namespace strata::core {
+ class RemoteExperts;
+ class ExpertSource;
+ 
++/// D4 (prompt reading in the expert process): the chunk-scale form of the reduction this file owns ("sum of w * expert(x)
++/// per token").  out16[t] = fp16(sum over k with row_of[t, k] >= 0 of wt[t, k] * rows[row_of[t, k]], fmaf in k order from
++/// 0) for n_tok tokens; *bad is set to 1 (device int) when a sum is not finite in fp16.  seabraid::prefill_reduce_ref
++/// (prefill_wire.hpp) is the same arithmetic on the CPU, which the host test checks against card 1's own sum.
++void prefill_reduce_f16(const float* rows, const int32_t* row_of, const float* wt, int64_t n_tok, int64_t k,
++                        uint16_t* out16, int32_t* bad, void* stream);
++/// x[i] = f32 of the fp16 bits x16[i] (exact): the request's rows on the expert process's device.
++void prefill_f16_to_f32(const uint16_t* x16, float* x, int64_t n, void* stream);
++
+ // Remote Expert Decode Optimization v1 on existing helper caches. One instance per serial engine.
+ class RemoteExpertOpt {
+ public:
+diff --git a/include/strata/core/remote_experts.hpp b/include/strata/core/remote_experts.hpp
+index 2a64ed720..dc323f8dc 100644
+--- a/include/strata/core/remote_experts.hpp
++++ b/include/strata/core/remote_experts.hpp
+@@ -3,6 +3,7 @@
+ #include "strata/core/expert_cache.hpp"
+ #include "strata/core/expert_source.hpp"
+ #include "strata/seabraid/channel.hpp"
++#include "strata/core/remote_prefill.hpp"
+ 
+ #include <cuda_runtime.h>
+ 
+@@ -141,6 +142,29 @@ public:
+     bool seabraid_retier(const seabraid::TierWireOp* ops, int32_t n, uint8_t* res,
+                         std::vector<uint8_t>* claimed, std::string& err);
+ 
++    // ---- D4 (STRATA_PREFILL_REMOTE_COMPUTE): while a prompt is read, the expert process computes the experts it holds
++    // (remote_prefill.cpp).  CARD 1 SIDE (a seabraid tier):
++    /// Checks the expert process offers a prefill region this engine can use (fp16 rows, `k` picks per token) and sets the
++    /// cost model's rates.  False with an error naming both sides' values; the caller then reads prompts as before.
++    bool prefill_open(int64_t k, std::string& err);
++    bool prefill_usable() const { return bl_ != nullptr && pf_open_ && !pf_dead_; }
++    /// The per-chunk choice (byte/time model, remote_prefill.hpp), logged once per prompt.  Never compute when unusable.
++    /// `row_bytes`: the row element size the chunk's layers will send (4 on a fused-path engine, else 2).
++    PrefillChoice prefill_choose(int64_t tokens, bool stream_all, int64_t layers, int64_t hidden, int64_t k, int row_bytes = 2);
++    /// Publishes this layer's request (its first token range).  `x16` T x H fp16, `w`/`ids` T x k, `remote_e[e]` the
++    /// experts handed over (the mask the caller's grouping used).  Host buffers must stay untouched until prefill_end.
++    bool prefill_begin(int64_t layer, const void* rows, int32_t row_bytes, const float* w, const int32_t* ids, int64_t n_tok,
++                       int64_t k, const uint8_t* remote_e, std::string& err);
++    /// Waits for the answer(s): T x H fp16 sums into `sums16` (a longer chunk is sent range by range).  False on a
++    /// timeout, a dead process, an error reply, a wrong echo or a non-finite sum - and the tier is then marked dead for
++    /// prompt reading (prefill_usable() false) so later chunks lend; the caller computes this layer's picks itself.
++    bool prefill_end(uint16_t* sums16, std::string& err);
++    // EXPERT PROCESS SIDE (a local cache): serve the request in `ch`'s prefill region on this card.
++    bool prefill_serve(const seabraid::Channel& ch, std::string& err);
++    /// Opaque: the serving buffers, defined in remote_prefill.cpp with their deleter (so ~RemoteExperts needs neither).
++    struct PrefillGpu;
++    struct PrefillGpuDel { void operator()(PrefillGpu* p) const; };
++
+     /// D7 call site (seabraid/retier_loop.hpp) reads these at a window boundary to snapshot the helper's residency for
+     /// the planner.  ENGINE THREAD ONLY: seabraid_retier rewrites bl_held_ on that thread, unsynchronised.
+     /// What the helper holds as this engine last adopted it: n_layers * n_expert, layer-major, nonzero = held.
+@@ -180,6 +204,21 @@ private:
+     uint64_t bl_seq_ = 0;
+     uint64_t bl_blob_seq_ = 0;
+     RemoteExpertOpt* remote_opt_ = nullptr;
++    // D4 card 1 side: the request in flight (ranges of at most pf_tokens tokens) and the model's measured inputs
++    bool pf_open_ = false, pf_dead_ = false, pf_pending_ = false;
++    const void* pf_rows_ = nullptr;
++    int32_t pf_row_bytes_ = 2;
++    const float* pf_w_ = nullptr;
++    const int32_t* pf_ids_ = nullptr;
++    const uint8_t* pf_mask_ = nullptr;
++    int64_t pf_layer_ = 0, pf_ntok_ = 0, pf_k_ = 0, pf_t0_ = 0, pf_tn_ = 0, pf_asked_ = 0;
++    uint64_t pf_seq_ = 0;
++    double pf_share_ = -1, pf_rate_ = 0, pf_lend_Bps_ = 0, pf_wire_Bps_ = 0, pf_layer_s_ = 0;
++    int pf_mode_ = 0;                           ///< 1: the model decides per chunk; 2: compute every eligible chunk (arms)
++    int64_t pf_picks_ = 0, pf_slots_ = 0;       ///< measured share: picks asked / pick slots offered, all requests
++    bool pf_range(std::string& err);            ///< pack + publish the range starting at pf_t0_
++    // D4 expert process side: device buffers for serving (remote_prefill.cpp), made on the first request
++    std::unique_ptr<PrefillGpu, PrefillGpuDel> pf_gpu_;
+     int device_ = -1;
+     int64_t n_expert_ = 0;
+     int32_t groups_ = 0;
+diff --git a/include/strata/core/remote_prefill.hpp b/include/strata/core/remote_prefill.hpp
+new file mode 100644
+index 000000000..2b0041651
+--- /dev/null
++++ b/include/strata/core/remote_prefill.hpp
+@@ -0,0 +1,122 @@
++#pragma once
++// D4 (STRATA_PREFILL_REMOTE_COMPUTE): while a prompt is read, the experts the other card holds are computed ON that card
++// (its expert process, over the seabraid channel's prefill region) instead of card 1 copying their weights across PCIe.
++// This header holds the two pieces both sides and the tests share:
++//   * the per-chunk byte/time model that chooses compute vs lend (pure: unit-tested without a GPU)
++//   * NativePicks: "compute these (token, expert) picks' rows on this device" - the native grouped expert kernels the
++//     decode path already runs on both cards, used by the expert process to serve a request AND by card 1 to compute a
++//     failed request's experts itself (one definition of that call sequence, two callers).
++#include <cmath>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace strata::core {
++
++// ---- the cost model ----------------------------------------------------------------------------------------------------
++/// What one prompt chunk would cost each way.  Rates are bytes or picks per second.
++struct PrefillCostIn {
++    int64_t tokens = 0, layers = 0, k = 0, n_expert = 0, hidden = 0;
++    double remote_bytes = 0;   ///< blob bytes of every expert the other card holds (all layers)
++    double pick_share = 0;     ///< share of (token, k) picks routed to those experts (measured, seeded by their count share)
++    bool stream_all = false;   ///< the chunk streams every non-resident expert whatever its routing (T >= stream_all_min)
++    double lend_Bps = 0;       ///< lending: other card VRAM -> host -> card 1, end to end
++    double wire_Bps = 0;       ///< compute: the prefill region's rows and sums through host memory and the other card's link
++    double pick_rate = 0;      ///< compute: picks per second the other card's expert kernels sustain
++    double layer_s = 0;        ///< compute: fixed cost per layer request (publish, wake, launch, answer)
++    int row_bytes = 2;         ///< compute: bytes per row element on the wire (2 fp16, 4 f32)
++};
++struct PrefillChoice {
++    bool compute = false;
++    double t_lend = 0, t_compute = 0, lend_bytes = 0, wire_bytes = 0, picks = 0;
++};
++
++/// Defaults, each a measurement or a stated estimate (STRATA_D4_* environment variables override them):
++///   lend 1.8 GB/s   MEASURED 2026-11-09: 13 GiB lent for a 3.5k prompt in the 75-85% of its 9.7 s spent in `wait copy`
++///   pick 2.0e5/s    MEASURED (D8 SEABRAID_STRATA_CARD_BENCH, 16 rows/expert): 24 GB NVIDIA GPU 226k, 32 GB AMD GPU 270k, 12 GB NVIDIA GPU 167k rows/s; the 24 GB NVIDIA GPU's, rounded down
++///   wire 3.0 GB/s   ESTIMATE: half of PCIe 3.0 x8 (the 24 GB NVIDIA GPU's link), pageable copies both ways; not measured yet
++///   layer 100 us    MEASURED: a decode layer request's round trip is 65-78 us (helper zero-copy off, 2026-11-06)
++inline constexpr double kD4LendBps = 1.8e9, kD4PickRate = 2.0e5, kD4WireBps = 3.0e9, kD4LayerS = 1.0e-4;
++
++/// The model.  WHY THESE TERMS: they are the costs that DIFFER between the two modes; card 1's attention, router and own
++/// experts are the same work either way.  Lending moves every held blob a chunk touches over the other card's link once per
++/// chunk (all of them when the chunk streams, else the share a uniform routing of T tokens touches); computing moves a
++/// fixed 4H + 8K bytes per token per layer (PrefillRegion::token_bytes) and runs the picks there.  Lending saturates
++/// with T, computing grows with T, so computing wins below a crossover and the model picks per chunk.
++inline PrefillChoice prefill_cost(const PrefillCostIn& c) {
++    PrefillChoice r;
++    const double T = (double) c.tokens, L = (double) c.layers, K = (double) c.k;
++    const double touched = c.stream_all ? 1.0 : 1.0 - std::pow(1.0 - K / (double) c.n_expert, T);
++    r.lend_bytes = c.remote_bytes * touched;
++    r.t_lend = c.lend_Bps > 0 ? r.lend_bytes / c.lend_Bps : 1e30;
++    r.picks = T * K * L * c.pick_share;
++    r.wire_bytes = T * L * ((double) (c.row_bytes + 2) * (double) c.hidden + 8.0 * K);
++    r.t_compute = (c.pick_rate > 0 ? r.picks / c.pick_rate : 1e30) + (c.wire_Bps > 0 ? r.wire_bytes / c.wire_Bps : 1e30) +
++                  L * c.layer_s;
++    r.compute = r.t_compute < r.t_lend;
++    return r;
++}
++
++/// The chunk size where the two are equal in the streamed (saturated) regime: below it computing wins.  A function of the
++/// model's inputs only (the report line and the tests read it); +inf when computing always wins, 0 when it never does.
++inline double prefill_crossover_tokens(const PrefillCostIn& c) {
++    const double L = (double) c.layers, K = (double) c.k;
++    const double per_tok = K * L * c.pick_share / c.pick_rate + L * ((double) (c.row_bytes + 2) * (double) c.hidden + 8.0 * K) / c.wire_Bps;
++    const double fixed = c.remote_bytes / c.lend_Bps - L * c.layer_s;
++    if (fixed <= 0) return 0;
++    return per_tok > 0 ? fixed / per_tok : INFINITY;
++}
++
++// ---- NativePicks: the expert process's (and card 1's fallback's) device runner ----------------------------------------
++/// Device buffers and the call sequence for "rows of these picks on this device": optional Hadamard rotation (APR), q8_1
++/// activations, the native grouped expert kernels.  Capacities grow on first use (cudaMalloc on the CURRENT device) and are
++/// kept; nothing here is allocated by a process that never reads a prompt this way.  Not thread-safe; one stream.
++class NativePicks {
++public:
++    NativePicks() = default;
++    ~NativePicks();
++    NativePicks(const NativePicks&) = delete;
++    NativePicks& operator=(const NativePicks&) = delete;
++    /// The activations of `n_tok` tokens (f32, device, n_tok x H) for `layer`: rotated if its gate/up is Hadamard-folded,
++    /// then q8_1.  Valid for run() until the next call.
++    bool input(int64_t layer, const float* x_dev, int64_t n_tok, void* stream, std::string& err);
++    /// Rows of `ng` groups (blob `ptr[g]` on this device, entries [start[g], start[g+1])) into `out_dev` (row ent_row[e]
++    /// gets token ent_tok[e]'s product, H floats).  Host tables, uploaded here.
++    bool run(int64_t layer, const unsigned long long* ptr, const int32_t* start, int32_t ng, const int32_t* ent_row,
++             const int32_t* ent_tok, int32_t ne, float* out_dev, void* stream, std::string& err);
++    void release();
++
++private:
++    bool grow(void** p, size_t& cap, size_t want, std::string& err);
++    void *q8_ = nullptr, *xr_ = nullptr, *scratch_ = nullptr, *meta_ = nullptr;
++    size_t q8_cap_ = 0, xr_cap_ = 0, scratch_cap_ = 0, meta_cap_ = 0;
++    const float *sx_ = nullptr, *sh_ = nullptr;   // APR sign vectors on this device (hadamard_device_signs: process-wide)
++    int64_t n_tok_ = 0;
++    std::vector<uint8_t> host_;                   // run()'s tables before their one upload
++};
++
++class ExpertSource;
++
++/// D4's failure path on CARD 1: when the expert process could not answer a layer, card 1 computes that layer's handed-over
++/// picks itself - each expert's blob read from `files`, copied to this device and run through NativePicks into the
++/// prompt path's own rows (row r of `Dm` gets token row_tok[r]'s product), after which the plain combine sums every row.
++/// Slow (one expert at a time, synchronous) and only ever run after a loud failure; correctness, not speed, is its job.
++/// It reads the FILES, never the expert card: the card that just failed is the last place to ask for bytes.
++class Card1Rows {
++public:
++    Card1Rows() = default;
++    ~Card1Rows();
++    Card1Rows(const Card1Rows&) = delete;
++    Card1Rows& operator=(const Card1Rows&) = delete;
++    /// `experts` (n of them) of `layer`: rows [off[e], off[e] + cnt[e]) of Dm.  `x_dev`: the layer's f32 input, T x H.
++    bool run(int64_t layer, const float* x_dev, int64_t T, const int32_t* experts, int n, const int32_t* off,
++             const int32_t* cnt, const int32_t* row_tok, float* Dm, ExpertSource& files, void* stream, std::string& err);
++
++private:
++    NativePicks np_;
++    uint8_t* host_ = nullptr;   // pinned staging for one blob
++    void* blob_ = nullptr;      // the blob on this device
++    size_t cap_ = 0;
++};
++
++} // namespace strata::core
+diff --git a/include/strata/prefill/d4_check.hpp b/include/strata/prefill/d4_check.hpp
+new file mode 100644
+index 000000000..0ab8a6943
+--- /dev/null
++++ b/include/strata/prefill/d4_check.hpp
+@@ -0,0 +1,51 @@
++#pragma once
++// STRATA_D4_CHECK=1 (diagnostic, off by default): for every D4 layer, compare what the expert process returned with what this
++// card computes for the SAME picks, and say where the two differ.  Reports per layer and per quant type:
++//   E1  returned sums vs this card's exact-input product   (the whole D4 error: fp16 rows + fp16 sums + the two cards' kernels)
++//   E2  returned sums vs this card's product of the fp16 rows (removes the row rounding: kernels + sum rounding)
++//   E3  fp16-row product vs exact-input product              (the row rounding alone)
++//   E4  returned sums vs fp16(E2's reference)                (removes the sum rounding too: kernel disagreement only)
++//   DEC the combine's fp16 decode on this device vs the exact bit decode (a wrong decode would be invisible to E1-E4)
++// Each is nrmse = |a-b|/|b|, max|a-b|/max|b|, signed bias = mean(a-b)/rms(b), scale = <a,b>/<b,b> (1 = no gain error).
++#include "strata/core/remote_prefill.hpp"
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace strata::prefill {
++
++struct D4CheckIn {
++    int64_t layer = 0, T = 0, from = 0;     ///< the handed-over picks are the (token, k) whose `slot` is >= from
++    const float* x = nullptr;               ///< the layer's f32 input (T x H, device)
++    const uint16_t* x16 = nullptr;          ///< its fp16 image (what the request carried), device
++    const int32_t* slot = nullptr;          ///< device (token, k) -> Dm row of the pick's product (see `from`)
++    const float* w = nullptr;               ///< device router weights
++    float* Dm = nullptr;
++    const uint16_t* sum16 = nullptr;        ///< the expert process's sums (mapped host)
++    std::vector<int32_t> experts;           ///< the handed-over experts of this layer
++    const int32_t *off = nullptr, *cnt = nullptr, *row_tok = nullptr;
++    void* stream = nullptr;
++};
++
++class D4Check {
++public:
++    D4Check() = default;
++    ~D4Check();
++    D4Check(const D4Check&) = delete;
++    D4Check& operator=(const D4Check&) = delete;
++    static bool enabled();   ///< STRATA_D4_CHECK is set and non-zero
++    /// STRATA_D4_CHECK=2 (a CONTROL, not a mode to run in): after the comparison the layer uses THIS card's own product of the
++    /// handed-over picks instead of the expert process's sums - the failure path, forced.  An arm run this way shows what the
++    /// engine does when D4's remote arithmetic is replaced by the arithmetic of the path D4 is compared against.
++    static bool use_reference();
++    /// Computes the reference on `card1` and prints one line to stderr.  False with `err` when the reference cannot be run.
++    bool run(core::Card1Rows& card1, core::ExpertSource& files, const D4CheckIn& in, std::string& err);
++
++private:
++    float *ref_ = nullptr, *refh_ = nullptr, *xr_ = nullptr, *dec_ = nullptr;
++    size_t cap_ = 0;   // elements per buffer
++    std::vector<float> h_ref_, h_refh_, h_dec_;
++};
++
++} // namespace strata::prefill
+diff --git a/include/strata/prefill/d4_plan.hpp b/include/strata/prefill/d4_plan.hpp
+new file mode 100644
+index 000000000..ad95b9656
+--- /dev/null
++++ b/include/strata/prefill/d4_plan.hpp
+@@ -0,0 +1,74 @@
++#pragma once
++// D4 (STRATA_PREFILL_REMOTE_COMPUTE): the host-side plan of one MoE layer of a prompt chunk - which picks go to the expert
++// process, what card 1 keeps, and where the expert card's picks land if card 1 has to compute them itself.  Host only (no GPU
++// runtime, no engine state), so prefill.cpp and tests/prefill/d4_plan_test.cpp run ONE definition of it.
++//
++// WHY THIS EXISTS (the D4 precision root cause).  D4 first took the host-grouped MMQ expert path on every layer it touched,
++// because that path has the host's routing in hand.  On an engine whose default prompt path is the fused int8 kernels
++// (HIP gfx12) that silently changed card 1's OWN experts from the fused to the MMQ kernels for the whole chunk - a
++// kernel change worth KL ~0.03 against the fused path (the engine's own gfx12 MMQ note), unrelated to the experts D4 moved.
++// The plan below needs only the routed ids, so the fused path can serve a D4 layer too: remote picks are masked out of the
++// ids the fused grouping sees (`ids_local`), and card 1's failure path knows their rows (`off`/`cnt`/`row_tok`/`remote_slot`).
++#include <cstdint>
++#include <vector>
++
++namespace strata::prefill {
++
++/// The path card 1's own experts take for a layer.  D4 must never change it (one rule, one place; d4_plan_test pins it).
++enum class ExpertPath { kMmq, kFused };
++
++/// `fused_ok`: the layer would take the fused kernels without D4.  `d4`: this layer hands experts to the expert process.
++/// The answer does not depend on `d4` - that independence is the point: D4 moves picks, it does not change how the
++/// picks card 1 keeps are computed.
++inline ExpertPath expert_path(bool fused_ok, bool d4) {
++    (void) d4;
++    return fused_ok ? ExpertPath::kFused : ExpertPath::kMmq;
++}
++
++struct D4Split {
++    std::vector<uint8_t> mask;          ///< per expert: handed to the expert process this layer (routed, held there, not on card 1)
++    int64_t rows_rem = 0;               ///< picks handed over
++    int64_t local_rows = 0;             ///< picks card 1 keeps (rows [0, local_rows) of Dm); ids outside [0, n_expert) are in neither
++    std::vector<int32_t> ids_local;     ///< T*K: the router's ids with every handed-over pick replaced by -1 (what the grouping sees)
++    std::vector<int32_t> remote_slot;   ///< T*K: the Dm row of a handed-over pick if card 1 computes it, else -1
++    std::vector<int32_t> off, cnt;      ///< per expert (n_expert + 1 offsets): rows [off[e], off[e] + cnt[e]) of Dm hold expert e's picks
++    std::vector<int32_t> row_tok;       ///< per Dm row (absolute index, as Card1Rows reads it): the token of a handed-over row
++};
++
++/// `holds(e)`: the expert process holds expert e of this layer.  `on_card1(e)`: card 1 has it resident (it keeps those: no copy
++/// needed).  Rows of handed-over experts go after card 1's own, expert id ascending, picks in (token, k) order inside one.
++template <class Holds, class OnCard1>
++inline void d4_split(const int32_t* ids, int64_t T, int64_t K, int32_t n_expert, Holds holds, OnCard1 on_card1, D4Split& s) {
++    const int64_t n = T * K;
++    s.mask.assign((size_t) n_expert, 0);
++    s.cnt.assign((size_t) n_expert + 1, 0);
++    s.off.assign((size_t) n_expert + 1, 0);
++    s.ids_local.assign((size_t) n, -1);
++    s.remote_slot.assign((size_t) n, -1);
++    for (int64_t i = 0; i < n; ++i)
++        if (ids[i] >= 0 && ids[i] < n_expert) ++s.cnt[(size_t) ids[i]];
++    int64_t rem = 0, valid = 0;
++    for (int32_t e = 0; e < n_expert; ++e) {
++        valid += s.cnt[(size_t) e];
++        s.mask[(size_t) e] = s.cnt[(size_t) e] > 0 && holds(e) && !on_card1(e) ? 1 : 0;
++        if (s.mask[(size_t) e]) rem += s.cnt[(size_t) e];
++    }
++    s.rows_rem = rem;
++    s.local_rows = valid - rem;
++    int32_t r = (int32_t) s.local_rows;
++    for (int32_t e = 0; e < n_expert; ++e)
++        if (s.mask[(size_t) e]) { s.off[(size_t) e] = r; r += s.cnt[(size_t) e]; }
++    s.row_tok.assign((size_t) valid, 0);
++    std::vector<int32_t> next(s.off.begin(), s.off.begin() + n_expert);
++    for (int64_t i = 0; i < n; ++i) {
++        const int32_t e = ids[i];
++        const bool mine = e >= 0 && e < n_expert && s.mask[(size_t) e];
++        s.ids_local[(size_t) i] = mine ? -1 : e;
++        if (!mine) continue;
++        const int32_t row = next[(size_t) e]++;
++        s.remote_slot[(size_t) i] = row;
++        s.row_tok[(size_t) row] = (int32_t) (i / K);
++    }
++}
++
++} // namespace strata::prefill
+diff --git a/include/strata/prefill/kernels.hpp b/include/strata/prefill/kernels.hpp
+index c47cb277c..66a5a49aa 100644
+--- a/include/strata/prefill/kernels.hpp
++++ b/include/strata/prefill/kernels.hpp
+@@ -141,6 +141,14 @@ void peer_gather_add(float* sum, const float* rows, int64_t r0, const float* wk,
+ /// moe_combine_peer with the peer's sums in FP16 (`peer16`, may be mapped host memory)
+ void moe_combine_peer16(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                         const uint16_t* peer16, int64_t rows_local, float* bo, int64_t T, void* stream);
++/// D4 diagnostic (STRATA_D4_CHECK): out[t, :] = sum over k of w[t,k] * D[slot[t,k], :] for the rows slot >= from (f32, combine order)
++void d4_ref_sum(const float* D, const int32_t* slot, const float* w, int64_t from, float* out, int64_t T, void* stream);
++/// D4 on a fused layer: slot[i] = sentinel where ids_local[i] < 0 (a pick the expert card computes), so the combine skips its Dm row
++void d4_mark_remote(int32_t* slot, const int32_t* ids_local, int64_t n, int32_t sentinel, void* stream);
++/// D4 failure path on a fused layer: slot[i] = rslot[i] where rslot[i] >= 0 (the pick card 1 computed into that Dm row)
++void d4_apply_remote(int32_t* slot, const int32_t* rslot, int64_t n, void* stream);
++/// D4 diagnostic: out[i] = the combine's fp16 decode of p[i] (p may be mapped host memory)
++void d4_decode_f16(const uint16_t* p, float* out, int64_t n, void* stream);
+ /// y = FP16 bits of x, saturated at +-65504 (the peer's sums on their way back; eddoursul/Strata 2acfac4)
+ void sums_to_f16(const float* x, uint16_t* y, int64_t n, void* stream);
+ /// dst[0, n) = FP32 of the FP16 src[0, n) (n a multiple of 8, 16-byte aligned; src may be mapped host memory)
+diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
+index dfcadaad0..c19716ad6 100644
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -24,7 +24,7 @@
+ #include <memory>
+ #include <string>
+ 
+-namespace strata::core { class PeerExperts; }
++namespace strata::core { class PeerExperts; class RemoteExperts; }
+ namespace strata::kernels::cpu { class ExpertPool; }
+ 
+ namespace strata::prefill {
+@@ -303,6 +303,13 @@ public:
+     /// thread runs meanwhile (no batch slots); on a layer split every stage may have it - one stage at a time takes it
+     /// for a chunk. Set before `init`.
+     void set_cpu_pool(kernels::cpu::ExpertPool* pool);
++    /// D4 (STRATA_PREFILL_REMOTE_COMPUTE): `remote` is a seabraid expert tier whose prefill_open() succeeded.  Per chunk its
++    /// byte/time model chooses: COMPUTE - the experts it holds are neither streamed nor computed here, their picks go to
++    /// the expert process and its per-token sums are added in the combine - or LEND (today's path, unchanged).  Only on the
++    /// MMQ host-grouped walk of a single-stage path without a peer GPU; a layer outside it lends.  `files`: the source the
++    /// failure path reads blobs from (never the expert card, which has just failed).  Null (default): nothing changes.
++    /// Set before `init`.
++    void set_remote_compute(core::RemoteExperts* remote, core::ExpertSource* files) { rc_ = remote; rc_files_ = files; }
+     /// With STRATA_PREFILL_CPU_SHARE set and `applies` (a pool will be set): the chunks staged after their routing - the
+     /// only ones the share applies to - go up to STRATA_PREFILL_CPU_SHARE_MAX tokens (default 3072) instead of 1024.
+     /// Before any `bytes_needed` (the ring and the small-chunk buffers follow the limit); `init` also sets it.
+@@ -344,6 +351,8 @@ private:
+     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
+                                       bool owned_pages, bool src, int64_t tail = -1);
+     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
++    core::RemoteExperts* rc_ = nullptr;              ///< set_remote_compute (D4)
++    core::ExpertSource* rc_files_ = nullptr;
+     // Layer-major prefill: the super-chunk's buffers for an n-token prompt (its size, 0 = not this prompt: `why`),
+     // the run, and the buffers given back after it.  `cap` (> 0): at most that many tokens (a layer split's stages
+     // share one size); lm_prepare_chain sizes every stage of a split.
+diff --git a/include/strata/seabraid/prefill_wire.hpp b/include/strata/seabraid/prefill_wire.hpp
+new file mode 100644
+index 000000000..c33052104
+--- /dev/null
++++ b/include/strata/seabraid/prefill_wire.hpp
+@@ -0,0 +1,172 @@
++#pragma once
++// seabraid D4: the host-side logic of a prefill request over the channel's v7 prefill region (channel.hpp owns the bytes'
++// layout; this file owns what goes into them and how the expert process walks them).  Host only, no GPU runtime: card 1,
++// the expert process and the CPU test all include it, so the three run ONE definition of the request.
++//
++//   card 1  : pack_prefill_request()  - one token range of one layer: fp16 rows, pick ids (-1 = not the expert process's),
++//                                       router weights; then Channel::pf_publish()
++//   process : serve_prefill<Backend>() - validate, plan_prefill_batches(), Backend computes each batch's pick rows and
++//                                       reduces them to per-token weighted sums, writes out16 + the echo
++//   reference: prefill_reduce_ref()    - the reduction the GPU kernel (remote_expert_opt.cu prefill_reduce_f16) performs,
++//                                       written out in the same order, for the CPU test backend
++#include "strata/seabraid/channel.hpp"
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstdint>
++#include <cstring>
++#include <string>
++#include <vector>
++
++namespace seabraid {
++
++/// Card 1: writes tokens [t0, t0 + n) of one layer into the prefill region.  `rows` (T x hidden, `row_bytes` per element: kPfRowsF16
++/// or kPfRowsF32 - the type this card's own expert path quantizes for the layer), `w` and `ids'
++/// (T x k, token-major, as Strata's router leaves them) are the WHOLE chunk's; `remote_e[e]` != 0 marks the experts card 1
++/// hands to the expert process for this layer (the same mask its grouping used to put their rows in the tail - one
++/// predicate, so a pick is never computed twice or not at all).  Returns the picks it asked for, -1 if it does not fit.
++inline int64_t pack_prefill_request(const Channel& ch, int32_t layer, int64_t t0, int64_t n, int64_t hidden, int64_t k,
++                                    const void* rows, int32_t row_bytes, const float* w, const int32_t* ids,
++                                    const uint8_t* remote_e, int64_t n_expert) {
++    Header* h = ch.header();
++    if (n <= 0 || n > h->pf_tokens || k != h->pf_k || hidden != h->hidden || (row_bytes != kPfRowsF16 && row_bytes != kPfRowsF32)) return -1;
++    std::memcpy(ch.pf_rows(), (const uint8_t*) rows + (size_t) (t0 * hidden) * (size_t) row_bytes, (size_t) (n * hidden) * (size_t) row_bytes);
++    h->pf_row_bytes = row_bytes;
++    int32_t* pick = ch.pf_pick();
++    float* wt = ch.pf_wt();
++    int64_t picks = 0;
++    for (int64_t i = 0; i < n * k; ++i) {
++        const int32_t e = ids[t0 * k + i];
++        const bool mine = e >= 0 && e < n_expert && remote_e[e] != 0;
++        pick[i] = mine ? e : -1;
++        wt[i] = mine ? w[t0 * k + i] : 0.0f;
++        picks += mine;
++    }
++    h->pf_layer = layer;
++    h->pf_ntok = (int32_t) n;
++    h->pf_ok = 0;
++    h->pf_picks = -1;   // a stale echo from the previous request must never pass card 1's check
++    h->pf_err[0] = '\0';
++    return picks;
++}
++
++/// One sub-batch of a request: a token block [t0, t1) whose picks are grouped by expert (ascending id; entries in token
++/// order inside a group).  Token blocks, not one batch per layer: the expert process's row buffer and kernel scratch are
++/// sized by `max_entries` (device memory), and a block's reduction is final - it never accumulates across batches.
++struct PrefillBatch {
++    int32_t t0 = 0, t1 = 0;
++    std::vector<int32_t> grp_expert, grp_start;   // groups; grp_start has one entry more (the end)
++    std::vector<int32_t> ent_tok, ent_row;        // per entry: token (request-relative) and its row in the batch's rows
++    std::vector<int32_t> row_of;                  // (t1 - t0) x k: the row holding pick (t, k), or -1
++};
++
++/// Splits a request's picks into token blocks of at most `max_entries` picks.  False with `why` on an id out of range or a
++/// width that cannot hold one token's picks.
++inline bool plan_prefill_batches(const int32_t* pick, int64_t n_tok, int64_t k, int64_t n_expert, int64_t max_entries,
++                                 std::vector<PrefillBatch>& out, std::string& why) {
++    out.clear();
++    if (k <= 0 || max_entries < k) { why = "prefill plan: max_entries " + std::to_string(max_entries) + " < k"; return false; }
++    std::vector<int32_t> cnt((size_t) n_expert, 0), at((size_t) n_expert, 0);
++    int64_t t = 0;
++    while (t < n_tok) {
++        PrefillBatch b;
++        b.t0 = (int32_t) t;
++        int64_t ents = 0;
++        for (; t < n_tok; ++t) {
++            int64_t mine = 0;
++            for (int64_t j = 0; j < k; ++j) mine += pick[t * k + j] >= 0;
++            if (ents + mine > max_entries) break;
++            ents += mine;
++        }
++        b.t1 = (int32_t) t;
++        std::fill(cnt.begin(), cnt.end(), 0);
++        for (int64_t i = (int64_t) b.t0 * k; i < (int64_t) b.t1 * k; ++i) {
++            const int32_t e = pick[i];
++            if (e < -1 || e >= n_expert) { why = "prefill plan: pick " + std::to_string(e) + " out of range"; return false; }
++            if (e >= 0) ++cnt[(size_t) e];
++        }
++        int32_t r = 0;
++        for (int32_t e = 0; e < (int32_t) n_expert; ++e) {
++            if (cnt[(size_t) e] == 0) continue;
++            b.grp_expert.push_back(e);
++            b.grp_start.push_back(r);
++            at[(size_t) e] = r;
++            r += cnt[(size_t) e];
++        }
++        b.grp_start.push_back(r);
++        b.ent_tok.assign((size_t) r, 0);
++        b.ent_row.assign((size_t) r, 0);
++        b.row_of.assign((size_t) (b.t1 - b.t0) * (size_t) k, -1);
++        for (int64_t i = (int64_t) b.t0 * k; i < (int64_t) b.t1 * k; ++i) {   // token order inside each group
++            const int32_t e = pick[i];
++            if (e < 0) continue;
++            const int32_t row = at[(size_t) e]++;
++            b.ent_tok[(size_t) row] = (int32_t) (i / k);
++            b.ent_row[(size_t) row] = row;
++            b.row_of[(size_t) (i - (int64_t) b.t0 * k)] = row;
++        }
++        out.push_back(std::move(b));
++    }
++    return true;
++}
++
++/// The per-token reduction of one batch, exactly as the GPU kernel performs it: for each token and column, the picks in k
++/// order, fmaf(weight, row, s) from s = 0.  `rows` is the batch's rows (H floats each); `sum` gets (t1 - t0) x hidden.
++inline void prefill_reduce_ref(const PrefillBatch& b, const float* rows, const float* wt, int64_t k, int64_t hidden,
++                               float* sum) {
++    for (int32_t t = b.t0; t < b.t1; ++t)
++        for (int64_t d = 0; d < hidden; ++d) {
++            float s = 0.0f;
++            for (int64_t j = 0; j < k; ++j) {
++                const int32_t r = b.row_of[(size_t) ((t - b.t0) * k + j)];
++                if (r >= 0) s = std::fmaf(wt[(size_t) (t * k + j)], rows[(size_t) r * (size_t) hidden + (size_t) d], s);
++            }
++            sum[(size_t) (t - b.t0) * (size_t) hidden + (size_t) d] = s;
++        }
++}
++
++/// The expert process: serve the request now in the region.  Backend (GPU in RemoteExperts, CPU in the test):
++///   bool holds(int32_t layer, int32_t expert);
++///   bool begin(int32_t layer, const void* rows, int32_t row_bytes, int64_t n_tok, std::string& err);   // rows in (fp16 or f32), ready
++///   bool batch(int32_t layer, const PrefillBatch& b, const float* wt, std::string& err); // rows + their per-token sums
++///   bool end(uint16_t* out16, int64_t n_tok, std::string& err);                         // sums out; false on non-finite
++/// Never answers a pick it does not hold with zeros: a pick it cannot compute fails the whole request, and card 1
++/// computes the layer's remote experts itself (prefill.cpp, the fallback), so no contribution is ever silently missing.
++template <class Backend>
++inline bool serve_prefill(const Channel& ch, Backend& be, int64_t n_expert, int64_t max_entries, std::string& err) {
++    Header* h = ch.header();
++    const auto t_start = std::chrono::steady_clock::now();
++    const int32_t layer = h->pf_layer;
++    const int64_t n = h->pf_ntok, k = h->pf_k;
++    bool ok = n >= 1 && n <= h->pf_tokens && layer >= 0 && layer < h->n_layers && h->pf_format == kPfFp16 &&
++              (h->pf_row_bytes == kPfRowsF16 || h->pf_row_bytes == kPfRowsF32);
++    if (!ok) err = "prefill request: layer " + std::to_string(layer) + ", " + std::to_string((long long) n) + " tokens (region holds " +
++                   std::to_string((long long) h->pf_tokens) + ")";
++    int64_t picks = 0;
++    std::vector<PrefillBatch> plan;
++    if (ok) {
++        const int32_t* pick = ch.pf_pick();
++        for (int64_t i = 0; ok && i < n * k; ++i) {
++            if (pick[i] < 0) continue;
++            ++picks;
++            if (pick[i] >= n_expert || !be.holds(layer, pick[i])) {
++                err = "prefill request: layer " + std::to_string(layer) + " expert " + std::to_string(pick[i]) + " is not held here";
++                ok = false;
++            }
++        }
++        ok = ok && plan_prefill_batches(pick, n, k, n_expert, max_entries, plan, err);
++    }
++    ok = ok && be.begin(layer, ch.pf_rows(), h->pf_row_bytes, n, err);
++    for (size_t i = 0; ok && i < plan.size(); ++i) ok = be.batch(layer, plan[i], ch.pf_wt(), err);
++    ok = ok && be.end(ch.pf_out16(), n, err);
++    h->pf_picks = ok ? (int32_t) picks : -1;
++    h->pf_ok = ok ? 1 : 0;
++    if (!ok) std::snprintf(h->pf_err, sizeof(h->pf_err), "%s", err.c_str());
++    h->pf_svc_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_start).count();
++    h->pf_svc_n += 1;
++    return ok;
++}
++
++} // namespace seabraid
+diff --git a/src/core/remote_expert_opt.cu b/src/core/remote_expert_opt.cu
+index 858004280..add10f987 100644
+--- a/src/core/remote_expert_opt.cu
++++ b/src/core/remote_expert_opt.cu
+@@ -3,6 +3,7 @@
+ #include "strata/core/on_device.hpp"
+ #include "strata/kernels/cpu/expert_layout.hpp"
+ #include "strata/kernels/elementwise.hpp"
++#include "strata/kernels/f16_bits.hpp"
+ #include "strata/kernels/verify_kernels.hpp"
+ #include "strata/kernels/window_limits.hpp"
+ 
+@@ -32,6 +33,27 @@ __global__ void reduce_experts(const float* parts, const ReduceMeta* meta, float
+     sum[(int64_t) t * H + c] = v;
+ }
+ 
++// D4: one thread per (token, column); the picks in k order, fmaf from 0 - prefill_reduce_ref's order exactly.
++__global__ void prefill_reduce_kernel(const float* rows, const int32_t* row_of, const float* wt, int64_t n_tok, int k,
++                                      uint16_t* out16, int32_t* bad) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n_tok * H) return;
++    const int64_t t = i / H, c = i % H;
++    float s = 0.0f;
++    for (int j = 0; j < k; ++j) {
++        const int32_t r = row_of[t * k + j];
++        if (r >= 0) s = fmaf(wt[t * k + j], rows[(int64_t) r * H + c], s);
++    }
++    const uint16_t h = strata::kernels::f16_from_f32(s);
++    if ((h & 0x7C00u) == 0x7C00u) atomicOr(bad, 1);   // inf or NaN in fp16: card 1 must not add it
++    out16[i] = h;
++}
++
++__global__ void prefill_f16_to_f32_kernel(const uint16_t* x16, float* x, int64_t n) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < n) x[i] = strata::kernels::f32_from_f16(x16[i]);
++}
++
+ // Like the upstream mapped-row copy, also skip rows returned in the remote sum.
+ __global__ void copy_cpu_rows(float4* dst, const volatile float4* src, const int32_t* mask,
+                               const int32_t* hit_rows, const int32_t* count) {
+@@ -49,6 +71,19 @@ __global__ void copy_cpu_rows(float4* dst, const volatile float4* src, const int
+ }
+ } // namespace
+ 
++void prefill_reduce_f16(const float* rows, const int32_t* row_of, const float* wt, int64_t n_tok, int64_t k,
++                        uint16_t* out16, int32_t* bad, void* stream) {
++    if (n_tok <= 0) return;
++    const int64_t n = n_tok * H;
++    prefill_reduce_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(rows, row_of, wt, n_tok, (int) k,
++                                                                                          out16, bad);
++}
++
++void prefill_f16_to_f32(const uint16_t* x16, float* x, int64_t n, void* stream) {
++    if (n <= 0) return;
++    prefill_f16_to_f32_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(x16, x, n);
++}
++
+ void RemoteExpertOpt::attach(RemoteExperts& remote) {
+     remote.remote_opt_ = this;
+     peers_.push_back({&remote});
+diff --git a/src/core/remote_experts.cpp b/src/core/remote_experts.cpp
+index e2dcd0c62..eea6bce25 100644
+--- a/src/core/remote_experts.cpp
++++ b/src/core/remote_experts.cpp
+@@ -121,6 +121,7 @@ void RemoteExperts::close() {
+         bl_.reset();
+         bl_held_.clear();
+         bl_resident_ = 0; bl_gib_ = 0; bl_pending_ = false;
++        pf_open_ = pf_dead_ = pf_pending_ = false;   // D4: a reopened channel is checked again by prefill_open
+         device_ = -1;
+         original_row_.clear();
+         layers_present_.clear();
+@@ -131,6 +132,7 @@ void RemoteExperts::close() {
+     if (scope.ok) {
+         if (stream_) cudaStreamSynchronize(stream_);
+         if (read_stream_) cudaStreamSynchronize(read_stream_);
++        pf_gpu_.reset();   // D4 serving buffers (this device's), before the cache they point into
+         cache_.close();
+         if (d_x_) cudaFree(d_x_);
+         if (d_out_) cudaFree(d_out_);
+diff --git a/src/core/remote_prefill.cpp b/src/core/remote_prefill.cpp
+new file mode 100644
+index 000000000..79fef0a59
+--- /dev/null
++++ b/src/core/remote_prefill.cpp
+@@ -0,0 +1,365 @@
++// D4 (STRATA_PREFILL_REMOTE_COMPUTE): prompt reading with the other card computing the experts it holds.  OWNER of the
++// card-1 side of the request (RemoteExperts::prefill_*), the expert process's device side (prefill_serve + NativePicks)
++// and nothing else: the region's bytes are channel.hpp's, the request's host logic prefill_wire.hpp's, the reduction
++// remote_expert_opt.cu's, and the prompt path only calls in (prefill.cpp).  See remote_prefill.hpp for the cost model.
++#include "strata/core/remote_prefill.hpp"
++#include "strata/core/remote_experts.hpp"
++#include "strata/core/remote_expert_opt.hpp"
++#include "strata/seabraid/prefill_wire.hpp"
++
++#include "strata/kernels/cpu/expert_layout.hpp"
++#include "strata/kernels/cpu/hadamard.hpp"
++#include "strata/kernels/iq_kernels.hpp"
++
++#include <cuda_runtime.h>
++
++#include <algorithm>
++#include <cerrno>
++#include <chrono>
++#include <csignal>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++namespace strata::core {
++namespace {
++constexpr int64_t H = strata::kernels::cpu::H;
++constexpr int64_t FF = strata::kernels::cpu::FF;
++// The expert process's sub-batch: picks per kernel launch.  Its rows (2048 x H f32 = 21 MB) and the kernels' scratch
++// (~17 MB) are DEVICE memory on a card that is full of experts, so they are bounded by this constant, not by the request.
++constexpr int64_t kServeEntries = 2048;
++
++bool ok_cuda(cudaError_t r, const char* what, std::string& err) {
++    if (r == cudaSuccess) return true;
++    err = std::string("D4 ") + what + ": " + cudaGetErrorString(r);
++    return false;
++}
++double env_or(const char* name, double dflt) {
++    const char* v = std::getenv(name);
++    return v != nullptr && std::atof(v) > 0 ? std::atof(v) : dflt;
++}
++} // namespace
++
++// ---- NativePicks -------------------------------------------------------------------------------------------------------
++NativePicks::~NativePicks() { release(); }
++
++void NativePicks::release() {
++    for (void** p : {&q8_, &xr_, &scratch_, &meta_}) { if (*p) cudaFree(*p); *p = nullptr; }
++    q8_cap_ = xr_cap_ = scratch_cap_ = meta_cap_ = 0;
++}
++
++bool NativePicks::grow(void** p, size_t& cap, size_t want, std::string& err) {
++    if (want <= cap) return true;
++    if (*p) cudaFree(*p);
++    *p = nullptr;
++    cap = 0;
++    if (!ok_cuda(cudaMalloc(p, want), "device buffer", err)) { *p = nullptr; return false; }
++    cap = want;
++    return true;
++}
++
++bool NativePicks::input(int64_t layer, const float* x_dev, int64_t n_tok, void* stream, std::string& err) {
++    const auto& lay = strata::kernels::cpu::expert_layout();
++    if (!lay.native || layer < 0 || (size_t) layer >= lay.fmt.size()) { err = "D4: the expert kernels need a native pack"; return false; }
++    const auto& fmt = lay.fmt[(size_t) layer];
++    const float* xe = x_dev;
++    if (fmt.had_gu) {   // APR: Hadamard-folded gate/up take H (s * x), exactly as RemoteExperts::begin rotates
++        if (!grow(&xr_, xr_cap_, (size_t) (n_tok * H) * sizeof(float), err)) return false;
++        if (sx_ == nullptr) sx_ = strata::kernels::hadamard_device_signs(strata::kernels::cpu::hadamard_signs((int) H), (int) H);
++        strata::kernels::hadamard_rows(x_dev, (float*) xr_, n_tok, H, fmt.had_block, sx_, stream);
++        xe = (const float*) xr_;
++    }
++    if (!grow(&q8_, q8_cap_, (size_t) n_tok * (size_t) (H / 32) * 36, err)) return false;
++    strata::kernels::quantize_q8_1_rows(xe, n_tok, H, q8_, stream);
++    n_tok_ = n_tok;
++    return ok_cuda(cudaGetLastError(), "input", err);
++}
++
++bool NativePicks::run(int64_t layer, const unsigned long long* ptr, const int32_t* start, int32_t ng, const int32_t* ent_row,
++                      const int32_t* ent_tok, int32_t ne, float* out_dev, void* stream, std::string& err) {
++    if (ng <= 0 || ne <= 0) return true;
++    const auto& fmt = strata::kernels::cpu::expert_layout().fmt[(size_t) layer];
++    // one upload for the five tables: [ptr ng | start ng+1 | count | dst ne | tok ne]
++    const size_t b_ptr = (size_t) ng * 8, b_start = ((size_t) ng + 1) * 4, b_cnt = 4, b_ent = (size_t) ne * 4;
++    const size_t bytes = b_ptr + b_start + b_cnt + 2 * b_ent;
++    if (!grow(&meta_, meta_cap_, bytes, err) ||
++        !grow(&scratch_, scratch_cap_, strata::kernels::native_expert_scratch_bytes(ne, FF), err)) return false;
++    host_.resize(bytes);
++    uint8_t* hm = host_.data();
++    std::memcpy(hm, ptr, b_ptr);
++    std::memcpy(hm + b_ptr, start, b_start);
++    std::memcpy(hm + b_ptr + b_start, &ng, b_cnt);
++    std::memcpy(hm + b_ptr + b_start + b_cnt, ent_row, b_ent);
++    std::memcpy(hm + b_ptr + b_start + b_cnt + b_ent, ent_tok, b_ent);
++    if (!ok_cuda(cudaMemcpyAsync(meta_, hm, bytes, cudaMemcpyHostToDevice, (cudaStream_t) stream), "tables", err)) return false;
++    auto* d = (uint8_t*) meta_;
++    auto L = strata::kernels::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff);
++    if (fmt.had_d) {
++        if (sh_ == nullptr) sh_ = strata::kernels::hadamard_device_signs(strata::kernels::cpu::hadamard_signs((int) FF), (int) FF);
++        L.had_block = fmt.had_block;
++        L.d_signs = sh_;
++    }
++    strata::kernels::native_expert_grouped(L, (const unsigned long long*) d, (const int32_t*) (d + b_ptr),
++                                           (const int32_t*) (d + b_ptr + b_start), (const int32_t*) (d + b_ptr + b_start + b_cnt),
++                                           (const int32_t*) (d + b_ptr + b_start + b_cnt + b_ent), ng, ne, q8_, scratch_,
++                                           out_dev, stream);
++    return ok_cuda(cudaGetLastError(), "expert kernels", err);
++}
++
++// ---- card 1's failure path ---------------------------------------------------------------------------------------------
++Card1Rows::~Card1Rows() {
++    if (host_) cudaFreeHost(host_);
++    if (blob_) cudaFree(blob_);
++}
++
++bool Card1Rows::run(int64_t layer, const float* x_dev, int64_t T, const int32_t* experts, int n, const int32_t* off,
++                    const int32_t* cnt, const int32_t* row_tok, float* Dm, ExpertSource& files, void* stream, std::string& err) {
++    const auto& lay = strata::kernels::cpu::expert_layout();
++    const size_t bytes = (size_t) lay.blob_bytes(layer);
++    if (cap_ < bytes) {
++        if (host_) cudaFreeHost(host_);
++        if (blob_) cudaFree(blob_);
++        host_ = nullptr; blob_ = nullptr; cap_ = 0;
++        if (!ok_cuda(cudaHostAlloc((void**) &host_, bytes, cudaHostAllocDefault), "fallback staging", err) ||
++            !ok_cuda(cudaMalloc(&blob_, bytes), "fallback blob", err)) return false;
++        cap_ = bytes;
++    }
++    if (!np_.input(layer, x_dev, T, stream, err)) return false;
++    std::vector<int32_t> rows, toks;
++    for (int i = 0; i < n; ++i) {
++        const int32_t e = experts[i], c = cnt[e];
++        if (c <= 0) continue;
++        if (!files.copy_blob(layer, e, host_)) {
++            err = "D4 fallback: the files have no blob for layer " + std::to_string(layer) + " expert " + std::to_string(e);
++            return false;
++        }
++        rows.clear(); toks.clear();
++        for (int32_t r = off[e]; r < off[e] + c; ++r) { rows.push_back(r); toks.push_back(row_tok[r]); }
++        const unsigned long long ptr = (unsigned long long) blob_;
++        const int32_t start[2] = {0, c};
++        if (!ok_cuda(cudaMemcpyAsync(blob_, host_, bytes, cudaMemcpyHostToDevice, (cudaStream_t) stream), "fallback copy", err) ||
++            !np_.run(layer, &ptr, start, 1, rows.data(), toks.data(), c, Dm, stream, err) ||
++            // the staging and the device blob are the next expert's: this one must be done with them
++            !ok_cuda(cudaStreamSynchronize((cudaStream_t) stream), "fallback sync", err)) return false;
++    }
++    return true;
++}
++
++// ---- the expert process: serve one request on this card -----------------------------------------------------------------
++struct RemoteExperts::PrefillGpu {
++    NativePicks np;
++    uint16_t *x16 = nullptr, *out16 = nullptr;
++    float *x = nullptr, *rows = nullptr, *wt = nullptr;
++    int32_t *row_of = nullptr, *bad = nullptr;
++    int64_t tokens = 0, k = 0;
++    std::vector<unsigned long long> ptr;
++    ~PrefillGpu() {
++        for (void* p : {(void*) x16, (void*) out16, (void*) x, (void*) rows, (void*) wt, (void*) row_of, (void*) bad})
++            if (p) cudaFree(p);
++    }
++};
++void RemoteExperts::PrefillGpuDel::operator()(PrefillGpu* p) const { delete p; }
++
++namespace {
++/// serve_prefill's backend on this card: the request's rows up, NativePicks per batch, the reduction, the sums down.
++/// Pageable copies to and from the shm region, on purpose: registering /dev/shm with the GPU runtime would make it a KFD
++/// userptr on an AMD expert card - the very eviction hazard the region's token sizing exists to avoid.
++struct GpuBackend {
++    RemoteExperts::PrefillGpu& g;
++    const ExpertCache& cache;
++    cudaStream_t s;
++    bool holds(int32_t layer, int32_t e) const { return cache.slot_of(layer, e) >= 0; }
++    bool begin(int32_t layer, const void* rows, int32_t row_bytes, int64_t n, std::string& err) {
++        if (!ok_cuda(cudaMemsetAsync(g.bad, 0, sizeof(int32_t), s), "flag", err)) return false;
++        if (row_bytes == seabraid::kPfRowsF32) {   // card 1's own f32 rows: straight to the activation buffer, no rounding anywhere
++            if (!ok_cuda(cudaMemcpyAsync(g.x, rows, (size_t) (n * H) * 4, cudaMemcpyHostToDevice, s), "rows up", err)) return false;
++        } else {
++            if (!ok_cuda(cudaMemcpyAsync(g.x16, rows, (size_t) (n * H) * 2, cudaMemcpyHostToDevice, s), "rows up", err)) return false;
++            prefill_f16_to_f32(g.x16, g.x, n * H, s);
++        }
++        return g.np.input(layer, g.x, n, s, err);
++    }
++    bool batch(int32_t layer, const seabraid::PrefillBatch& b, const float* wt, std::string& err) {
++        const int32_t ng = (int32_t) b.grp_expert.size(), ne = (int32_t) b.ent_tok.size();
++        const int64_t nt = b.t1 - b.t0;
++        g.ptr.resize((size_t) ng);
++        for (int32_t i = 0; i < ng; ++i) {
++            const int32_t slot = cache.slot_of(layer, b.grp_expert[(size_t) i]);
++            if (slot < 0) { err = "D4: expert " + std::to_string(b.grp_expert[(size_t) i]) + " left the cache"; return false; }
++            g.ptr[(size_t) i] = (unsigned long long) cache.device_slot(slot);
++        }
++        return ok_cuda(cudaMemcpyAsync(g.row_of, b.row_of.data(), (size_t) (nt * g.k) * 4, cudaMemcpyHostToDevice, s), "row table", err) &&
++               ok_cuda(cudaMemcpyAsync(g.wt, wt + (size_t) b.t0 * (size_t) g.k, (size_t) (nt * g.k) * 4, cudaMemcpyHostToDevice, s),
++                       "weights", err) &&
++               g.np.run(layer, g.ptr.data(), b.grp_start.data(), ng, b.ent_row.data(), b.ent_tok.data(), ne, g.rows, s, err) &&
++               (prefill_reduce_f16(g.rows, g.row_of, g.wt, nt, g.k, g.out16 + (size_t) b.t0 * H, g.bad, s),
++                ok_cuda(cudaGetLastError(), "reduce", err));
++    }
++    bool end(uint16_t* out16, int64_t n, std::string& err) {
++        int32_t bad = 0;
++        if (!ok_cuda(cudaMemcpyAsync(&bad, g.bad, sizeof(bad), cudaMemcpyDeviceToHost, s), "flag down", err) ||
++            !ok_cuda(cudaMemcpyAsync(out16, g.out16, (size_t) (n * H) * 2, cudaMemcpyDeviceToHost, s), "sums down", err) ||
++            !ok_cuda(cudaStreamSynchronize(s), "sync", err)) return false;
++        if (bad) { err = "D4: a weighted sum is not finite in fp16"; return false; }
++        return true;
++    }
++};
++} // namespace
++
++bool RemoteExperts::prefill_serve(const seabraid::Channel& ch, std::string& err) {
++    const seabraid::Header* h = ch.header();
++    if (bl_ || device_ < 0) { err = "D4: prefill_serve runs in the expert process, on its own cache"; return false; }
++    int prev = -1;
++    if (!ok_cuda(cudaGetDevice(&prev), "cudaGetDevice", err) || !ok_cuda(cudaSetDevice(device_), "cudaSetDevice", err)) return false;
++    struct Back { int d; ~Back() { cudaSetDevice(d); } } back{prev};
++    if (!pf_gpu_ || pf_gpu_->tokens < h->pf_tokens || pf_gpu_->k != h->pf_k) {   // first request: size by the region's TOKENS
++        pf_gpu_.reset(new PrefillGpu);
++        PrefillGpu& g = *pf_gpu_;
++        g.tokens = h->pf_tokens; g.k = h->pf_k;
++        const size_t T = (size_t) g.tokens, K = (size_t) g.k;
++        if (!ok_cuda(cudaMalloc((void**) &g.x16, T * H * 2), "rows", err) || !ok_cuda(cudaMalloc((void**) &g.out16, T * H * 2), "sums", err) ||
++            !ok_cuda(cudaMalloc((void**) &g.x, T * H * 4), "rows f32", err) ||
++            !ok_cuda(cudaMalloc((void**) &g.rows, (size_t) kServeEntries * H * 4), "pick rows", err) ||
++            !ok_cuda(cudaMalloc((void**) &g.wt, T * K * 4), "weights", err) || !ok_cuda(cudaMalloc((void**) &g.row_of, T * K * 4), "row table", err) ||
++            !ok_cuda(cudaMalloc((void**) &g.bad, 4), "flag", err)) { pf_gpu_.reset(); return false; }
++    }
++    GpuBackend be{*pf_gpu_, cache_, stream_};
++    return seabraid::serve_prefill(ch, be, n_expert_, kServeEntries, err);
++}
++
++// ---- card 1 ----------------------------------------------------------------------------------------------------------------
++bool RemoteExperts::prefill_open(int64_t k, std::string& err) {
++    pf_open_ = pf_dead_ = pf_pending_ = false;
++    if (!bl_) { err = "D4: the expert tier is not a seabraid expert process"; return false; }
++    const seabraid::Header* h = bl_->header();
++    // Open-time mismatch fails fast, naming both sides: a region of another width or format would be read as shifted
++    // picks or as the wrong number type - wrong sums, never a crash.
++    if (h->pf_tokens <= 0) {
++        err = "D4: the expert process offers no prefill region (pf_tokens 0, channel v" + std::to_string(h->version) +
++              "); card 1 wants k " + std::to_string((long long) k) + " fp16 rows: start seabraid-helper with --prefill-tokens N";
++        return false;
++    }
++    if (h->pf_k != k || h->pf_format != seabraid::kPfFp16) {
++        err = "D4: prefill region mismatch: expert process k " + std::to_string(h->pf_k) + " format " + std::to_string(h->pf_format) +
++              ", card 1 k " + std::to_string((long long) k) + " format " + std::to_string((int) seabraid::kPfFp16) + " (fp16)";
++        return false;
++    }
++    const char* v = std::getenv("STRATA_PREFILL_REMOTE_COMPUTE");
++    pf_mode_ = v != nullptr && std::atoi(v) == 2 ? 2 : 1;
++    pf_lend_Bps_ = env_or("STRATA_D4_LEND_GBPS", kD4LendBps / 1e9) * 1e9;
++    pf_wire_Bps_ = env_or("STRATA_D4_WIRE_GBPS", kD4WireBps / 1e9) * 1e9;
++    pf_rate_ = env_or("STRATA_D4_PICK_RATE", kD4PickRate);
++    pf_layer_s_ = env_or("STRATA_D4_LAYER_US", kD4LayerS * 1e6) * 1e-6;
++    pf_k_ = k;
++    pf_open_ = true;
++    std::fprintf(stderr, "D4: prompt reading computes the experts %s holds on that card (%s): region %lld tokens/request "
++                         "(%.1f MiB), lend %.2f GB/s, wire %.2f GB/s, %.0f picks/s, %.0f us/layer\n",
++                 h->helper_name, pf_mode_ == 2 ? "every eligible chunk" : "per-chunk byte/time model", (long long) h->pf_tokens,
++                 (double) bl_->prefill_region().bytes / 1048576.0, pf_lend_Bps_ / 1e9, pf_wire_Bps_ / 1e9, pf_rate_, pf_layer_s_ * 1e6);
++    return true;
++}
++
++PrefillChoice RemoteExperts::prefill_choose(int64_t tokens, bool stream_all, int64_t layers, int64_t hidden, int64_t k, int row_bytes) {
++    PrefillChoice none;
++    if (!prefill_usable() || tokens <= 0) return none;
++    if (pf_pending_) {   // a prompt that failed between a request and its answer left it in flight: drain it, never read it
++        if (!seabraid::Channel::wait([&] { return pf_seq_ == 0 || bl_->pf_answered(pf_seq_); }, 60)) pf_dead_ = true;
++        pf_pending_ = false;
++        if (pf_dead_) return none;
++    }
++    if (const pid_t pid = (pid_t) bl_->header()->helper_pid; pid > 0 && ::kill(pid, 0) != 0 && errno == ESRCH) {
++        pf_dead_ = true;   // between chunks: this chunk (and every later one) lends
++        std::fprintf(stderr, "D4: the expert process (pid %d) is gone; the prompt lends\n", (int) pid);
++        return none;
++    }
++    const auto& lay = strata::kernels::cpu::expert_layout();
++    PrefillCostIn c;
++    c.tokens = tokens; c.layers = layers; c.k = k; c.n_expert = n_expert_; c.hidden = hidden; c.stream_all = stream_all;
++    int64_t held = 0;
++    for (size_t i = 0; i < bl_held_.size(); ++i)
++        if (bl_held_[i]) { ++held; c.remote_bytes += (double) lay.blob_bytes((int64_t) (i / (size_t) n_expert_)); }
++    // The pick share is MEASURED once requests have run (picks asked / pick slots offered); until then the held count's
++    // share, which overstates it (card 1 keeps the hottest experts) and so leans the first chunks towards lending.
++    c.pick_share = pf_slots_ > 0 ? (double) pf_picks_ / (double) pf_slots_
++                                 : (double) held / (double) std::max<int64_t>(1, layers * n_expert_);
++    c.row_bytes = row_bytes;
++    c.lend_Bps = pf_lend_Bps_; c.wire_Bps = pf_wire_Bps_; c.pick_rate = pf_rate_; c.layer_s = pf_layer_s_;
++    // Once 20k picks have been served, the expert process's own service time per pick replaces the pick rate AND the wire
++    // term (its service time includes its copies in and out): measured beats estimated.
++    const seabraid::Header* h = bl_->header();
++    if (pf_picks_ >= 20000 && h->pf_svc_ns > 0) {
++        c.pick_rate = (double) pf_picks_ / ((double) h->pf_svc_ns * 1e-9);
++        c.wire_Bps = 1e30;
++    }
++    PrefillChoice r = prefill_cost(c);
++    if (pf_mode_ == 2) r.compute = true;
++    std::fprintf(stderr, "D4 chunk %lld tokens (%s): %s - lend %.2f GB %.3f s vs compute %.0f picks + %.2f GB %.3f s "
++                         "(share %.3f, %.0f picks/s; crossover %.0f tokens)\n",
++                 (long long) tokens, stream_all ? "streamed" : "staged", r.compute ? "COMPUTE on the expert card" : "lend",
++                 r.lend_bytes / 1e9, r.t_lend, r.picks, r.wire_bytes / 1e9, r.t_compute, c.pick_share, c.pick_rate,
++                 prefill_crossover_tokens(c));
++    return r;
++}
++
++bool RemoteExperts::pf_range(std::string& err) {
++    pf_tn_ = std::min<int64_t>(pf_ntok_ - pf_t0_, bl_->header()->pf_tokens);
++    pf_asked_ = seabraid::pack_prefill_request(*bl_, (int32_t) pf_layer_, pf_t0_, pf_tn_, H, pf_k_, pf_rows_, pf_row_bytes_, pf_w_, pf_ids_,
++                                              pf_mask_, n_expert_);
++    if (pf_asked_ < 0) { err = "D4: the request does not fit the prefill region"; return false; }
++    // A range without a pick of the expert process's needs no round trip: its sums are zero (prefill_end writes them).
++    pf_seq_ = pf_asked_ > 0 ? bl_->pf_publish() : 0;
++    return true;
++}
++
++bool RemoteExperts::prefill_begin(int64_t layer, const void* rows, int32_t row_bytes, const float* w, const int32_t* ids,
++                                  int64_t n_tok, int64_t k, const uint8_t* remote_e, std::string& err) {
++    if (!prefill_usable()) { err = "D4: prompt reading on the expert card is off (closed or failed earlier)"; return false; }
++    if (pf_pending_ || k != pf_k_ || n_tok <= 0) { err = "D4: a request is in flight, or a wrong routing width"; pf_dead_ = true; return false; }
++    pf_rows_ = rows; pf_row_bytes_ = row_bytes; pf_w_ = w; pf_ids_ = ids; pf_mask_ = remote_e;
++    pf_layer_ = layer; pf_ntok_ = n_tok; pf_t0_ = 0;
++    if (!pf_range(err)) { pf_dead_ = true; return false; }
++    pf_pending_ = true;
++    return true;
++}
++
++bool RemoteExperts::prefill_end(uint16_t* sums16, std::string& err) {
++    if (!pf_pending_) { err = "D4: no request in flight"; return false; }
++    pf_pending_ = false;
++    seabraid::Header* h = bl_->header();
++    const pid_t pid = (pid_t) h->helper_pid;
++    auto fail = [&](const std::string& why) {
++        // WHAT BREAKS FIRST under a crash between send and receive: this wait.  The expert process's pid is checked every
++        // 0.5 s and the wait gives up after 60 s, so card 1 never sums a stale region; it marks prompt reading on that card
++        // dead (later chunks lend) and its caller computes this layer's picks itself.  Loud, once per failure.
++        err = why;
++        pf_dead_ = true;
++        std::fprintf(stderr, "D4: FAILED at layer %lld (%s); card 1 computes this layer's expert-card picks itself and "
++                             "every later chunk lends\n", (long long) pf_layer_, why.c_str());
++        return false;
++    };
++    while (true) {
++        if (pf_seq_ != 0) {
++            const auto t0 = std::chrono::steady_clock::now();
++            while (!seabraid::Channel::wait([&] { return bl_->pf_answered(pf_seq_); }, 0.5)) {
++                if (pid > 0 && ::kill(pid, 0) != 0 && errno == ESRCH)
++                    return fail("the expert process (pid " + std::to_string(pid) + ") died");
++                if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60)) return fail("no answer within 60 s");
++            }
++            h->pf_err[sizeof(h->pf_err) - 1] = '\0';
++            if (!h->pf_ok) return fail(std::string("the expert process: ") + h->pf_err);
++            // The echo: the picks it computed must be the picks asked, or a contribution would be silently missing.
++            if (h->pf_picks != (int32_t) pf_asked_)
++                return fail("asked " + std::to_string((long long) pf_asked_) + " picks, the expert process computed " +
++                            std::to_string(h->pf_picks));
++            std::memcpy(sums16 + pf_t0_ * H, bl_->pf_out16(), (size_t) (pf_tn_ * H) * sizeof(uint16_t));
++        } else {
++            std::memset(sums16 + pf_t0_ * H, 0, (size_t) (pf_tn_ * H) * sizeof(uint16_t));
++        }
++        pf_picks_ += pf_asked_;
++        pf_slots_ += pf_tn_ * pf_k_;
++        pf_t0_ += pf_tn_;
++        if (pf_t0_ >= pf_ntok_) return true;
++        if (!pf_range(err)) return fail(err);   // the next range (a chunk longer than the region): one round trip each
++    }
++}
++} // namespace strata::core
+diff --git a/src/prefill/d4_check.cpp b/src/prefill/d4_check.cpp
+new file mode 100644
+index 000000000..37b738665
+--- /dev/null
++++ b/src/prefill/d4_check.cpp
+@@ -0,0 +1,106 @@
++// STRATA_D4_CHECK: see d4_check.hpp.  Diagnostic only - nothing here runs unless the variable is set, and the layer's output
++// is still the expert process's (the reference rows go to Dm rows the combine does not read: rows >= rem_at).
++#include "strata/prefill/d4_check.hpp"
++
++#include "strata/core/remote_expert_opt.hpp"
++#include "strata/kernels/cpu/expert_layout.hpp"
++#include "strata/kernels/f16_bits.hpp"
++#include "strata/prefill/kernels.hpp"
++
++#include <cuda_runtime.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++namespace strata::prefill {
++namespace {
++constexpr int64_t N = strata::kernels::cpu::H;
++
++struct Cmp { double nrmse = 0, maxrel = 0, bias = 0, scale = 1; };
++Cmp compare(const float* a, const float* b, size_t n) {
++    double ee = 0, bb = 0, ab = 0, sd = 0, maxd = 0, maxb = 0;
++    for (size_t i = 0; i < n; ++i) {
++        const double d = (double) a[i] - (double) b[i];
++        ee += d * d; bb += (double) b[i] * b[i]; ab += (double) a[i] * b[i]; sd += d;
++        maxd = std::max(maxd, std::fabs(d)); maxb = std::max(maxb, std::fabs((double) b[i]));
++    }
++    Cmp c;
++    if (bb > 0 && n > 0) {
++        c.nrmse = std::sqrt(ee / bb); c.maxrel = maxb > 0 ? maxd / maxb : 0;
++        c.bias = (sd / (double) n) / std::sqrt(bb / (double) n); c.scale = ab / bb;
++    }
++    return c;
++}
++bool cu(cudaError_t r, const char* what, std::string& err) {
++    if (r == cudaSuccess) return true;
++    err = std::string("D4 check ") + what + ": " + cudaGetErrorString(r);
++    return false;
++}
++} // namespace
++
++bool D4Check::enabled() {
++    static const bool on = [] { const char* v = std::getenv("STRATA_D4_CHECK"); return v != nullptr && std::atoi(v) != 0; }();
++    return on;
++}
++
++bool D4Check::use_reference() {
++    static const bool on = [] { const char* v = std::getenv("STRATA_D4_CHECK"); return v != nullptr && std::atoi(v) == 2; }();
++    return on;
++}
++
++D4Check::~D4Check() {
++    for (void* p : {(void*) ref_, (void*) refh_, (void*) xr_, (void*) dec_}) if (p) cudaFree(p);
++}
++
++bool D4Check::run(core::Card1Rows& card1, core::ExpertSource& files, const D4CheckIn& in, std::string& err) {
++    const size_t n = (size_t) (in.T * N);
++    auto s = (cudaStream_t) in.stream;
++    if (cap_ < n) {
++        for (void* p : {(void*) ref_, (void*) refh_, (void*) xr_, (void*) dec_}) if (p) cudaFree(p);
++        ref_ = refh_ = xr_ = dec_ = nullptr; cap_ = 0;
++        if (!cu(cudaMalloc((void**) &ref_, n * 4), "ref", err) || !cu(cudaMalloc((void**) &refh_, n * 4), "refh", err) ||
++            !cu(cudaMalloc((void**) &xr_, n * 4), "xr", err) || !cu(cudaMalloc((void**) &dec_, n * 4), "dec", err)) return false;
++        cap_ = n;
++        h_ref_.resize(n); h_refh_.resize(n); h_dec_.resize(n);
++    }
++    const int ne = (int) in.experts.size();
++    // reference 1: this card's kernels on the exact f32 input
++    if (!card1.run(in.layer, in.x, in.T, in.experts.data(), ne, in.off, in.cnt, in.row_tok, in.Dm, files, in.stream, err)) return false;
++    d4_ref_sum(in.Dm, in.slot, in.w, in.from, ref_, in.T, in.stream);
++    // reference 2: the same on the fp16 image of the input, which is what the request carried
++    core::prefill_f16_to_f32(in.x16, xr_, (int64_t) n, in.stream);
++    if (!card1.run(in.layer, xr_, in.T, in.experts.data(), ne, in.off, in.cnt, in.row_tok, in.Dm, files, in.stream, err)) return false;
++    d4_ref_sum(in.Dm, in.slot, in.w, in.from, refh_, in.T, in.stream);
++    // the combine's own fp16 decode, executed on this device
++    d4_decode_f16(in.sum16, dec_, (int64_t) n, in.stream);
++    if (!cu(cudaMemcpyAsync(h_ref_.data(), ref_, n * 4, cudaMemcpyDeviceToHost, s), "ref down", err) ||
++        !cu(cudaMemcpyAsync(h_refh_.data(), refh_, n * 4, cudaMemcpyDeviceToHost, s), "refh down", err) ||
++        !cu(cudaMemcpyAsync(h_dec_.data(), dec_, n * 4, cudaMemcpyDeviceToHost, s), "dec down", err) ||
++        !cu(cudaStreamSynchronize(s), "sync", err)) return false;
++    std::vector<float> got(n), refh16(n);
++    size_t dec_bad = 0, got_ne_ref16 = 0;
++    for (size_t i = 0; i < n; ++i) {
++        got[i] = strata::kernels::f32_from_f16(in.sum16[i]);
++        refh16[i] = strata::kernels::f32_from_f16(strata::kernels::f16_from_f32(h_refh_[i]));
++        dec_bad += std::memcmp(&got[i], &h_dec_[i], 4) != 0 && !(std::isnan(got[i]) && std::isnan(h_dec_[i]));
++        got_ne_ref16 += std::memcmp(&got[i], &refh16[i], 4) != 0;
++    }
++    const Cmp e1 = compare(got.data(), h_ref_.data(), n), e2 = compare(got.data(), h_refh_.data(), n),
++              e3 = compare(h_refh_.data(), h_ref_.data(), n), e4 = compare(got.data(), refh16.data(), n);
++    const auto& f = strata::kernels::cpu::expert_layout().fmt[(size_t) in.layer];
++    double rms = 0;
++    for (size_t i = 0; i < n; ++i) rms += (double) h_ref_[i] * h_ref_[i];
++    std::fprintf(stderr,
++        "D4CHECK layer=%lld gu=%d d=%d had=%d%d experts=%d rms=%.4g"
++        " E1[nrmse=%.3e max=%.3e bias=%+.2e scale=%.5f] E2[%.3e %.3e %+.2e %.5f] E3[%.3e %.3e %+.2e %.5f]"
++        " E4[%.3e %.3e %+.2e %.5f] E4_bit_unequal=%.4f DEC_bad=%zu\n",
++        (long long) in.layer, f.gu_type, f.d_type, (int) f.had_gu, (int) f.had_d, ne, std::sqrt(rms / (double) n),
++        e1.nrmse, e1.maxrel, e1.bias, e1.scale, e2.nrmse, e2.maxrel, e2.bias, e2.scale, e3.nrmse, e3.maxrel, e3.bias, e3.scale,
++        e4.nrmse, e4.maxrel, e4.bias, e4.scale, (double) got_ne_ref16 / (double) n, dec_bad);
++    return true;
++}
++
++} // namespace strata::prefill
+diff --git a/src/prefill/kernels.cu b/src/prefill/kernels.cu
+index 9b7edf79a..9271c9d14 100644
+--- a/src/prefill/kernels.cu
++++ b/src/prefill/kernels.cu
+@@ -3355,6 +3355,37 @@ __global__ void moe_combine_peer16_kernel(const float* __restrict__ Dm, const in
+     }
+     bo[i] = (s + __half2float(__ushort_as_half(peer16[i]))) + shared[i] * sigm(sg[t]);
+ }
++// D4 diagnostic (STRATA_D4_CHECK): token t's weighted sum of the Dm rows at or after `from` (the handed-over picks' rows), in the
++// combine's own order (k ascending, fmaf from 0) - the f32 product the expert process's fp16 sums are judged against.
++__global__ void d4_ref_sum_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot, const float* __restrict__ w,
++                                  int64_t from, float* __restrict__ out, int64_t T) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= T * N) return;
++    const int64_t t = i / N, d = i % N;
++    float s = 0.0f;
++#pragma unroll
++    for (int k = 0; k < KU; ++k) {
++        const int32_t r = slot[t * KU + k];
++        if (r >= from) s = fmaf(w[t * KU + k], Dm[(int64_t) r * N + d], s);
++    }
++    out[i] = s;
++}
++// D4 on a fused layer: the grouping saw the ids with the handed-over picks masked to -1, so those picks got no row; their slot
++// becomes `sentinel` (>= the combine's rows_local), which the combine reads as "the expert card's sum", never as a Dm row.
++__global__ void d4_mark_remote_kernel(int32_t* __restrict__ slot, const int32_t* __restrict__ ids_local, int64_t n, int32_t sentinel) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < n && ids_local[i] < 0) slot[i] = sentinel;
++}
++// D4 failure path on a fused layer: the picks card 1 computed itself sit in the Dm rows `rslot` names; point their slots there.
++__global__ void d4_apply_remote_kernel(int32_t* __restrict__ slot, const int32_t* __restrict__ rslot, int64_t n) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < n && rslot[i] >= 0) slot[i] = rslot[i];
++}
++// D4 diagnostic: the combine's exact fp16 decode expression, run on its own so a wrong decode on this device shows up
++__global__ void d4_decode_kernel(const uint16_t* __restrict__ p, float* __restrict__ out, int64_t n) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < n) out[i] = __half2float(__ushort_as_half(p[i]));
++}
+ __global__ void peer_gather_add_kernel(float* __restrict__ sum, const float* __restrict__ rows, int64_t r0,
+                                        const float* __restrict__ wk, const int32_t* __restrict__ pair,
+                                        const int32_t* __restrict__ tok, const int32_t* __restrict__ start,
+@@ -3390,6 +3421,22 @@ void moe_combine_peer16(const float* Dm, const int32_t* slot, const float* w, co
+                                                                                       rows_local, bo, T);
+     check("moe_combine_peer16");
+ }
++void d4_ref_sum(const float* Dm, const int32_t* slot, const float* w, int64_t from, float* out, int64_t T, void* stream) {
++    d4_ref_sum_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, from, out, T);
++    check("d4_ref_sum");
++}
++void d4_mark_remote(int32_t* slot, const int32_t* ids_local, int64_t n, int32_t sentinel, void* stream) {
++    d4_mark_remote_kernel<<<blocks_for(n), 256, 0, (cudaStream_t) stream>>>(slot, ids_local, n, sentinel);
++    check("d4_mark_remote");
++}
++void d4_apply_remote(int32_t* slot, const int32_t* rslot, int64_t n, void* stream) {
++    d4_apply_remote_kernel<<<blocks_for(n), 256, 0, (cudaStream_t) stream>>>(slot, rslot, n);
++    check("d4_apply_remote");
++}
++void d4_decode_f16(const uint16_t* p, float* out, int64_t n, void* stream) {
++    d4_decode_kernel<<<blocks_for(n), 256, 0, (cudaStream_t) stream>>>(p, out, n);
++    check("d4_decode_f16");
++}
+ void peer_gather_add(float* sum, const float* rows, int64_t r0, const float* wk, const int32_t* pair, const int32_t* tok,
+                      const int32_t* start, const int32_t* list, int64_t n_tok, void* stream) {
+     if (n_tok <= 0) return;
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 9381ff220..bb6f544c0 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -40,6 +40,9 @@
+ #include "strata/core/progress.hpp"
+ #include "strata/core/on_device.hpp"
+ #include "strata/core/stream_watch.hpp"
++#include "strata/core/remote_experts.hpp"   // D4 (set_remote_compute)
++#include "strata/prefill/d4_check.hpp"       // D4 diagnostic (STRATA_D4_CHECK)
++#include "strata/prefill/d4_plan.hpp"        // D4: the layer's split of picks, and "D4 never changes card 1's expert path"
+ #include "strata/platform/aux_cpus.hpp"
+ 
+ #include "strata/core/layout.hpp"
+@@ -730,6 +733,8 @@ inline bool fused_ring() {
+     if (const int ov = strata::prefill::pf_fused_override().load(std::memory_order_relaxed); ov == 0 || ov == strata::prefill::kPfFusedKernelsOnly)
+         return false;   // the small-card prompt path decided on MMQ's layout
+     if (core::peer_portable()) return false;   // multi-GPU: --peer-device keeps the MMQ path and its buffer sizes
++    // (D4, STRATA_PREFILL_REMOTE_COMPUTE, does not appear here: it must not change card 1's own expert path or the layout that path
++    // sizes.  Its layers run on the fused kernels like any other layer of the chunk - see "D4 on a fused layer" below.)
+     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+     // the Q2_0 pack: fused::enabled().  A native pack: native_supported() alone - it implies enabled() wherever the Q2_0
+     // kernels exist, and on gfx12 (the native kernels only) enabled() is false while the native layers do run fused.
+@@ -1661,6 +1666,46 @@ struct Prefill::Impl {
+     // (nullptr: identity signs or not folded), resolved once in init so a prompt chunk reads a pointer
+     std::vector<const float*> had_sx, had_sh;
+     std::unique_ptr<PeerPrefill> pp;         // multi-GPU: the peer GPU's expert share (set_peer)
++    // D4 (set_remote_compute): card 1's host ends of a request, sized by TOKENS on the first chunk that computes remotely:
++    // x16 / w are the D2H targets of mixed_h / w, sum16 is mapped so the combine reads the expert process's sums in place
++    // (as PeerPrefill's host_sum16).  `mask` is the layer's handed-over experts: the grouping AND the request read it.
++    struct D4Host {
++        uint8_t* rows = nullptr;             // pinned: the request's rows, fp16 (mixed_h) or f32 (mixed) as the expert process offers
++        uint16_t* sum16 = nullptr;
++        float* w = nullptr;
++        int32_t* ids = nullptr;              // pinned: the router's ids of the layer (the fused path has no host copy of its own)
++        int32_t *ids_dev = nullptr, *rslot_dev = nullptr;   // fused layer: the masked ids the grouping sees; the failure path's slots
++        D4Split split;                       // fused layer: this layer's plan (d4_plan.hpp)
++        size_t cap = 0;
++        std::vector<uint8_t> mask;
++        std::vector<char> ok_layer;          // layers it may apply to: MMQ host grouping, no NVFP4 tail (empty: not yet known)
++        core::Card1Rows fallback;            // the failure path's runner on this device
++        D4Check check;                       // STRATA_D4_CHECK: the per-layer comparison with this card's own product
++        bool grow(size_t tokens) {
++            if (tokens <= cap) return true;
++            release();
++            const bool ok = cudaHostAlloc((void**) &rows, tokens * N * 4, cudaHostAllocDefault) == cudaSuccess &&
++                            cudaHostAlloc((void**) &sum16, tokens * N * 2, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess &&
++                            cudaHostAlloc((void**) &w, tokens * K * 4, cudaHostAllocDefault) == cudaSuccess &&
++                            cudaHostAlloc((void**) &ids, tokens * K * 4, cudaHostAllocDefault) == cudaSuccess &&
++                            cudaMalloc((void**) &ids_dev, tokens * K * 4) == cudaSuccess &&
++                            cudaMalloc((void**) &rslot_dev, tokens * K * 4) == cudaSuccess;
++            if (ok) cap = tokens; else (void) cudaGetLastError();
++            return ok;
++        }
++        void release() {
++            for (void* p : {(void*) rows, (void*) sum16, (void*) w, (void*) ids}) if (p) cudaFreeHost(p);
++            for (void* p : {(void*) ids_dev, (void*) rslot_dev}) if (p) cudaFree(p);
++            rows = nullptr; sum16 = nullptr; w = nullptr; ids = nullptr; ids_dev = rslot_dev = nullptr; cap = 0;
++        }
++        // The request's rows, down from the device in the expert process's row type.  ONE place for the choice, so the two layer
++        // branches (fused and MMQ) cannot disagree about it.
++        void fetch_rows(const float* mixed, const uint16_t* mixed_h, size_t T, size_t N, int row_bytes, cudaStream_t s) {
++            if (row_bytes == 4) cudaMemcpyAsync(rows, mixed, T * N * 4, cudaMemcpyDeviceToHost, s);
++            else cudaMemcpyAsync(rows, mixed_h, T * N * 2, cudaMemcpyDeviceToHost, s);
++        }
++        ~D4Host() { release(); }
++    } d4;
+     // layer split: the next stage's GPU as a stream-only peer (set_stage_helper); its buffers are that stage's own
+     // prompt buffers, bound per prompt, and it takes the place of `pp` for a run it helps
+     std::unique_ptr<PeerPrefill> help_pp;
+@@ -4389,13 +4434,34 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
+         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
+         const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
++        // D4: compute or lend, decided HERE, per chunk, because the streamed walk below plans (and starts issuing) every
++        // layer's copies before any layer is routed - an expert handed to the expert process must never enter that plan.
++        // The choice is RemoteExperts' byte/time model (remote_prefill.hpp).  Only on a single-stage path without a peer.
++        bool d4 = false;
++        if (rc_ != nullptr && !m.pp && next_ == nullptr && stage_lb_ == 0 && helper_ == nullptr && m.src != nullptr &&
++            rc_files_ != nullptr && lay0.native) {
++            if (m.d4.ok_layer.empty()) {   // once: MMQ's host grouping (the tail rows and the peer16 combine) and no NVFP4 tail
++                m.d4.ok_layer.assign((size_t) g.n_layers, 0);
++                for (int64_t l = 0; l < g.n_layers; ++l)
++                    m.d4.ok_layer[(size_t) l] = mmq_plan().any && mmq_plan().layer[(size_t) l] && !lay0.fmt[(size_t) l].tail_off;
++            }
++            d4 = rc_->prefill_choose(T, stream_all, g.n_layers, N, K, stream_all && fused_ring() ? seabraid::kPfRowsF32 : seabraid::kPfRowsF16).compute;
++            if (d4 && !m.d4.grow((size_t) m.T_max)) {
++                std::fprintf(stderr, "D4: the host could not give the request buffers (RAM is short); this chunk lends\n");
++                d4 = false;
++            }
++            if (d4) m.d4.mask.assign((size_t) m.g->n_expert, 0);
++        }
++        // Fixed for the whole chunk, even after a failure: the streamed plan already left these experts out, so a failed
++        // layer's picks are computed by card 1 (Card1Rows), never silently dropped and never looked for in the ring.
++        auto d4_layer = [&](int64_t l) { return d4 && m.d4.ok_layer[(size_t) l] != 0; };
+         // the CPU share: this chunk takes the pool if no other stage of a layer split has it now (released at the end
+         // of the chunk, after the last layer's CPU thread is joined)
+         struct PoolHold {
+             bool held = false;
+             ~PoolHold() { if (held) g_cpu_pool_busy.store(false, std::memory_order_release); }
+         } pool_hold;
+-        if (cpu_pool_ != nullptr && cpu_share_on() && !stream_all && !pipe_chunked &&
++        if (cpu_pool_ != nullptr && cpu_share_on() && !stream_all && !pipe_chunked && !d4 &&
+             !g_share_blocked.load(std::memory_order_acquire)) {
+             bool expect = false;
+             pool_hold.held = g_cpu_pool_busy.compare_exchange_strong(expect, true, std::memory_order_acq_rel);
+@@ -4454,6 +4520,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
+                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                     if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
++                    if (d4_layer(l) && rc_->holds(l, e)) continue;   // D4: computed by the expert process, never copied
+                     int job = -1;
+                     const uint8_t* b = nullptr;
+                     if (m.src->transient(l, e)) {   // CS-T: copied by the source into the stager's buffer
+@@ -5440,8 +5507,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                     // rotated inside experts_native (fused::set_down_rotation); every other folded layer keeps MMQ
+                     const bool fold_ok = had_block == 128 && ((mmq_gt == 145 && mmq_dt == 146) || (mmq_gt == 144 && mmq_dt == 144)) &&
+                                          (!had_gu || m.Xr != nullptr);
+-                    const bool fused_nat = (use_mmq || fused_only) && stream_all && no_peer && lay.native && ((!had_gu && !had_d) || fold_ok) &&
+-                                           fused::native_supported(mmq_gt, mmq_dt);
++                    // D4 does NOT enter this decision (expert_path ignores it): the first D4 sent every layer it touched to MMQ, which on
++                    // a gfx12 engine (fused by default) changed card 1's own experts - the whole of D4's measured KL on that engine.
++                    const bool fused_nat = expert_path((use_mmq || fused_only) && stream_all && no_peer && lay.native && ((!had_gu && !had_d) || fold_ok) &&
++                                                       fused::native_supported(mmq_gt, mmq_dt), d4_layer(l)) == ExpertPath::kFused;
+ #if defined(STRATA_PF_OWN_ONLY)
+                     const bool fused_l = ((use_mmq || fused_only) && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
+ #else
+@@ -5468,6 +5537,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                     }
+                     size_t n_order = 0;                   // the routed experts (the debug report; unknown when fused)
+                     bool peer_now = false;                // multi-GPU: the peer computed rows of this layer (MMQ path only)
++                    // D4: this layer handed rows [rem_at, T*K) to the expert process (rem_now); rem_sent: its request is out
++                    bool rem_now = false, rem_sent = false;
++                    int64_t rem_at = 0;
++                    const int32_t* rem_tok = nullptr;     // the row -> token table (src_h) the failure path reads
++                    const int32_t *rem_off = nullptr, *rem_cnt = nullptr;   // ...and the handed-over experts' row blocks (offset, count)
++                    bool rem_fused = false;               // this layer ran on the fused kernels: the handed-over picks have a sentinel slot
++                    std::string rem_err;
+                     // set_cpu_pool: this layer's CPU experts (rows [T * K - rows_cpu, T * K) of Dm), computed on a thread
+                     // that reads on_cpu: declared first, so the future (which waits for the thread) goes first
+                     std::vector<char> on_cpu;
+@@ -5499,7 +5575,37 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                         // STRATA_PF_P1A=1 (gfx1151): the layer input's FP16 rows for the P1A kernels (p1a_input keeps nullptr otherwise)
+                         if (fused_nat) fused::p1a_input(had_gu ? nullptr : m.mixed_h, m.H_bytes);
+                         bool p1a_layer = false;
+-                        fused::group(m.ids, T * K, (int) K, (int) m.g->n_expert, m.GU, m.slot_dev, m.src_dev, m.cs);
++                        // D4 on a fused layer.  The fused grouping routes on the GPU, so the request's picks come down first (one sync: the
++                        // request needs them, and the MMQ branch syncs here too); the experts the expert card computes are masked to -1 in
++                        // the ids the grouping sees, so card 1 computes exactly its own picks on the same kernels it uses without D4, and
++                        // the request goes out before those kernels start.  The masked picks get the sentinel slot below.
++                        const int32_t* grp_ids = m.ids;
++                        if (d4_layer(l) && fused_nat) {
++                            cudaMemcpyAsync(m.d4.ids, m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
++                            m.d4.fetch_rows(m.mixed, m.mixed_h, (size_t) T, (size_t) N, seabraid::kPfRowsF32, m.cs);   // the fused kernels quantize the f32 rows
++                            cudaMemcpyAsync(m.d4.w, m.w, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
++                            if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
++                                err = "prefill: the routed ids' download failed (D4, fused layer)";
++                                return false;
++                            }
++                            const int64_t E = m.g->n_expert;
++                            d4_split(m.d4.ids, T, K, (int32_t) E, [&](int32_t e) { return rc_->holds(l, e); },
++                                     [&](int32_t e) { return m.host_res && m.cache && m.host_res[(size_t) l * E + e] >= 0; }, m.d4.split);
++                            if (m.d4.split.rows_rem > 0) {
++                                m.d4.mask = m.d4.split.mask;
++                                rem_now = rem_fused = true;
++                                rem_at = T * K;   // the combine's rows_local: every slot below it is a Dm row, the sentinel is not
++                                rem_tok = m.d4.split.row_tok.data();
++                                rem_off = m.d4.split.off.data(); rem_cnt = m.d4.split.cnt.data();
++                                cudaMemcpyAsync(m.d4.ids_dev, m.d4.split.ids_local.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
++                                cudaMemcpyAsync(m.d4.rslot_dev, m.d4.split.remote_slot.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
++                                grp_ids = m.d4.ids_dev;
++                                if (rc_->prefill_usable())
++                                    rem_sent = rc_->prefill_begin(l, m.d4.rows, seabraid::kPfRowsF32, m.d4.w, m.d4.ids, T, K, m.d4.mask.data(), rem_err);
++                            }
++                        }
++                        fused::group(grp_ids, T * K, (int) K, (int) m.g->n_expert, m.GU, m.slot_dev, m.src_dev, m.cs);
++                        if (rem_fused) d4_mark_remote(m.slot_dev, grp_ids, T * K, (int32_t) (T * K), m.cs);
+                         // launches over the experts in id order, each at most kMaxBatch experts (STRATA_PF_BATCH: below)
+                         // of which at most a third of the ring streamed: the next batch's blobs arrive while one computes.
+                         // An expert the routing did not pick has no tiles; its ring slot is given back with its batch.
+@@ -5545,7 +5651,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                             }
+                             pt.mark(kPfGemmGU, cs);
+                             if (fused_nat) {
+-                                fused::want_dm_f16(pf_dm16() && rows_cpu == 0 && !peer_now && ((reinterpret_cast<uintptr_t>(m.shared) | reinterpret_cast<uintptr_t>(m.bo)) & 15) == 0);
++                                fused::want_dm_f16(pf_dm16() && rows_cpu == 0 && !peer_now && !rem_fused && ((reinterpret_cast<uintptr_t>(m.shared) | reinterpret_cast<uintptr_t>(m.bo)) & 15) == 0);
+                                 const auto& f = lay.fmt[(size_t) l];
+                                 const fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
+                                 if (wb) {
+@@ -5590,7 +5696,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                             err = "prefill: the routed ids' download failed";   // #1996
+                             return false;
+                         }
+-                        bool cpu_maybe = pool_hold.held && !stream_all && m.src != nullptr && !m.cpu_dead &&
++                        bool cpu_maybe = pool_hold.held && !stream_all && m.src != nullptr && !m.cpu_dead && !d4_layer(l) &&
+                                          lay.native && (!m.pp || pf_peer_cpu()) && !lay.fmt.empty();
+                         // The share's two pinned buffers are small (~50 MB) but are had mid-request, when the host may have
+                         // nothing left (0.1.41 report: tight RAM, chats failing).  A buffer that cannot be had ends the share
+@@ -5638,6 +5744,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                             }
+                             if (cpu_maybe) cudaMemcpyAsync(m.cpu_x, m.mixed, want * sizeof(float), cudaMemcpyDeviceToHost, m.cs);
+                         }
++                        // D4: the request's rows (the FP16 copy the FP16 path already keeps: the format the wire carries)
++                        // and the router weights, down with the ids - the sync below covers all three
++                        if (d4_layer(l)) {
++                            m.d4.fetch_rows(m.mixed, m.mixed_h, (size_t) T, (size_t) N, seabraid::kPfRowsF16, m.cs);   // MMQ quantizes the fp16 rows
++                            cudaMemcpyAsync(m.d4.w, m.w, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
++                        }
+                         // #579: a stall here is the GPU (this layer's attention and router, or the previous layer's
+                         // work), not the host: the watchdog's report says so (only its text changes)
+                         core::progress_at("reading the prompt (batched): waiting for the GPU (attention, router) at layer",
+@@ -5780,13 +5892,28 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                             }
+                             rows_local = T * K - rows_peer;
+                         }
++                        // D4: the experts the expert process holds (and card 1 does not) are its: their rows go last, as
++                        // one block [rem_at, T*K) that nothing here computes; the combine adds its per-token sums instead.
++                        // ONE mask for the grouping and the request (m.d4.mask), so a pick is computed exactly once.
++                        int64_t rows_rem = 0;
++                        const bool d4l = d4_layer(l) && pre_mmq;
++                        if (d4l) {
++                            for (int32_t e = 0; e < m.g->n_expert; ++e) {
++                                const bool mine = m.cnt[(size_t) e] > 0 && rc_->holds(l, e) &&
++                                                  !(m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0);
++                                m.d4.mask[(size_t) e] = mine ? 1 : 0;
++                                if (mine) rows_rem += m.cnt[(size_t) e];
++                            }
++                            rows_local -= rows_rem;
++                        }
++                        auto rem_e = [&](int32_t e) { return d4l && m.d4.mask[(size_t) e] != 0; };
+                         // STRATA_PF_PEER_CPU: beside the peer the CPU's block goes before the peer's, which stays the tail
+                         // (its combine takes every row from back_at on); alone, last as before
+                         const bool cpu_mid = !on_peer.empty() && !on_cpu.empty();
+                         {
+                             int32_t r = 0;
+                             for (int32_t e = 0; e < m.g->n_expert; ++e)
+-                                if ((on_peer.empty() || !on_peer[(size_t) e]) && (on_cpu.empty() || !on_cpu[(size_t) e])) {
++                                if ((on_peer.empty() || !on_peer[(size_t) e]) && (on_cpu.empty() || !on_cpu[(size_t) e]) && !rem_e(e)) {
+                                     m.off[(size_t) e] = r;
+                                     r += m.cnt[(size_t) e];
+                                 }
+@@ -5798,6 +5925,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                                     if (on_peer[(size_t) e] == kind) { m.off[(size_t) e] = r; r += m.cnt[(size_t) e]; }
+                             for (int32_t e = 0; e < m.g->n_expert && !on_cpu.empty() && !cpu_mid; ++e)   // the CPU's block, last
+                                 if (on_cpu[(size_t) e]) { m.off[(size_t) e] = r; r += m.cnt[(size_t) e]; }
++                            for (int32_t e = 0; e < m.g->n_expert && d4l; ++e)   // D4: the expert card's block (no CPU share, no peer)
++                                if (rem_e(e)) { m.off[(size_t) e] = r; r += m.cnt[(size_t) e]; }
+                             m.off[(size_t) m.g->n_expert] = r;
+                             rows_local -= rows_cpu;
+                         }
+@@ -5814,7 +5943,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                         std::vector<int32_t> order, order_peer;
+                         for (int32_t e = 0; e < m.g->n_expert; ++e)
+                             if (m.cnt[(size_t) e] > 0 && (on_peer.empty() || on_peer[(size_t) e] != 2) &&
+-                                (on_cpu.empty() || !on_cpu[(size_t) e]))
++                                (on_cpu.empty() || !on_cpu[(size_t) e]) && !rem_e(e))
+                                 (!on_peer.empty() && on_peer[(size_t) e] ? order_peer : order).push_back(e);
+                         for (int32_t e = 0; e < m.g->n_expert && !on_peer.empty(); ++e)   // the peer-streamed ones last:
+                             if (on_peer[(size_t) e] == 2) order_peer.push_back(e);        // their copies get the most time
+@@ -5828,7 +5957,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                         const bool sort_all = detail::mmq_resident_sort_requested();
+                         const bool sort_full = !sort_all && use_mmq && mmq_plan().group_sort[(size_t) l] &&
+                                                order.size() >= (size_t) MMQ_GROUP;
+-                        if (detail::mmq_resident_sort_eligible((sort_all || sort_full) && on_peer.empty(), use_mmq, lay.native,
++                        if (detail::mmq_resident_sort_eligible((sort_all || sort_full) && on_peer.empty() && !d4l, use_mmq, lay.native,
+                                 m.cache != nullptr, m.host_res ? m.host_res + (size_t) l * m.g->n_expert : nullptr,
+                                 m.g->n_expert, stream_all, !stream_all || seq_start[(size_t) l] == seq_start[(size_t) l + 1]))
+                             detail::mmq_resident_sort_rows(ids_h, T * K, (int32_t) K, m.cnt, m.off, order, slot_h, src_h,
+@@ -5843,6 +5972,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                                 return false;
+                             }
+                         }
++                        // D4: the request goes out NOW, so the expert card computes while this card runs its own experts
++                        // below; the combine waits for it (prefill_end).  A refusal here is the combine's failure path too.
++                        if (d4l && rows_rem > 0) {
++                            rem_now = true;
++                            rem_at = T * K - rows_rem;
++                            rem_tok = src_h;
++                            rem_off = m.off.data(); rem_cnt = m.cnt.data();
++                            if (rc_->prefill_usable())
++                                rem_sent = rc_->prefill_begin(l, m.d4.rows, seabraid::kPfRowsF16, m.d4.w, ids_h, T, K, m.d4.mask.data(), rem_err);
++                        }
+                         // Diagnostics: STRATA_DUMP_MOE_INPUT=path, STRATA_DUMP_MOE_LAYER=l - the first chunk's MoE input
+                         // of layer l ({T, N, K} int64, T x N floats, T x K expert ids) for testing products on real rows
+                         static const char* dump_moe = std::getenv("STRATA_DUMP_MOE_INPUT");
+@@ -7090,6 +7229,39 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                         m.pend_l = (int) l;
+                         m.pend_wall_n = n_stream;
+                     }
++                    // D4: the expert card's per-token sums land in mapped host memory the combine reads in place.  Safe to
++                    // overwrite per layer: the next D4 layer writes them only after its grouping sync, i.e. after this
++                    // combine ran.  On ANY failure this card computes the handed-over picks into their own Dm rows (from the
++                    // files) and the plain combine below sums every row - loud, never a missing contribution.
++                    bool rem_sums = false;
++                    if (rem_now) {
++                        rem_sums = rem_sent && rc_->prefill_end(m.d4.sum16, rem_err);
++                        if (rem_sums && D4Check::enabled()) {   // diagnostic: judge the returned sums against this card's own product
++                            D4CheckIn ci;
++                            ci.layer = l; ci.T = T; ci.x = m.mixed; ci.x16 = m.mixed_h; ci.w = m.w; ci.Dm = m.Dm;
++                            ci.sum16 = m.d4.sum16; ci.row_tok = rem_tok; ci.off = rem_off; ci.cnt = rem_cnt; ci.stream = m.cs;
++                            ci.slot = rem_fused ? m.d4.rslot_dev : m.slot_dev;   // a fused layer keeps the pick -> row table apart
++                            ci.from = rem_fused ? 0 : rem_at;
++                            for (int32_t e = 0; e < m.g->n_expert; ++e)
++                                if (m.d4.mask[(size_t) e]) ci.experts.push_back(e);
++                            std::string cerr;
++                            if (!m.d4.check.run(m.d4.fallback, *rc_files_, ci, cerr)) std::fprintf(stderr, "D4CHECK layer=%lld failed: %s\n", (long long) l, cerr.c_str());
++                        }
++                        if (rem_sums && D4Check::use_reference()) { rem_sums = false; rem_err = "STRATA_D4_CHECK=2: control"; }
++                        if (!rem_sums) {
++                            std::fprintf(stderr, "D4: layer %lld computed on card 1 (%s)\n", (long long) l,
++                                         rem_err.empty() ? "the expert process is off for prompts" : rem_err.c_str());
++                            std::vector<int32_t> ex;
++                            for (int32_t e = 0; e < m.g->n_expert; ++e)
++                                if (m.d4.mask[(size_t) e]) ex.push_back(e);
++                            if (!m.d4.fallback.run(l, m.mixed, T, ex.data(), (int) ex.size(), rem_off, rem_cnt, rem_tok,
++                                                   m.Dm, *rc_files_, m.cs, err)) {
++                                err = "prefill: D4 failed and card 1 could not compute those experts either: " + err;
++                                return false;
++                            }
++                            if (rem_fused) d4_apply_remote(m.slot_dev, m.d4.rslot_dev, T * K, m.cs);   // the plain combine now finds their rows
++                        }
++                    }
+                     if (peer_now) {   // multi-GPU: the peer's rows are in Dm (or, without P2P, in host memory)
+                         cudaStreamWaitEvent(m.cs, m.pp->ev_done, 0);
+                         if (!m.pp->p2p && !m.pp->sums)
+@@ -7099,6 +7271,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                         moe_combine_peer16(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum16, m.pp->back_at, m.bo, T, m.cs);
+                     else if (peer_now && m.pp->sums)
+                         moe_combine_peer(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum, m.pp->back_at, m.bo, T, m.cs);
++                    else if (rem_sums)   // D4: rows below rem_at are this card's, the rest arrive as the expert card's sums
++                        moe_combine_peer16(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.d4.sum16, rem_at, m.bo, T, m.cs);
+                     else if (dm16_used && rows_cpu == 0)
+                         moe_combine16(reinterpret_cast<const uint16_t*>(m.Dm), m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+                     else
+@@ -7619,6 +7793,7 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
+     const bool split = stage_lb_ != 0 || stage_le_ != g.n_layers || next_ != nullptr;
+     if (hand_in_ != nullptr) { why = "a layer split's chunk hand-off is in use"; return 0; }
+     if (m.pp || helper_ != nullptr || core::peer_portable()) { why = "a peer GPU"; return 0; }
++    if (rc_ != nullptr) { why = "D4 (the expert process computes its experts; no layer-major form)"; return 0; }
+     // the PLE block (layer 1) reads the token history: on a split it runs in a first stage that holds layers 0 and 1
+     // (a later stage never reaches it)
+     if (split && m.ss->ple.ready() && stage_lb_ <= 1 && !(stage_lb_ == 0 && stage_le_ >= 2)) {
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 5b36a06d5..1e2f46670 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -11640,6 +11640,23 @@ int main(int argc, char** argv) {
+             std::fprintf(stderr, "strata serve: the prompt path reads the experts a helper cache holds from that "
+                                  "cache (STRATA_PREFILL_HELPER_SOURCE)\n");
+         }
++        // D4 (STRATA_PREFILL_REMOTE_COMPUTE=1: per-chunk model, =2: every eligible chunk): the seabraid expert process computes
++        // the experts it holds while a prompt is read (core/remote_prefill.cpp, prefill.cpp).  A hook only; unset: nothing
++        // here runs.  Open-time mismatch (no region, another width or format) stops the engine with both sides' values.
++        strata::core::RemoteExperts* d4_remote = nullptr;
++        if (const char* dv = std::getenv("STRATA_PREFILL_REMOTE_COMPUTE"); dv != nullptr && std::atoi(dv) != 0) {
++            for (strata::core::RemoteExperts* r : prefill_helpers)
++                if (r->seabraid()) d4_remote = r;
++            std::string d4err;
++            if (d4_remote == nullptr || srcp == nullptr || multi_gpu || !stages.empty() || o.batch > 0)
++                d4err = "needs a seabraid expert process, an expert source and a serial single-GPU prompt path";
++            else
++                (void) d4_remote->prefill_open(K, d4err);
++            if (!d4err.empty()) {
++                std::fprintf(stderr, "strata serve: STRATA_PREFILL_REMOTE_COMPUTE: %s\n", d4err.c_str());
++                return 2;
++            }
++        }
+         strata::prefill::Prefill sp;
+         // 149-prefetch STRATA_RAM_ADAPT2=1 (with STRATA_RAM_ADAPT=n, the promotions staged per window): see the window loop
+         struct RamAdapt2 {
+@@ -12331,6 +12348,7 @@ int main(int argc, char** argv) {
+             }
+             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
+             if (share_pool) sp.set_cpu_pool(&pool);
++            sp.set_remote_compute(d4_remote, srcp);   // D4 (null: off); srcp = the files, for its failure path
+             int cur_dev = 0;
+             cudaGetDevice(&cur_dev);   // the device this path is about to run on (dev -1: the current one)
+             const bool room_here = mtp_room_slots > 0 && mtp.device() == cur_dev;
+diff --git a/tests/core/remote_prefill_test.cpp b/tests/core/remote_prefill_test.cpp
+new file mode 100644
+index 000000000..d3f7bfdcd
+--- /dev/null
++++ b/tests/core/remote_prefill_test.cpp
+@@ -0,0 +1,305 @@
++// remote_prefill_test: D4 (STRATA_PREFILL_REMOTE_COMPUTE) without a GPU.  Card 1's REAL request path
++// (RemoteExperts::prefill_open / prefill_begin / prefill_end, seabraid::pack_prefill_request) talks over a REAL POSIX shm
++// channel to an in-process expert process running the REAL serve_prefill (plan_prefill_batches, the echo) with a CPU
++// backend: synthetic experts, prefill_reduce_ref (the arithmetic of remote_expert_opt.cu's prefill_reduce_f16), fp16 rows
++// and sums exactly as the wire carries them.
++//
++// What it pins (each sabotaged once and watched to FAIL - see the commit message):
++//   1 sizing    : the prefill region is sized by TOKENS (4H + 8K bytes each, page-rounded), never by pairs
++//   2 equality  : card 1's own picks + the expert process's per-token sums == card 1 computing every pick itself, within
++//                 2e-3 of the token's largest |value| (fp16 rows and fp16 sums: 2 x 2^-11 relative, plus fmaf order)
++//   3 ranges    : a chunk longer than the region goes as several requests; a range with no handed-over pick sends nothing
++//   4 failure   : an error reply or a wrong echo is a failure, and prompt reading on that card is then off (later chunks lend)
++//   5 open      : no region / another width is refused at open, naming both sides
++//   6 model     : the byte/time model computes below its crossover and lends above it
++#include <algorithm>
++#include <atomic>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <sys/stat.h>
++#include <thread>
++#include <unistd.h>
++#include <vector>
++
++#include "strata/seabraid/channel.hpp"
++#include "strata/seabraid/prefill_wire.hpp"
++#include "strata/core/expert_cache.hpp"
++#include "strata/core/expert_source.hpp"
++#include "strata/core/remote_experts.hpp"
++#include "strata/core/remote_prefill.hpp"
++#include "strata/kernels/cpu/expert_layout.hpp"
++#include "strata/kernels/f16_bits.hpp"
++#include "strata/kernels/window_limits.hpp"
++
++namespace bl = seabraid;
++using strata::core::RemoteExperts;
++using strata::kernels::f16_from_f32;
++using strata::kernels::f32_from_f16;
++
++static int g_fail = 0;
++#define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); ++g_fail; } } while (0)
++
++constexpr int H = strata::kernels::cpu::H, K = 10, NL = 3, NE = 16, LAYER = 1, PF_TOK = 8, MAXE = 13;
++constexpr int MAXT = strata::kernels::kWindowMaxT;
++constexpr double kTol = 2e-3;
++static const int kHeld[] = {2, 3, 5, 7, 9};
++
++// A synthetic expert: nonlinear and different per expert, so a pick computed by the wrong expert, with the wrong token or
++// without its weight cannot cancel out.
++static float expert_val(int e, const float* x, int j) {
++    return (0.3f + 0.1f * (float) e) * x[j] + 0.05f * (float) (e % 3 - 1) * std::tanh(x[(j + 7 * e) % H]);
++}
++
++// What the last request's rows looked like when they reached the expert process (decoded to f32), and in which type: the test
++// compares them with what card 1 sent, so a row type that silently re-rounds (or is read as the wrong type) cannot pass.
++static std::vector<float> g_recv;
++static int32_t g_recv_row_bytes = 0;
++
++struct CpuBackend {   // serve_prefill's backend, on the CPU
++    const uint8_t* held;
++    std::vector<float> x, rows, sum;
++    bool fail = false;
++    bool holds(int32_t l, int32_t e) const { return held[(size_t) l * NE + (size_t) e] != 0; }
++    bool begin(int32_t, const void* rows, int32_t row_bytes, int64_t n, std::string&) {
++        x.resize((size_t) n * H); sum.assign((size_t) n * H, 0.0f);
++        for (size_t i = 0; i < x.size(); ++i)
++            x[i] = row_bytes == bl::kPfRowsF32 ? ((const float*) rows)[i] : f32_from_f16(((const uint16_t*) rows)[i]);
++        g_recv = x; g_recv_row_bytes = row_bytes;
++        return true;
++    }
++    bool batch(int32_t, const bl::PrefillBatch& b, const float* wt, std::string& err) {
++        if (fail) { err = "injected failure"; return false; }
++        rows.assign(b.ent_tok.size() * (size_t) H, 0.0f);
++        for (size_t g = 0; g + 1 < b.grp_start.size(); ++g)
++            for (int32_t i = b.grp_start[g]; i < b.grp_start[g + 1]; ++i)
++                for (int j = 0; j < H; ++j)
++                    rows[(size_t) b.ent_row[(size_t) i] * H + j] = expert_val(b.grp_expert[g], &x[(size_t) b.ent_tok[(size_t) i] * H], j);
++        bl::prefill_reduce_ref(b, rows.data(), wt, K, H, &sum[(size_t) b.t0 * H]);
++        return true;
++    }
++    bool end(uint16_t* out16, int64_t n, std::string& err) {
++        for (int64_t i = 0; i < n * H; ++i) {
++            out16[i] = f16_from_f32(sum[(size_t) i]);
++            if ((out16[i] & 0x7C00u) == 0x7C00u) { err = "non-finite"; return false; }
++        }
++        return true;
++    }
++};
++
++struct Fixture {
++    bl::Channel ch;
++    std::thread th;
++    RemoteExperts re;
++    strata::core::ExpertCache primary;
++    strata::core::FileExpertSource src;
++    std::atomic<int> requests{0};
++    std::atomic<bool> fail{false}, lie{false};
++    std::string err;
++
++    Fixture(const char* tag, int64_t pf_tokens = PF_TOK, int32_t pf_k = K) {
++        const std::string name = std::string("/d4pf") + std::to_string(getpid()) + tag;
++        std::string e;
++        if (!ch.create(name, H, (int64_t) MAXT * K, NL, NE, (uint32_t) MAXT, (int64_t) strata::kernels::cpu::expert_layout().max_blob, e,
++                       pf_tokens, pf_k)) { std::printf("create failed: %s\n", e.c_str()); std::exit(2); }
++        ch.header()->free_gib = 8.0;
++        ch.header()->helper_pid = (int32_t) getpid();   // alive: card 1's liveness checks run and pass
++        std::strcpy(ch.header()->helper_name, "fake-expert-process");
++        ch.header()->state.store(bl::kHelperUp, std::memory_order_release);
++        th = std::thread([this] { serve(); });
++        setenv("SEABRAID_STRATA_SHM", name.c_str(), 1);
++        std::vector<std::pair<int32_t, int32_t>> ranked;
++        for (int x : kHeld) ranked.emplace_back(LAYER, x);
++        std::vector<uint8_t> claimed((size_t) NL * NE, 0);
++        if (!re.open(bl::kDeviceBase, 5, NL, NE, ranked, primary, src, claimed, err, false)) { std::printf("open failed: %s\n", err.c_str()); std::exit(2); }
++    }
++    ~Fixture() {
++        re.close();
++        ch.header()->state.store(bl::kShutdown, std::memory_order_release);
++        th.join();
++    }
++    void serve() {
++        bl::Header* hd = ch.header();
++        while (hd->state.load(std::memory_order_acquire) != bl::kPlanReady) {
++            if (hd->state.load() == bl::kShutdown) return;
++            usleep(200);
++        }
++        for (int64_t i = 0; i < hd->plan_count; ++i) ch.held()[(size_t) ch.plan()[2 * i] * NE + (size_t) ch.plan()[2 * i + 1]] = 1;
++        hd->resident = hd->plan_count; hd->gib = 0.1;
++        hd->state.store(bl::kLoaded, std::memory_order_release);
++        CpuBackend be{ch.held(), {}, {}, {}};
++        while (hd->state.load(std::memory_order_acquire) != bl::kShutdown) {
++            const uint64_t seq = ch.pf_pending();
++            if (seq == 0) { usleep(50); continue; }
++            be.fail = fail.load();
++            std::string e;
++            bl::serve_prefill(ch, be, NE, MAXE, e);
++            if (lie.load()) hd->pf_picks -= 1;   // a dishonest echo: one contribution silently missing
++            ++requests;
++            ch.pf_answer(seq);
++        }
++    }
++};
++
++struct Chunk {   // T tokens of routing, as Strata's router leaves them (token-major ids and weights)
++    int T;
++    std::vector<float> x, w;
++    std::vector<uint16_t> x16;
++    std::vector<int32_t> ids;
++    const void* rows(int32_t row_bytes) const { return row_bytes == bl::kPfRowsF32 ? (const void*) x.data() : (const void*) x16.data(); }
++    explicit Chunk(int t, bool foreign_only = false) : T(t), x((size_t) t * H), w((size_t) t * K), x16((size_t) t * H), ids((size_t) t * K) {
++        for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin(0.37f * (float) i) * (1.0f + (float) (i % 11) * 0.2f);
++        for (size_t i = 0; i < x.size(); ++i) x16[i] = f16_from_f32(x[i]);   // card 1 downloads mixed_h: the fp16 of its rows
++        const int pool[K] = {2, 11, 3, 5, 12, 7, 9, 13, 14, 15};
++        const int foreign[K] = {0, 1, 4, 6, 8, 10, 11, 12, 13, 14};
++        for (int tk = 0; tk < t; ++tk)
++            for (int i = 0; i < K; ++i) {
++                ids[(size_t) tk * K + i] = foreign_only ? foreign[i] : pool[(i + tk) % K];
++                w[(size_t) tk * K + i] = 0.03f + 0.011f * (float) ((tk * 7 + i * 3) % 13);
++            }
++    }
++};
++
++static bool held(int e) { for (int x : kHeld) if (x == e) return true; return false; }
++
++int main() {
++    // ---- 1. sizing by tokens
++    {
++        const int64_t hid = 2560, k = 10, toks = 16384;
++        const auto r = bl::PrefillRegion::of(hid, k, toks);
++        auto up = [](size_t v) { return (v + 4095) & ~(size_t) 4095; };
++        const size_t want = up((size_t) toks * hid * 4) + up((size_t) toks * hid * 2) + 2 * up((size_t) toks * k * 4);   // rows (room for f32), sums, picks, weights
++        CHECK(r.bytes == want);
++        CHECK(r.bytes <= (size_t) toks * bl::PrefillRegion::token_bytes(hid, k, bl::kPfRowsF32) + 4 * 4096);
++        CHECK(r.bytes < (size_t) 300 << 20);   // room for f32 rows (~250 MB at 16K tokens); a pairs-sized region (one H-float row per pick) would be ~3.4 GB here
++        CHECK(bl::PrefillRegion::of(hid, k, 2 * toks).bytes == 2 * r.bytes);   // linear in tokens
++        Fixture f("s");
++        struct stat st{};
++        const std::string path = std::string("/dev/shm") + std::getenv("SEABRAID_STRATA_SHM");
++        CHECK(::stat(path.c_str(), &st) == 0);
++        const auto lay = bl::Layout::of(H, (int64_t) MAXT * K, NL, NE, (int64_t) strata::kernels::cpu::expert_layout().max_blob);
++        CHECK((size_t) st.st_size == lay.total + bl::PrefillRegion::of(H, K, PF_TOK).bytes);
++        CHECK(f.ch.header()->pf_tokens == PF_TOK && f.ch.header()->pf_k == K && f.ch.header()->pf_format == bl::kPfFp16);
++    }
++    // ---- 2 + 3. equality across three ranges (21 tokens, 8 per request), then a range without a handed-over pick
++    {
++        Fixture f("e");
++        CHECK(f.re.prefill_open(K, f.err));
++        const Chunk c(21);
++        std::vector<uint8_t> mask(NE, 0);
++        for (int e = 0; e < NE; ++e) mask[(size_t) e] = f.re.holds(LAYER, e) ? 1 : 0;
++        for (int e = 0; e < NE; ++e) CHECK((mask[(size_t) e] != 0) == held(e));
++        std::vector<uint16_t> sums((size_t) c.T * H, 0xFFFF);
++        CHECK(f.re.prefill_begin(LAYER, c.x16.data(), bl::kPfRowsF16, c.w.data(), c.ids.data(), c.T, K, mask.data(), f.err));
++        CHECK(f.re.prefill_end(sums.data(), f.err));
++        CHECK(f.requests.load() == 3);
++        double worst = 0;
++        for (int t = 0; t < c.T; ++t) {
++            std::vector<double> ref(H, 0.0), d4(H, 0.0);
++            double scale = 1e-6;
++            for (int j = 0; j < H; ++j) {
++                for (int i = 0; i < K; ++i) {
++                    const int e = c.ids[(size_t) t * K + i];
++                    const double v = (double) c.w[(size_t) t * K + i] * expert_val(e, &c.x[(size_t) t * H], j);
++                    ref[(size_t) j] += v;                       // card 1 computing every pick itself
++                    if (!mask[(size_t) e]) d4[(size_t) j] += v;  // card 1's own picks under D4 ...
++                }
++                d4[(size_t) j] += f32_from_f16(sums[(size_t) t * H + j]);   // ... plus the expert process's sum
++                scale = std::max(scale, std::fabs(ref[(size_t) j]));
++            }
++            for (int j = 0; j < H; ++j) worst = std::max(worst, std::fabs(d4[(size_t) j] - ref[(size_t) j]) / scale);
++        }
++        std::printf("equality: worst |D4 - card 1 alone| / max|row| = %.3e (tolerance %.0e)\n", worst, kTol);
++        CHECK(worst <= kTol);
++        const int before = f.requests.load();
++        const Chunk none(PF_TOK, true);
++        std::vector<uint16_t> zs((size_t) none.T * H, 0x1234);
++        CHECK(f.re.prefill_begin(LAYER, none.x16.data(), bl::kPfRowsF16, none.w.data(), none.ids.data(), none.T, K, mask.data(), f.err));
++        CHECK(f.re.prefill_end(zs.data(), f.err));
++        CHECK(f.requests.load() == before);   // no round trip
++        CHECK(std::all_of(zs.begin(), zs.end(), [](uint16_t v) { return v == 0; }));
++        CHECK(f.re.prefill_usable());
++    }
++    // ---- 2b. the row type is declared per request: fp16 rows arrive as the fp16 rounding of card 1's rows, f32 rows bit for bit,
++    //          and both in one session (an engine runs fused layers and MMQ layers in the same chunk)
++    {
++        Fixture f("rt");
++        CHECK(f.re.prefill_open(K, f.err));
++        const Chunk c(PF_TOK);   // one request: the last request's rows are all of them
++        std::vector<uint8_t> mask(NE, 0);
++        for (int e : kHeld) mask[(size_t) e] = 1;
++        std::vector<uint16_t> sums((size_t) c.T * H);
++        for (const int32_t rb : {bl::kPfRowsF32, bl::kPfRowsF16, bl::kPfRowsF32}) {
++            CHECK(f.re.prefill_begin(LAYER, c.rows(rb), rb, c.w.data(), c.ids.data(), c.T, K, mask.data(), f.err));
++            CHECK(f.re.prefill_end(sums.data(), f.err));
++            CHECK(g_recv_row_bytes == rb && g_recv.size() == c.x.size());
++            size_t unequal = 0;
++            for (size_t i = 0; i < c.x.size() && i < g_recv.size(); ++i) {
++                const float want = rb == bl::kPfRowsF32 ? c.x[i] : f32_from_f16(c.x16[i]);
++                unequal += std::memcmp(&want, &g_recv[i], 4) != 0;
++            }
++            CHECK(unequal == 0);
++            // WHY the type is declared per request (the D4 precision loss, reproduced on the host): a path that quantizes card 1's
++            // f32 rows to int8 blocks and an expert card that quantizes what it RECEIVED agree on every code only when it received
++            // the f32 rows; fp16-rounded rows flip a few percent of the codes (one quantization step each, ~0.5% nrmse on an
++            // expert's output - measured per layer on the GPUs by STRATA_D4_CHECK, E3).
++            size_t flips = 0;
++            for (size_t b = 0; b + 32 <= c.x.size() && b + 32 <= g_recv.size(); b += 32) {
++                float a = 0, ar = 0;
++                for (int i = 0; i < 32; ++i) { a = std::max(a, std::fabs(c.x[b + i])); ar = std::max(ar, std::fabs(g_recv[b + i])); }
++                for (int i = 0; i < 32; ++i)
++                    flips += std::lrintf(c.x[b + i] / (a / 127.0f)) != std::lrintf(g_recv[b + i] / (ar / 127.0f));
++            }
++            std::printf("row type %d bytes: int8 codes that differ from card 1's own f32 quantization: %.2f%%\n", rb, 100.0 * (double) flips / (double) c.x.size());
++            if (rb == bl::kPfRowsF32) CHECK(flips == 0);
++            else CHECK(flips > c.x.size() / 500);   // > 0.2%: fp16 rows are a real re-rounding for a path that quantizes f32
++        }
++        CHECK(!f.re.prefill_begin(LAYER, c.rows(3), 3, c.w.data(), c.ids.data(), c.T, K, mask.data(), f.err));   // no such row type
++    }
++    // ---- 4. failure contract: an error reply, then a dishonest echo
++    for (int lie = 0; lie < 2; ++lie) {
++        Fixture f(lie ? "l" : "f");
++        CHECK(f.re.prefill_open(K, f.err));
++        (lie ? f.lie : f.fail).store(true);
++        const Chunk c(5);
++        std::vector<uint8_t> mask(NE, 0);
++        for (int e : kHeld) mask[(size_t) e] = 1;
++        std::vector<uint16_t> sums((size_t) c.T * H);
++        CHECK(f.re.prefill_begin(LAYER, c.x16.data(), bl::kPfRowsF16, c.w.data(), c.ids.data(), c.T, K, mask.data(), f.err));
++        CHECK(!f.re.prefill_end(sums.data(), f.err));
++        CHECK(!f.re.prefill_usable());
++        CHECK(!f.re.prefill_begin(LAYER, c.x16.data(), bl::kPfRowsF16, c.w.data(), c.ids.data(), c.T, K, mask.data(), f.err));
++        CHECK(!f.re.prefill_choose(4, false, NL, H, K).compute);   // later chunks lend
++    }
++    // ---- 5. open-time refusals name both sides
++    {
++        Fixture f0("z", 0, 0);
++        CHECK(!f0.re.prefill_open(K, f0.err) && f0.err.find("--prefill-tokens") != std::string::npos);
++    }
++    {
++        Fixture f8("k", PF_TOK, 8);
++        CHECK(!f8.re.prefill_open(K, f8.err) && f8.err.find("expert process k 8") != std::string::npos &&
++              f8.err.find("card 1 k 10") != std::string::npos);
++    }
++    // ---- 6. the cost model
++    {
++        strata::core::PrefillCostIn c;
++        c.layers = 48; c.k = 10; c.n_expert = 512; c.hidden = 2560; c.stream_all = true;
++        c.remote_bytes = 14e9; c.pick_share = 0.35;
++        c.lend_Bps = strata::core::kD4LendBps; c.wire_Bps = strata::core::kD4WireBps;
++        c.pick_rate = strata::core::kD4PickRate; c.layer_s = strata::core::kD4LayerS;
++        const double x = strata::core::prefill_crossover_tokens(c);
++        std::printf("model: crossover %.0f tokens (32 GB AMD GPU-first placement, 14 GB held, share 0.35, default rates)\n", x);
++        CHECK(x > 1000 && x < 100000);
++        c.tokens = (int64_t) (x * 0.9); CHECK(strata::core::prefill_cost(c).compute);
++        c.tokens = (int64_t) (x * 1.1) + 1; CHECK(!strata::core::prefill_cost(c).compute);
++        c.stream_all = false; c.tokens = 64;   // a short staged chunk touches few blobs: the model must still be sane
++        const auto s = strata::core::prefill_cost(c);
++        CHECK(s.lend_bytes < c.remote_bytes && s.lend_bytes > 0);
++    }
++    if (g_fail) { std::printf("remote_prefill_test: %d FAILED\n", g_fail); return 1; }
++    std::printf("remote_prefill_test: all checks passed\n");
++    return 0;
++}
+diff --git a/tests/prefill/d4_plan_test.cpp b/tests/prefill/d4_plan_test.cpp
+new file mode 100644
+index 000000000..60cbef7b1
+--- /dev/null
++++ b/tests/prefill/d4_plan_test.cpp
+@@ -0,0 +1,82 @@
++// d4_plan_test: D4's host-side layer plan (include/strata/prefill/d4_plan.hpp), CPU only.
++//
++//   1 path   : handing experts to the expert process must not change the path card 1's own experts take (fused int8 kernels or
++//              MMQ).  This is the D4 precision root cause: the first D4 forced MMQ on every layer it touched, which on a HIP
++//              gfx12 engine (fused by default) changed card 1's own experts, KL ~0.03 against the fused path.
++//   2 split  : every routed pick is exactly one of card 1's or the expert process's; the masked ids keep card 1's picks and
++//              nothing else; the rows of the handed-over picks are distinct, inside [local_rows, valid), one contiguous block per
++//              expert in (token, k) order, and row_tok names the pick's token (the failure path computes them from these).
++//   3 limits : nothing handed over (a plan equal to the unmasked routing); everything handed over; ids out of range ignored.
++#include <algorithm>
++#include <cstdio>
++#include <cstdint>
++#include <random>
++#include <set>
++#include <vector>
++
++#include "strata/prefill/d4_plan.hpp"
++
++using strata::prefill::D4Split;
++using strata::prefill::ExpertPath;
++using strata::prefill::d4_split;
++using strata::prefill::expert_path;
++
++static int g_fail = 0;
++#define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); ++g_fail; } } while (0)
++
++static void check_path() {
++    for (const bool fused_ok : {false, true})
++        CHECK(expert_path(fused_ok, true) == expert_path(fused_ok, false));   // D4 never changes card 1's own path
++    CHECK(expert_path(true, true) == ExpertPath::kFused);                      // a fused-capable layer stays fused under D4
++    CHECK(expert_path(false, true) == ExpertPath::kMmq);
++}
++
++static void check_split(int64_t T, int64_t K, int32_t E, uint32_t seed, int holds_mode) {
++    std::mt19937 rng(seed);
++    std::vector<int32_t> ids((size_t) (T * K));
++    for (auto& v : ids) v = (int32_t) (rng() % (uint32_t) (E + 2)) - 1 + ((rng() % 50 == 0) ? E : 0);   // includes -1 and E.. (out of range)
++    std::vector<uint8_t> hold((size_t) E), res((size_t) E);
++    for (int32_t e = 0; e < E; ++e) {
++        hold[(size_t) e] = holds_mode == 0 ? 0 : holds_mode == 2 ? 1 : (rng() % 3 == 0);
++        res[(size_t) e] = holds_mode == 2 ? 0 : (rng() % 4 == 0);
++    }
++    D4Split s;
++    d4_split(ids.data(), T, K, E, [&](int32_t e) { return hold[(size_t) e] != 0; }, [&](int32_t e) { return res[(size_t) e] != 0; }, s);
++
++    int64_t valid = 0, rem = 0;
++    std::set<int32_t> rows;
++    std::vector<int32_t> seen_rows_of((size_t) E, 0);
++    for (int64_t i = 0; i < T * K; ++i) {
++        const int32_t e = ids[(size_t) i];
++        const bool in_range = e >= 0 && e < E;
++        valid += in_range;
++        const bool remote = in_range && hold[(size_t) e] && !res[(size_t) e];
++        rem += remote;
++        CHECK((s.ids_local[(size_t) i] == -1) == (remote || e == -1));                 // masked iff handed over (or already -1)
++        if (!remote) CHECK(s.ids_local[(size_t) i] == e && s.remote_slot[(size_t) i] == -1);
++        if (remote) {
++            const int32_t row = s.remote_slot[(size_t) i];
++            CHECK(row >= s.local_rows && row < s.local_rows + s.rows_rem);
++            CHECK(rows.insert(row).second);                                             // distinct rows
++            CHECK(row >= s.off[(size_t) e] && row < s.off[(size_t) e] + s.cnt[(size_t) e]);
++            CHECK(s.row_tok[(size_t) row] == (int32_t) (i / K));                        // the row's token
++            CHECK(row == s.off[(size_t) e] + seen_rows_of[(size_t) e]++);               // (token, k) order inside the expert
++        }
++    }
++    CHECK(s.rows_rem == rem);
++    CHECK(s.local_rows == valid - rem);
++    CHECK((int64_t) rows.size() == rem);
++    if (rem > 0) CHECK(*rows.begin() == s.local_rows && *rows.rbegin() == valid - 1);   // one dense block after card 1's rows
++    for (int32_t e = 0; e < E; ++e) CHECK((s.mask[(size_t) e] != 0) == (s.cnt[(size_t) e] > 0 && hold[(size_t) e] && !res[(size_t) e]));
++    if (holds_mode == 0) CHECK(rem == 0 && s.local_rows == valid);
++}
++
++int main() {
++    check_path();
++    for (uint32_t seed = 1; seed <= 40; ++seed) check_split(37, 10, 64, seed, (int) (seed % 3));
++    check_split(1, 10, 512, 7, 1);
++    check_split(4188, 10, 512, 9, 1);
++    if (g_fail) { std::printf("d4_plan_test: %d FAILED\n", g_fail); return 1; }
++    std::printf("d4_plan_test: ok\n");
++    return 0;
++}

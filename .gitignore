@@ -1,0 +1,21 @@
+# build outputs
+build*/
+/target/
+target/
+dist/
+*.egg-info/
+*.bin
+*.gguf
+# python
+__pycache__/
+*.py[cod]
+.venv*/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+# a hand-copied native library; scripts/build_wheel.py never reads or writes here
+bindings/python/seabraid/_lib/
+
+# User-local IDE settings are not release inputs.
+.idea/

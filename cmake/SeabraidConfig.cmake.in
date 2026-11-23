@@ -1,0 +1,50 @@
+# Copyright 2026 Saltwater Research LLC
+# SPDX-License-Identifier: Apache-2.0
+@PACKAGE_INIT@
+
+# The layout epoch of the library this package was built from. The headers declare SEABRAID_ABI_EPOCH; a
+# consumer whose own copy of the headers differs, or that loads another build of the library at run time,
+# must compare seabraid_abi_epoch() with SEABRAID_ABI_EPOCH at start-up and refuse on a mismatch.
+set(Seabraid_ABI_EPOCH @seabraid_abi_epoch@)
+
+if(NOT TARGET Seabraid::runtime)
+    # A partial SDK should fail at discovery, before generating link commands.
+    # WHY a loop of set() and EXISTS, not the set_and_check() macro: a macro argument is substituted into the macro body as
+    # TEXT and parsed again, so an install prefix containing ${NAME} (or a quote) was evaluated by the second parse and
+    # find_package looked for a directory the install never wrote. Plain set() reads the string as written.
+    set(_seabraid_include "@PACKAGE_seabraid_sdk_include_cfg@")
+    set(_seabraid_runtime "@PACKAGE_seabraid_sdk_runtime_cfg@")
+    set(_seabraid_checked _seabraid_include _seabraid_runtime)
+    if(WIN32)
+        set(_seabraid_import "@PACKAGE_seabraid_sdk_import@")
+        list(APPEND _seabraid_checked _seabraid_import)
+    endif()
+    foreach(_seabraid_var IN LISTS _seabraid_checked)
+        if(NOT EXISTS "${${_seabraid_var}}")
+            message(FATAL_ERROR "File or directory ${${_seabraid_var}} referenced by variable ${_seabraid_var} does not exist !")
+        endif()
+    endforeach()
+    unset(_seabraid_checked)
+    unset(_seabraid_var)
+
+    # GLOBAL so a consumer that calls find_package inside a subdirectory can link the target from its siblings.
+    add_library(Seabraid::runtime SHARED IMPORTED GLOBAL)
+    set_target_properties(Seabraid::runtime PROPERTIES
+        IMPORTED_LOCATION "${_seabraid_runtime}"
+        INTERFACE_INCLUDE_DIRECTORIES "${_seabraid_include}"
+    )
+    if(WIN32)
+        set_property(TARGET Seabraid::runtime PROPERTY IMPORTED_IMPLIB "${_seabraid_import}")
+    elseif(@seabraid_has_soname@)
+        # Baked in at install time: true only for the Linux build, the one target build.rs gives a SONAME.
+        # build.rs gives the ELF cdylib this SONAME (libseabraid.so.MAJOR.MINOR while the major version is 0),
+        # so DT_NEEDED is the bare name and CMake adds the installed library directory to the consumer's
+        # build RPATH. The installed file has that name; libseabraid.so beside it is the -lseabraid symlink.
+        set_property(TARGET Seabraid::runtime PROPERTY IMPORTED_SONAME "@seabraid_soname@")
+    endif()
+    unset(_seabraid_include)
+    unset(_seabraid_runtime)
+    unset(_seabraid_import)
+endif()
+
+check_required_components(Seabraid)

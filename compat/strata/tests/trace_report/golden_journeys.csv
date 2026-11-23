@@ -1,0 +1,8 @@
+layer,expert,hop,ts_us,time,round,epoch,direction,status,from_rung,to_rung,src_or_dst,bytes,stage_us,write_us,issue
+0,2,1,2000,t+1.000s,1,2,down,committed,0,1,card,4096,100,300,
+0,2,2,3000,t+2.000s,2,4,up,committed,1,0,card,4096,150,350,
+0,3,1,2001,t+1.001s,1,3,down,committed,1,2,fallback,4096,2000,500,
+0,5,1,2000,t+1.000s,1,2,up,committed,1,0,card,4096,100,300,
+0,5,2,3000,t+2.000s,2,4,down,committed,0,1,card,4096,150,350,
+0,7,1,2001,t+1.001s,1,3,up,committed,2,1,fallback,4096,2000,500,
+1,4,1,3001,t+2.001s,2,4,up,rejected,1,0,card,4096,40,0,issue stage/failed@rung1

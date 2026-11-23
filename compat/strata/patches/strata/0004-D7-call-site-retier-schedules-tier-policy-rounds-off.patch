@@ -1,0 +1,236 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Seabraid <seabraid@example.invalid>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH 04/16] D7 call site: --retier schedules tier-policy rounds off
+ the decode path and applies them on the engine thread
+
+Nothing called RemoteExperts::seabraid_retier. This wires the policy (strata-ext tier_plan) to it
+behind --retier, default OFF. The scheduling code lives in seabraid's strata-ext
+(strata/seabraid/retier_loop.hpp), not in generate.cpp; this patch adds only the hooks, the link
+and two read accessors.
+
+DESIGN GATE
+- Owner: round scheduling, the TierOp->TierWireOp conversion and the --retier* flags live in
+  strata-ext retier_loop.{hpp,cpp}. tier_plan still owns what moves; RemoteExperts still owns how
+  it is applied. generate.cpp gets: include, one Options member, flag parse, --help, a
+  startup check+construct, one tick() at the serial --serve window boundary, and a --serve-only
+  guard. All of it is #if STRATA_HAVE_SEABRAID_RETIER, defined by CMake only when the seabraid
+  checkout provides the seabraid_retier target, so a build without SEABRAID_STRATA_SOURCE_DIR compiles
+  none of it.
+- Contract: RetierLoop::tick(usage, held, free_slots, quiescent, ApplyFn) on the engine thread.
+  ApplyFn is RemoteExperts::seabraid_retier; the loop never includes remote_experts.hpp (one-way
+  edge). RemoteExperts gains seabraid_held() and seabraid_free_slots(), both engine-thread only.
+- Size: retier_loop.hpp 147 lines, retier_loop.cpp 215, generate.cpp +52.
+- Failure: misconfiguration (bad value, empty usage with the feature on, no helper, not --serve)
+  fails fast at startup, the error names --adapt-every and --adapt-swaps. A round error (planner
+  error, helper refusal, fence timeout) is logged and the round skipped; serving continues and
+  failed ops reach note_failed. Ops are never applied off the engine thread: tick() refuses any
+  other thread, the planner thread only produces a plan.
+- Checker: tests/retier_loop_test.cpp and tests/tier_plan_test.cpp in the seabraid checkout, each
+  guard sabotaged once (tests/SABOTAGE.md).
+- Finish line: with the flag off nothing here is constructed (no thread, no snapshot); with it on,
+  one log line per round with ops proposed/applied/failed, ranker ms, fence ms, coverage.
+
+THREAD MODEL. Engine thread: at a window boundary tick() takes a finished plan and applies it
+through seabraid_retier, then (if a round is due and none is in flight) copies heat
+(DriverState::usage) and the helper's residency into a single-slot mailbox. Planner thread: waits on
+the mailbox, runs note_failed for the previous round, plan_tier_round (timed), converts to wire ops,
+posts a plan to a second single-slot mailbox. The planner owns TierPolicyState exclusively; failures
+reach it inside the next input. No shared mutable state besides the two mailboxes.
+
+HOOK PLACEMENT. Just before adapt_tick() in the serial --serve loop: the previous window's adapt
+thread was joined at the end of that iteration and the next is not started, so nothing else touches
+usage or the helper's residency. The pipelined loop, --batch and generate mode have no hook;
+generate mode is refused at startup, and the RetierLoop destructor prints a WARNING when it was never
+ticked. With an --adapt-async job running, usage is being written, so the snapshot is skipped.
+
+KNOBS (flags, all in --help): --retier off|on|zero-op (default off), --retier-every N windows
+(128), --retier-moves N (4), --retier-margin X (1.25), --retier-cooldown N (8), --retier-ceiling X
+(0.08). zero-op runs snapshot, ranker, hand-off and the log line, discards the ops and never enters
+the fence (seabraid_retier refuses n=0, so the loop skips the call).
+
+TRANSPORT LIMIT FOUND WHILE WIRING: the wire has no EVICT and a SWAP is same-layer, but the policy
+emits bare EVICTs and cross-layer pairs. strata-ext now has TierPolicyConfig::same_layer_swaps
+(default false; the loop forces it) so the policy returns only LOADs into free slots and same-layer
+LOAD+EVICT pairs; to_wire() turns pairs into SWAPs and drops anything else, counted and logged.
+On a full helper the free-slot count is 0 for good, so every applied move is a swap.
+
+NOT VERIFIED: nothing was run on a GPU. generate.cpp, remote_experts.cpp and the loop compile with
+nvcc 13.1 sm_86 (generate.cpp needs -std=c++20); HIP is not built here.
+---
+ CMakeLists.txt                         |  6 ++++
+ include/strata/core/remote_experts.hpp |  8 ++++++
+ src/core/remote_experts.cpp            |  6 ++++
+ src/program/generate.cpp               | 52 ++++++++++++++++++++++++++++++++++
+ 4 files changed, 72 insertions(+)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6345ce4..638f984 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -835,4 +835,10 @@ endif()
+ set(SEABRAID_STRATA_SOURCE_DIR "" CACHE PATH "seabraid checkout that provides the external expert helper (empty: none)")
+ if(SEABRAID_STRATA_SOURCE_DIR AND TARGET strata)
+   add_subdirectory("${SEABRAID_STRATA_SOURCE_DIR}/strata-ext" "${CMAKE_BINARY_DIR}/seabraid-strata-ext")
++  # D7 re-tiering call site (seabraid_retier target, strata-ext).  Linked and defined here, in the directory that owns `strata`,
++  # so a build without SEABRAID_STRATA_SOURCE_DIR (or with an older checkout) compiles none of the --retier code.
++  if(TARGET seabraid_retier)
++    target_link_libraries(strata PRIVATE seabraid_retier)
++    target_compile_definitions(strata PRIVATE STRATA_HAVE_SEABRAID_RETIER=1)
++  endif()
+ endif()
+diff --git a/include/strata/core/remote_experts.hpp b/include/strata/core/remote_experts.hpp
+index cda800f..f76dc6e 100644
+--- a/include/strata/core/remote_experts.hpp
++++ b/include/strata/core/remote_experts.hpp
+@@ -124,6 +124,14 @@ public:
+     bool seabraid_retier(const seabraid::TierWireOp* ops, int32_t n, uint8_t* res,
+                         std::vector<uint8_t>* claimed, std::string& err);
+ 
++    /// D7 call site (seabraid/retier_loop.hpp) reads these at a window boundary to snapshot the helper's residency for
++    /// the planner.  ENGINE THREAD ONLY: seabraid_retier rewrites bl_held_ on that thread, unsynchronised.
++    /// What the helper holds as this engine last adopted it: n_layers * n_expert, layer-major, nonzero = held.
++    const std::vector<uint8_t>& seabraid_held() const { return bl_held_; }
++    /// Helper slots a kTierLoad can still take: the slots the plan filled (the cache never grows past them) minus what
++    /// is held now, never negative.  Every SWAP keeps the count, so on a full helper this is 0 for good.
++    int64_t seabraid_free_slots() const;
++
+ private:
+     friend class RemoteExpertOpt;
+     // seabraid (device >= seabraid::kDeviceBase): the helper process's channel, what it holds, and a pending request
+diff --git a/src/core/remote_experts.cpp b/src/core/remote_experts.cpp
+index 91bb382..50c3a7c 100644
+--- a/src/core/remote_experts.cpp
++++ b/src/core/remote_experts.cpp
+@@ -728,6 +728,12 @@ bool RemoteExperts::seabraid_retier(const seabraid::TierWireOp* ops, int32_t n,
+     return true;
+ }
+ 
++int64_t RemoteExperts::seabraid_free_slots() const {
++    int64_t held = 0;
++    for (const uint8_t v : bl_held_) held += v != 0;
++    return bl_resident_ > held ? bl_resident_ - held : 0;
++}
++
+ bool RemoteExperts::copy_cached_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst,
+                                       size_t n, uint8_t* hit, std::string& err) {
+     std::fill(hit, hit + n, 0);
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 0d4dab9..2793b54 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -57,6 +57,9 @@
+ #include "strata/core/pin_budget.hpp"
+ #include "strata/core/uma_cache.hpp"
+ #include "strata/core/remote_experts.hpp"
++#if defined(STRATA_HAVE_SEABRAID_RETIER)   // seabraid D7 live re-tiering: only when built with -DSEABRAID_STRATA_SOURCE_DIR
++#include "strata/seabraid/retier_loop.hpp"
++#endif
+ #include "strata/core/on_device.hpp"
+ #include "strata/core/peer_experts.hpp"
+ #include "strata/core/layer.hpp"
+@@ -1060,6 +1063,9 @@ struct Options {
+     bool serve = false;
+     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
+     bool vision = false;
++#if defined(STRATA_HAVE_SEABRAID_RETIER)
++    seabraid::RetierConfig retier;   ///< --retier*: seabraid D7 live re-tiering (default off; strata-ext/include/strata/seabraid/retier_loop.hpp)
++#endif
+     int adapt_swaps = 96;
+     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole
+     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
+@@ -1457,6 +1463,9 @@ void usage() {
+                  "                       the expert arena on one CUDA GPU (no --batch) starts blocking and tries it for a\n"
+                  "                       while when the swaps hold the windows up, keeping it only if it is faster; 0 = the\n"
+                  "                       blocking tier always (also STRATA_ADAPT_ASYNC=0); 1 = always on.\n");
++#if defined(STRATA_HAVE_SEABRAID_RETIER)
++    std::fputs(seabraid::retier_help(), stderr);
++#endif
+ }
+ 
+ // --lookup-chain: the context's last tokens for the draft sources (at most 64), the MTP's pending drafts last
+@@ -3672,6 +3681,9 @@ int main(int argc, char** argv) {
+     bool have_tokens = false;
+     bool have_logits_stride = false;
+     bool ram_keep_by_flag = false;
++#if defined(STRATA_HAVE_SEABRAID_RETIER)
++    std::string retier_err;
++#endif
+     for (int i = 1; i < argc; ++i) {
+         const std::string a = argv[i];
+         auto next = [&](const char* what) -> const char* {
+@@ -4060,6 +4072,11 @@ int main(int argc, char** argv) {
+         else if (a == "--no-publish-kernel") o.no_publish_kernel = true;
+         else if (a == "--no-fused-gdn") o.no_fused_gdn = true;
+         else if (a == "--no-fast-select") o.no_fast_select = true;
++#if defined(STRATA_HAVE_SEABRAID_RETIER)
++        else if (const int rr = seabraid::retier_parse_flag(a, next, o.retier, retier_err); rr != 0) {
++            if (rr == 2) { std::fprintf(stderr, "strata generate: %s\n", retier_err.c_str()); return 2; }
++        }
++#endif
+         else {
+             // An unknown flag is an ERROR and not a warning: a typo'd `--max-neww` that silently generated 16
+             // tokens would look like a working run.
+@@ -4069,6 +4086,13 @@ int main(int argc, char** argv) {
+         }
+         }
+     }
++#if defined(STRATA_HAVE_SEABRAID_RETIER)
++    // Disabled retiering has no runtime driver, so check the completed argv even when no helper will open.
++    if (!seabraid::retier_check_flags(o.retier, o.serve, retier_err)) {
++        std::fprintf(stderr, "strata generate: %s\n", retier_err.c_str());
++        return 2;
++    }
++#endif
+     {   // --ram-keep-gib W (or STRATA_RAM_KEEP_GIB, for a program that cannot pass the flag; the flag wins): the RAM to leave free.  It also
+         // raises the headroom of the explicit RAM modes (--resident-budget-gib, --resident-experts) to at least W, unless
+         // STRATA_RESIDENT_HEADROOM_GIB is set (that value wins).
+@@ -9561,6 +9585,10 @@ int main(int argc, char** argv) {
+ 
+     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+     Drive drive;
++#if defined(STRATA_HAVE_SEABRAID_RETIER)
++    std::unique_ptr<seabraid::RetierLoop> retier_loop;     // seabraid D7: stays null unless --retier is on and checked
++    strata::core::RemoteExperts* retier_re = nullptr;     // the helper tier the loop drives
++#endif
+     // #731 (opt-in, STRATA_DISJOINT_ADAPT=1): the adaptive tiers leave an expert a helper GPU holds out of the primary's
+     // promotion candidates (it would sit in both caches).  Asked live, from the helper's own cache (RemoteExperts::holds,
+     // #854), so an expert the helper's tier swaps in or out later is followed - never a copy taken at load.
+@@ -13884,6 +13912,22 @@ int main(int argc, char** argv) {
+         }
+         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
+             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
++#if defined(STRATA_HAVE_SEABRAID_RETIER)
++        if (o.retier.mode != seabraid::RetierMode::kOff) {   // seabraid D7: fail fast, before the first request, never run with zero heat
++            for (int r = 0; r < 3; ++r)
++                if (o.expert_cache_remote[(size_t) r] > 0 && remote_experts[(size_t) r].seabraid()) retier_re = &remote_experts[(size_t) r];
++            std::string rerr;
++            if (!seabraid::retier_check(o.retier, o.adapt_every, o.adapt_swaps, drive.d.usage.size(), g.n_layers * g.n_expert, retier_re != nullptr, rerr)) {
++                std::fprintf(stderr, "strata serve: %s\n", rerr.c_str());
++                return 2;
++            }
++            retier_loop = std::make_unique<seabraid::RetierLoop>(o.retier, g.n_layers, g.n_expert);   // built on the engine thread: the only one that may tick it
++            std::fprintf(stderr, "strata serve: seabraid re-tiering %s: a round every %d windows, %d moves, margin %.2f, cooldown %d rounds, layer ceiling %.3f\n",
++                         o.retier.mode == seabraid::RetierMode::kZeroOp ? "ZERO-OP (no ops are sent)" : "ON", o.retier.every_windows,
++                         o.retier.policy.max_moves_per_round, o.retier.policy.promote_margin, o.retier.policy.cooldown_rounds,
++                         o.retier.policy.max_helper_layer_share);
++        }
++#endif
+         PcieAuto pcie_auto;
+         if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && (n_stages == 1 || pcie_auto_split_ok())) {
+             const auto& pl = strata::kernels::cpu::expert_layout();
+@@ -20616,6 +20660,14 @@ int main(int argc, char** argv) {
+                         if (file_left > 0) { --file_left; src.replace_resident(x.layer, x.in, x.out); }
+                     }
+                 }
++#if defined(STRATA_HAVE_SEABRAID_RETIER)
++                // seabraid D7: the one window-boundary hook.  Engine thread; this window's adapt thread was joined at the end of the
++                // last one and the next is not started yet, so nothing else touches usage or the helper's residency here.  tick()
++                // applies a finished plan through seabraid_retier (which drains and fences) and snapshots heat for the next round.
++                if (retier_loop)
++                    retier_loop->tick(drive.d.usage.data(), drive.d.usage.size(), retier_re->seabraid_held(), retier_re->seabraid_free_slots(), !ajob,
++                                      [&](const seabraid::TierWireOp* ops, int32_t n, uint8_t* res, std::string& e) { return retier_re->seabraid_retier(ops, n, res, nullptr, e); });
++#endif
+                 if (!adapt_tick(false)) {   // --adapt-async: the round in flight moves on a step when it can
+                     std::printf("ERR an adaptive refill failed\n");
+                     return 1;

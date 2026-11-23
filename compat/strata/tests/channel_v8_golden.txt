@@ -1,0 +1,6 @@
+version 11
+header_bytes 2752
+tier_wire_op_bytes 20
+tier_wire_op_blob_slot_offset 2
+tier_swap_blob 3
+blob_batch 16

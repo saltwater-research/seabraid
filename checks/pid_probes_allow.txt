@@ -1,0 +1,15 @@
+# Copyright 2026 Saltwater Research LLC
+# SPDX-License-Identifier: Apache-2.0
+# Sites checks/check_pid_probes.py allows on purpose.  One row per site:  <fragment of "<file>: <line text>"> | <why>
+# A row that matches no site (or two) fails, so a change that removes a site deletes its row in the same change.
+#
+# ---- bare waits in the engine's remote experts (rule 3)
+ok = seabraid::Channel::wait([&] { return ch.header()->state.load(std::memory_order_acquire) >= seabraid::kHelperUp; }, 60); | RemoteExperts::preflight is static and runs before any channel is open, so there is no watch to wake it; the bound is its 60 s
+
+# ---- numeric-pid probes in the patch stack (rule 1)
+
+# ---- repo C++ tests that signal a child they own (rule 1)
+adapters/strata/helper_hardening_test.cpp: extern "C" int kill(pid_t pid, int number) noexcept { | the F1 interposer: it COUNTS every kill(2) the supervisor makes, so the test can prove there are none
+adapters/strata/helper_process_test.cpp: kill(decoy, SIGKILL); | a test fixture kills the decoy child it forked itself and still holds unreaped (no recycling is possible)
+adapters/strata/helper_process_test.cpp: check(kill(process.pid(), SIGKILL) == 0, | a test fixture kills the probe child it owns, to prove the exit probe reports it
+adapters/strata/private_qwen_test.cpp: check(kill(controller, SIGKILL) == 0, | a test fixture kills the controller it forked and holds unreaped, to test loss of the controller

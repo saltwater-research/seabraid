@@ -1,0 +1,6 @@
+step,mean_ms,p50_ms,p99_ms
+fence,18.7,16.7,52.0
+stage,7.9,6.7,35.1
+replace,6.0,5.5,20.2
+plan,2.2,2.1,7.1
+publish,0.1,0.0,0.5

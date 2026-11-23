@@ -1,0 +1,470 @@
+# Copyright 2026 Saltwater Research LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# Release gates.  Policy (enforced by tests/test_ci_workflow.py): read-only token, no secrets, no
+# privileged pull-request trigger, every action pinned by full commit SHA with its tag in a trailing comment.
+name: ci
+
+on:
+  push:
+  pull_request:
+  # Windows and macOS run by hand because their runners bill 2x and 10x minutes and Linux is the release target.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the pyproject floor. Both 3.11 and 3.14 have wheels for the pinned test dependencies below.
+        python-version: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+          # PyYAML and numpy keep workflow-policy and provider tests from skipping. Require wheels for both pins.
+          python -m pip install --disable-pip-version-check --only-binary=:all: pytest PyYAML==6.0.3 numpy==2.4.6
+      - name: Install lizard
+        # WHY here: the complexity checker (CCN <= 10; documented exceptions up to 15 live in checks/complexity_allow.txt;
+        # checks/check_complexity.py owns the rule) needs lizard, and it runs in the Release checkers step below.
+        run: python -m pip install --disable-pip-version-check lizard==1.26.1
+      # The native tests run on one Python leg. Run cargo test directly for clear Rust failures and exclude it from CTest.
+      - name: cargo fmt
+        if: matrix.python-version == '3.11'
+        run: cargo fmt --check
+      - name: cargo clippy
+        if: matrix.python-version == '3.11'
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: cargo test
+        if: matrix.python-version == '3.11'
+        run: cargo test --locked
+      - name: CMake native tests (with the load simulator)
+        # WHY BUILD_TOOLS here: tools/sim is built and tested by nothing else; it is POSIX-only, so Linux is where it runs.
+        # WHY Release: optimiser-only -Werror diagnostics (alloc-size-larger-than) broke a Release build that an untyped one
+        # passed (2026-11-19); the sanitizer job keeps the unoptimised configuration covered.
+        if: matrix.python-version == '3.11'
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSEABRAID_BUILD_NATIVE_TESTS=ON -DSEABRAID_BUILD_TOOLS=ON
+          cmake --build build --parallel
+          ctest --test-dir build --output-on-failure -E '^seabraid_rust_core$'
+      - name: Release checkers
+        # checks/run_all.py owns the checker list and arguments for CI and local runs.
+        run: python checks/run_all.py
+      # WHY two steps: tests/test_build_config.py builds, installs and checks the whole SDK (three cargo builds). Every leg
+      # here has cmake and cargo, so without a switch each Python version would build it again. The 3.11 leg runs the SDK
+      # tests with SEABRAID_REQUIRE_SDK_TESTS=1, which turns a skip into a failure (a skip reads as a pass); the other
+      # legs set SEABRAID_SKIP_SDK_TESTS=1 and skip them with that reason. tests/test_ci_workflow.py pins both.
+      - name: Release library
+        # WHY before the root tests: tests/test_no_egress.py inspects the built libseabraid.so for socket imports (the link-level
+        # half of the no-egress gate) and the Python package tests load it; the old order built it after the pytest step, so the
+        # link gate skipped in CI (R8 M2).
+        run: cargo build --release --locked
+      - name: Root tests (including the SDK build and install checks)
+        if: matrix.python-version == '3.11'
+        env:
+          SEABRAID_REQUIRE_SDK_TESTS: "1"
+          # WHY both: SEABRAID_LIBRARY is the one name for "the built library" everywhere; the REQUIRE switch turns the link
+          # gate's skip into a failure (a skip reads as a pass), exactly like SEABRAID_REQUIRE_SDK_TESTS above.
+          SEABRAID_LIBRARY: ${{ github.workspace }}/target/release/libseabraid.so
+          SEABRAID_REQUIRE_EGRESS_LINK_TEST: "1"
+        run: python -m pytest tests -q
+      - name: Root tests (the SDK tests run on the 3.11 leg)
+        if: matrix.python-version != '3.11'
+        env:
+          SEABRAID_SKIP_SDK_TESTS: "1"
+          SEABRAID_LIBRARY: ${{ github.workspace }}/target/release/libseabraid.so
+          SEABRAID_REQUIRE_EGRESS_LINK_TEST: "1"
+        run: python -m pytest tests -q
+      - name: Add-on tests
+        working-directory: compat/strata
+        run: python -m pytest tests -q
+      - name: Python package tests
+        run: SEABRAID_LIBRARY="$PWD/target/release/libseabraid.so" python -B -m unittest discover -s bindings/python
+
+  journey:
+    # The first-time-user journey as a regression check: the README Quickstart and CONTRIBUTING "Build and test" commands
+    # (scripts/journey/steps.toml, which tests/test_journey_steps.py keeps equal to the docs) replayed in a fresh `git archive`
+    # tree with a clean environment.  A step that fails here is a doc or a build that no longer works for a newcomer.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # WHY these three: 3.11 is the pyproject floor, 3.12 is the first CPython whose venv has no setuptools, 3.14 is the
+        # interpreter the journey was first recorded on.  The journey runs online here (no --offline), so pip steps run too.
+        python-version: ["3.11", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Fresh tree
+        # WHY git archive: it is exactly the tracked files, with no .git, no build output and no leftovers, like a source download.
+        run: |
+          mkdir -p "$RUNNER_TEMP/journey/src"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/journey/src"
+      - name: Replay the journey
+        # The runner is the archived copy's own; the record goes outside the tree so the checkers never scan it.
+        run: python "$RUNNER_TEMP/journey/src/scripts/journey/run.py" --tree "$RUNNER_TEMP/journey/src" --out "$RUNNER_TEMP/journey/out"
+      - name: Journey report
+        if: always()
+        run: cat "$RUNNER_TEMP/journey/out/REPORT.md" >> "$GITHUB_STEP_SUMMARY"
+
+  windows:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal
+        shell: bash
+      - name: cargo test
+        run: cargo test --locked
+        shell: bash
+      - name: CMake native tests
+        shell: bash
+        run: |
+          cmake -S . -B build -DSEABRAID_BUILD_NATIVE_TESTS=ON
+          cmake --build build --config Release --parallel
+          # the Rust step above is the one Rust run, so CTest skips seabraid_rust_core
+          ctest --test-dir build -C Release --output-on-failure -E '^seabraid_rust_core$'
+
+  macos:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: cargo test
+        run: cargo test --locked
+      - name: CMake native tests
+        run: |
+          cmake -S . -B build -DSEABRAID_BUILD_NATIVE_TESTS=ON
+          cmake --build build --parallel
+          # the Rust step above is the one Rust run, so CTest skips seabraid_rust_core
+          ctest --test-dir build --output-on-failure -E '^seabraid_rust_core$'
+
+  wheels:
+    # Platform wheels: build scripts/build_wheel.py's wheel, install it into a fresh venv with no index and no source
+    # tree on the path, and run a native weave through seabraid.bundled_library(). Nothing is published.
+    runs-on: ubuntu-24.04
+    # WHY a container on Linux: the wheel's manylinux tag is computed from the GLIBC symbols the library needs, so
+    # building on the oldest glibc we can (AlmaLinux 8, glibc 2.28) is what makes the tag portable. The tag stays
+    # honest whatever the image drifts to, because the script reads it from the built library, not from the image name.
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain (manylinux container)
+        # WHY the distribution's Rust: the image ships no Rust and the workflow policy forbids piping a download into a
+        # shell; rust-toolset from the AlmaLinux 8 repositories is newer than Cargo.toml's rust-version.
+        run: dnf install -y rust-toolset binutils
+        shell: bash
+      - name: Build the wheel
+        run: |
+          /opt/python/cp312-cp312/bin/python -m pip install --disable-pip-version-check "setuptools>=77"
+          /opt/python/cp312-cp312/bin/python scripts/build_wheel.py --out dist
+        shell: bash
+      - name: Install into a fresh venv and run the native smoke
+        run: |
+          /opt/python/cp312-cp312/bin/python -m venv wheel-venv
+          wheel-venv/bin/python -m pip install --disable-pip-version-check --no-index --find-links dist seabraid
+          wheel-venv/bin/python -I scripts/wheel_smoke.py
+        shell: bash
+
+  wheels-other:
+    # The same wheel check on Windows and macOS, run only when the workflow is started by hand (see `on:`).
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            venv-python: Scripts/python.exe
+          - os: macos-15
+            venv-python: bin/python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal
+        shell: bash
+      - name: Build the wheel
+        run: |
+          python -m pip install --disable-pip-version-check "setuptools>=77"
+          python scripts/build_wheel.py --out dist
+        shell: bash
+      - name: Install into a fresh venv and run the native smoke
+        run: |
+          python -m venv wheel-venv
+          wheel-venv/${{ matrix.venv-python }} -m pip install --disable-pip-version-check --no-index --find-links dist seabraid
+          wheel-venv/${{ matrix.venv-python }} -I scripts/wheel_smoke.py
+        shell: bash
+
+  sanitizers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # WHY both flags in both variables: the C and C++ fixtures link as well as compile, and the link line must carry them too.
+      CFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
+      CXXFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
+      ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Build the native tests under ASan and UBSan
+        run: |
+          cmake -S . -B build-san -DSEABRAID_BUILD_NATIVE_TESTS=ON
+          cmake --build build-san --parallel
+      - name: ctest with leak detection on
+        # seabraid_rust_core is the Rust suite (run once, in the linux job) and the Rust library is not instrumented anyway.
+        # seabraid_cargo_build_target makes its own uninstrumented scratch build, so it proves nothing under sanitizers.
+        run: ctest --test-dir build-san --output-on-failure -E '^(seabraid_rust_core|seabraid_cargo_build_target|seabraid_provider_smoke)$'
+      - name: ctest seabraid_provider_smoke with leak detection off
+        # WHY off, for this one test only: exercise_bounded_close in native-tests/provider_smoke.cpp calls close_timeout on a
+        # stuck provider, which by contract LEAKS the worker thread and its session; LSan would report that deliberate leak.
+        # Every other test, and this test's ASan and UBSan checks, stay on.
+        env:
+          ASAN_OPTIONS: detect_leaks=0:strict_string_checks=1
+        run: ctest --test-dir build-san --output-on-failure -R '^seabraid_provider_smoke$'
+
+  cmake-floor:
+    # WHY: the README promises CMake 3.22 or newer (cmake_minimum_required 3.22), and two checks once held only on 4.x
+    # (2026-11-19). This job builds, tests and installs with exactly 3.22.6 and runs the SDK and layout checks with it;
+    # SEABRAID_CMAKE steers the scripts and the tests (recipe in native-tests/installed/check_sdk.sh).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: CMake 3.22.6 and the test runner
+        run: |
+          python -m venv "$RUNNER_TEMP/cm322"
+          "$RUNNER_TEMP/cm322/bin/python" -m pip install --disable-pip-version-check --only-binary=:all: cmake==3.22.6
+          python -m pip install --disable-pip-version-check --only-binary=:all: pytest
+      - name: Build, test and install with CMake 3.22
+        run: |
+          export SEABRAID_CMAKE="$RUNNER_TEMP/cm322/bin/cmake" SEABRAID_REQUIRE_SDK_TESTS=1
+          "$SEABRAID_CMAKE" --version | head -1 | grep -F 3.22.6
+          "$SEABRAID_CMAKE" -S . -B build322 -DCMAKE_BUILD_TYPE=Release -DSEABRAID_BUILD_NATIVE_TESTS=ON -DSEABRAID_BUILD_TOOLS=ON -DBUILD_TESTING=ON
+          "$SEABRAID_CMAKE" --build build322 --parallel
+          "$RUNNER_TEMP/cm322/bin/ctest" --test-dir build322 --output-on-failure
+          "$SEABRAID_CMAKE" --install build322 --prefix "$RUNNER_TEMP/sdk322"
+          sh native-tests/installed/check_sdk.sh "$RUNNER_TEMP/sdk322" build322
+          sh native-tests/installed/check_layouts.sh
+          python -m pytest -q tests/test_native_checks.py tests/test_build_config.py
+
+  sdk:
+    # Installs the SDK the way a downstream user gets it and builds native-tests/installed against it with find_package,
+    # so the install rules, SeabraidConfig.cmake and the installed header and library are proven, not assumed.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Build and install the SDK
+        run: |
+          cmake -S . -B build-sdk -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-sdk --parallel
+          cmake --install build-sdk --prefix "$RUNNER_TEMP/seabraid-sdk"
+      - name: Check the installed SDK and build the downstream consumer from a moved prefix
+        # WHY a script (runnable locally the same way): it checks the library mode, that the exported symbols are exactly
+        # the installed header's functions, that install_manifest.txt lists every installed file, then MOVES the prefix and
+        # builds native-tests/installed against it with find_package(Seabraid <major.minor>) (CMAKE_PREFIX_PATH), checking
+        # the same-minor rule, Seabraid_ABI_EPOCH and a consumer run. The prefix is moved back afterwards.
+        run: sh native-tests/installed/check_sdk.sh "$RUNNER_TEMP/seabraid-sdk" build-sdk
+      - name: Build and run the minimal consumer example
+        # WHY: examples/consumer is the copy-and-edit starting point the README points at; building it here proves the
+        # documented find_package(Seabraid) recipe and examples/minimal_provider.c work against an installed SDK.
+        run: |
+          cmake -S examples/consumer -B build-consumer -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/seabraid-sdk"
+          cmake --build build-consumer --parallel
+          ./build-consumer/minimal_provider | tee consumer.out
+          grep -F 'output = [2.5, 5]' consumer.out
+      - name: Fetch the pinned ggml source
+        # The commit is the llama.cpp release the adapter's patch targets (adapters/ggml/MAP.md); ggml/ is the engine's
+        # ggml tree, which the check builds CPU-only. Only that directory is checked out.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ggml-org/llama.cpp
+          ref: b1b770d90d94cad9e9ea5b993bdbc383a522fb28
+          path: llama.cpp
+          sparse-checkout: ggml
+          persist-credentials: false
+      - name: Link the ggml adapter against the installed SDK
+        run: sh adapters/ggml/sdk_check/run.sh "$GITHUB_WORKSPACE/llama.cpp/ggml" "$RUNNER_TEMP/ggml-sdk-check"
+      - name: Build and run the ggml fixtures
+        # WHY: the adapter's fixtures (route faults, cache lifecycle, packed Q4_0 parity, scheduler continuation) build only with
+        # SEABRAID_GGML_TESTS=ON and the step above links one program with tests off, so nothing ran them (R8 M3).
+        # scripts/ggml_fixtures wraps the same ggml checkout as a subdirectory and runs CTest; it fails if no fixture is found.
+        run: sh scripts/ggml_fixtures/run.sh "$GITHUB_WORKSPACE/llama.cpp/ggml" "$RUNNER_TEMP/ggml-fixtures"
+
+  strata-adapter:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Fetch the pinned Strata sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Niko1221/Strata
+          ref: c77572806996349b49995e4f98d41b5294d36a21 # patches/strata/STRATA_BASE (test_ci_coverage.py keeps them equal)
+          path: strata
+          sparse-checkout: |
+            include
+            src
+            tests
+            cmake
+            bench/micro
+            third_party
+          persist-credentials: false
+      - name: Apply the compatibility series, then the v7 patch
+        working-directory: strata
+        run: git -c user.name=ci -c user.email=ci@invalid am ../compat/strata/patches/strata/*.patch ../adapters/strata/strata-v7-seabraid.patch
+      - name: Build the adapter and its fixtures, then run the fixtures
+        run: |
+          cmake -S . -B build-strata -DCMAKE_BUILD_TYPE=Release -DSEABRAID_BUILD_STRATA_ADAPTER=ON -DBUILD_TESTING=ON -DSTRATA_SOURCE="$GITHUB_WORKSPACE/strata"
+          cmake --build build-strata --parallel
+          ctest --test-dir build-strata -R '^strata_' --no-tests=error --output-on-failure
+      - name: Run the patched engine's CPU helper-loss tests
+        # The host-only test links Strata's CUDA engine. Use the same toolkit release as Strata's own CI.
+        run: >-
+          docker run --rm --volume "$GITHUB_WORKSPACE:/source:ro"
+          nvidia/cuda:12.9.1-devel-ubuntu24.04 sh -c 'apt-get update &&
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build &&
+          sh /source/compat/strata/tests/run_engine_helper_loss.sh /source/strata /tmp/strata-tests'
+      - name: Compat host tests with pinned xxHash, then helper syntax checks
+        run: |
+          cmake -S compat/strata/tests -B build-compat -DCMAKE_BUILD_TYPE=Release -DSTRATA_SOURCE="$GITHUB_WORKSPACE/strata"
+          cmake --build build-compat --parallel
+          ctest --test-dir build-compat --no-tests=error --output-on-failure
+          for f in helper helper_serve card_bench card_bench_run; do g++ -std=c++20 -fsyntax-only -Wall -Wextra -Icompat/strata/strata-ext/include -Icompat/strata/strata-ext/src -Iadapters/strata/wire -I"$GITHUB_WORKSPACE/strata/include" "compat/strata/strata-ext/src/$f.cpp"; done
+
+  miri:
+    # Miri checks the Rust FFI layer for undefined behaviour (aliasing, bad pointers, uninitialised reads), which ASan and
+    # UBSan cannot do because they do not instrument the Rust library.  It is a required job, not allow-failure.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # WHY ignore-leaks: close_timeout on a stuck provider deliberately leaks its worker and session (see the sanitizers
+      # job); Miri would report that as a leak.  Everything else (aliasing, validity, data races) stays checked.
+      MIRIFLAGS: -Zmiri-ignore-leaks
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal --component miri --component rust-src
+          cargo +nightly miri setup
+      - name: Miri on the FFI tests (Stacked Borrows)
+        # WHY two aliasing models, both required: they reject different programs (R6a H2's `&mut` over the handle's gate
+        # was a Stacked Borrows violation; the use-after-free and the retag race beside it were found under Tree
+        # Borrows only), and the language has not chosen between them, so a pointer pattern must pass both.
+        # WHY these filters: `ffi::` matches every test under src/ffi (the exported C functions, the caller-sized struct readers,
+        # the placement handle tests; some run a provider thread, which Miri supports) and diag::tests calls C-callable log
+        # sinks.  The filter is a plain substring of the full test name, so the module path is what matters: the placement
+        # tests moved to ffi::placement::tests and a narrower `ffi::tests` filter silently dropped them.  The rest of the suite
+        # adds no unsafe code, and the header_parity tests read repository files at run time, which Miri's isolation forbids
+        # (nothing under src/ffi or src/diag reads files; include_str! reads at compile time and is fine).
+        # CHECKER: tests/test_ci_workflow.py derives the unsafe-touching test modules from the source tree and fails if one
+        # is matched by no filter here.
+        # (a block scalar: `ffi:: ` has a colon-space, which a plain YAML scalar would parse as a mapping key)
+        run: |
+          cargo +nightly miri test --locked --lib -- ffi:: diag::tests
+      - name: Miri on the FFI tests (Tree Borrows)
+        # The same tests and filters as the step above (tests/test_ci_workflow.py holds the two equal); only the model differs.
+        env:
+          MIRIFLAGS: -Zmiri-ignore-leaks -Zmiri-tree-borrows
+        run: |
+          cargo +nightly miri test --locked --lib -- ffi:: diag::tests
+
+  msrv:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        # WHY: Cargo.toml declares rust-version; only a build on exactly that toolchain proves the claim.
+        run: rustup toolchain install 1.79 --profile minimal
+      - name: cargo check on the MSRV
+        run: cargo +1.79 check --all-targets --locked
+
+  deny:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
+        with:
+          command: check advisories bans licenses sources

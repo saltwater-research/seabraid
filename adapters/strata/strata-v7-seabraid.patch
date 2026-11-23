@@ -1,0 +1,1948 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Seabraid <seabraid@example.invalid>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH 1/3] Strata: opt in to the private Seabraid Qwen decode tier
+
+Target: the Strata commit pinned in compat/strata/patches/strata/STRATA_BASE (its one owner) with the Seabraid compatibility patches 0001-0006 and 0010-0016 applied (0007 was only the wire header, now adapters/strata/wire; 0008 and 0009 dropped: the DeepSeek engine they extend was removed upstream in 0.2.14).
+Retain serial request-local failure handling and bind the helper to the engine checkpoint.
+---
+ CMakeLists.txt                              |  25 +++
+ cmake/strata_gpu_engine.cmake               |   2 +-
+ include/strata/core/expert_source.hpp       |   2 +
+ include/strata/core/ownership_rungs.hpp     |   7 +-
+ include/strata/core/remote_expert_opt.hpp   |   3 +-
+ include/strata/core/remote_experts.hpp      |  39 +++-
+ include/strata/core/seabraid_checkpoint.hpp |  31 +++
+ src/core/expert_source.cpp                  |   7 +
+ src/core/ownership_rungs.cpp                |  10 +-
+ src/core/remote_expert_opt.cu               |  12 +-
+ src/core/remote_experts.cpp                 |   3 +
+ src/core/remote_seabraid.cpp                | 155 ++++++++++++++
+ src/program/generate.cpp                    | 219 ++++++++++++++++++--
+ tests/core/seabraid_checkpoint_test.cpp     |  85 ++++++++
+ 14 files changed, 564 insertions(+), 36 deletions(-)
+ create mode 100644 include/strata/core/seabraid_checkpoint.hpp
+ create mode 100644 src/core/remote_seabraid.cpp
+ create mode 100644 tests/core/seabraid_checkpoint_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9580888f3..e5309651b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -420,6 +420,12 @@ if(STRATA_BUILD_TESTS)
+   target_include_directories(seabraid_hot_share_test PRIVATE include)
+   add_test(NAME seabraid_hot_share_test COMMAND seabraid_hot_share_test)
+ 
++  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
++    add_executable(seabraid_checkpoint_test tests/core/seabraid_checkpoint_test.cpp)
++    target_include_directories(seabraid_checkpoint_test PRIVATE include)
++    add_test(NAME seabraid_checkpoint_test COMMAND seabraid_checkpoint_test)
++  endif()
++
+   # N-card ladder M3: the expert ownership map and its prepare/commit/abort transition on fake cards (host only, no GPU)
+   add_executable(ownership_map_test tests/core/ownership_map_test.cpp src/core/ownership_map.cpp)
+   target_include_directories(ownership_map_test PRIVATE include)
+@@ -849,6 +855,25 @@ endif()
+ # External expert helpers (seabraid): an out-of-process helper serves the remote expert tier over a
+ # shared-memory channel (include/strata/seabraid/channel.hpp), so a GPU of another vendor can hold experts.  The helper's own
+ # sources live in the seabraid checkout; empty = not built.
++set(STRATA_SEABRAID_SOURCE_DIR "" CACHE PATH "Seabraid checkout for the optional private Qwen decode tier")
++if(STRATA_SEABRAID_SOURCE_DIR)
++  if(NOT TARGET strata_engine OR NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
++    message(FATAL_ERROR "STRATA_SEABRAID_SOURCE_DIR requires the Linux Strata GPU engine")
++  endif()
++  set(SEABRAID_EMBED_STRATA_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}")
++  set(SEABRAID_EMBED_STRATA_GEOMETRY "${_strata_geo_out}")
++  set(SEABRAID_EMBED_STRATA_TESTING "${STRATA_BUILD_TESTS}")
++  set(SEABRAID_EMBED_STRATA_WINDOW "${_strata_window_max_t}")
++  set(SEABRAID_BUILD_STRATA_ADAPTER ON)
++  add_subdirectory("${STRATA_SEABRAID_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/seabraid")
++  # generate.cpp (target strata) includes the placement driver and the private rung: it links them for their include paths too.
++  target_link_libraries(strata_engine PRIVATE seabraid_strata_runtime)
++  if(TARGET strata)
++    target_link_libraries(strata PRIVATE seabraid_strata_runtime seabraid_strata_placement_driver)
++  endif()
++  target_compile_definitions(strata_engine PUBLIC STRATA_HAVE_SEABRAID=1)
++endif()
++
+ set(SEABRAID_STRATA_SOURCE_DIR "" CACHE PATH "seabraid checkout that provides the external expert helper (empty: none)")
+ if(SEABRAID_STRATA_SOURCE_DIR AND TARGET strata)
+   add_subdirectory("${SEABRAID_STRATA_SOURCE_DIR}/strata-ext" "${CMAKE_BINARY_DIR}/seabraid-strata-ext")
+diff --git a/cmake/strata_gpu_engine.cmake b/cmake/strata_gpu_engine.cmake
+index fe44a3c8a..0f0b60050 100644
+--- a/cmake/strata_gpu_engine.cmake
++++ b/cmake/strata_gpu_engine.cmake
+@@ -284,7 +284,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   # already links `strata_core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
+   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
+   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
+-  add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
++  add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp src/core/remote_seabraid.cpp
+     src/core/ownership_map.cpp src/core/ownership_rungs.cpp
+     src/core/remote_expert_opt.cu src/core/remote_prefill.cpp
+     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
+diff --git a/include/strata/core/expert_source.hpp b/include/strata/core/expert_source.hpp
+index ee0d584bf..2196daea2 100644
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -688,6 +688,8 @@ struct ExpertDispatch {
+     /// whole mechanism exists to prevent.  `failed` is what the short-circuit reads.
+     bool failed = false;
+     const char* fail = nullptr;
++    // Only serial verifier windows can be drained and discarded without publishing their state.
++    std::string* seabraid_error = nullptr;
+     int64_t fail_layer = -1;
+     int64_t fail_expert = -1;
+ };
+diff --git a/include/strata/core/ownership_rungs.hpp b/include/strata/core/ownership_rungs.hpp
+index 5c6f4687f..48197b773 100644
+--- a/include/strata/core/ownership_rungs.hpp
++++ b/include/strata/core/ownership_rungs.hpp
+@@ -24,6 +24,7 @@
+ 
+ namespace strata::core {
+ class ExpertCache;
++class ExpertSource;
+ class RemoteExperts;
+ 
+ // Card 1: the engine's own cache.  `host_res` is the table the engine routes from (slot index or kNotResident per cell,
+@@ -43,18 +44,20 @@ private:
+     std::function<bool(std::string&)> publish_;
+ };
+ 
+-// A card behind a seabraid channel.  stage() borrows the blob through the prompt path's cache read (copy_cached_blobs);
++// A card behind a seabraid channel.  stage() reads the blob from the engine's ExpertSource (copy_blob), after the card's
++// own residency says it holds the expert;
+ // replace() is ONE same-layer kTierSwap through seabraid_retier (drain, fence, ack, held[] adopted and checked).  The
+ // staged bytes are not sent: the channel has no blob-load op yet (channel v7's kTierLoadFromBlob, design M4), so the
+ // card reads the new expert from its own copy of the same pack.
+ class RemoteRung : public RungIO {
+ public:
+-    explicit RemoteRung(RemoteExperts& re) : re_(re) {}
++    RemoteRung(RemoteExperts& re, ExpertSource& src) : re_(re), src_(src) {}
+     IoStatus stage(int32_t layer, int32_t expert, std::vector<uint8_t>& out, std::string& err) override;
+     IoStatus replace(int32_t layer, int32_t old_e, int32_t new_e, const std::vector<uint8_t>& bytes, std::string& err) override;
+ 
+ private:
+     RemoteExperts& re_;
++    ExpertSource& src_;
+ };
+ 
+ // The ownership snapshot of a two-card engine as routing really resolves it today: card 1 (rung 0) if the engine's own
+diff --git a/include/strata/core/remote_expert_opt.hpp b/include/strata/core/remote_expert_opt.hpp
+index af95f4b22..1d39f68a5 100644
+--- a/include/strata/core/remote_expert_opt.hpp
++++ b/include/strata/core/remote_expert_opt.hpp
+@@ -27,7 +27,8 @@ public:
+     RemoteExpertOpt(const RemoteExpertOpt&) = delete;
+     RemoteExpertOpt& operator=(const RemoteExpertOpt&) = delete;
+ 
+-    void attach(RemoteExperts& remote); // before RemoteExperts::open
++    void attach(RemoteExperts& remote);
++    static int routing_width() noexcept; // before RemoteExperts::open
+     bool init(std::string& err);        // after all helper caches are open
+     /// CPU tests only: take caller-owned host memory (kWindowMaxT * (H + 10) floats) for the sums instead of init()'s
+     /// pinned allocation, so no CUDA context is created.  combine()/copy_rows() read the device mapping and are not usable.
+diff --git a/include/strata/core/remote_experts.hpp b/include/strata/core/remote_experts.hpp
+index 0303f1921..29322dd44 100644
+--- a/include/strata/core/remote_experts.hpp
++++ b/include/strata/core/remote_experts.hpp
+@@ -19,6 +19,7 @@
+ #include <vector>
+ 
+ namespace seabraid { class PeerWatch; }   // wire/strata/seabraid/peer_watch.hpp; complete only in remote_experts.cpp
++namespace seabraid::strata_adapter { class QwenDecodeTier; class ExecutorView; }
+ 
+ namespace strata::core {
+ class RemoteExpertOpt;
+@@ -39,23 +40,35 @@ public:
+               const std::vector<std::pair<int32_t, int32_t>>& ranked,
+               const ExpertCache& primary, ExpertSource& source,
+               std::vector<uint8_t>& claimed, std::string& err, bool auto_size = false);
++    bool open_seabraid(const char* helper, const std::string& pack, const std::string& native,
++                   int slots, int64_t layers, int64_t experts,
++                   const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
++                   std::vector<uint8_t>& claimed, std::string& err);
+     void close();
++    void disable_seabraid() noexcept;
++    bool seabraid_tier() const { return seabraid_ != nullptr; }
++    bool process_tier() const { return seabraid() || seabraid_tier(); }
+ 
+     /// `kind` is the primary verifier's classification (-1 = CPU candidate),
+     /// or null on the one-token path. Entries already served on CUDA0 are excluded.
+     bool begin(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok,
+                int64_t k, const int32_t* kind, const int32_t* primary_res,
+                std::string& err);
+-    bool owns(int64_t index) const { return owned_[(size_t) index] != 0; }
++    bool owns(int64_t index) const { return seabraid_ ? seabraid_owns((size_t) index) : owned_[(size_t) index] != 0; }
+     /// This helper's cache holds (layer, expert): begin() will take its rows unless the plan gave them away.
+     bool holds(int64_t layer, int32_t expert) const {
+-        // A CLOSED card (fail closed: a tier round timed out or tore a slot) holds nothing as far as routing goes.
+-        if (bl_) return bl_closed_.load(std::memory_order_relaxed) == 0 && layer >= 0 && expert >= 0 && expert < n_expert_ &&
+-                        (size_t) layer * (size_t) n_expert_ + (size_t) expert < bl_held_.size() &&
+-                        bl_held_[(size_t) layer * (size_t) n_expert_ + (size_t) expert] != 0;
++        if (seabraid_) return seabraid_holds(layer, expert);
++        // WHY the view gate (R1, one predicate: view AND physical AND alive): the published executor table is the only
++        // routing fact.  NOT host-tested (generate.cpp's main is unlinkable in a test): the live invariants and the A/A arm cover it.
++        if (bl_) return (!exec_view_ || view_routes(layer, expert)) && physically_holds(layer, expert);
+         // Helper side: a quarantined slot (its tier copy started and did not finish) is published as holding nothing.
+         return cache_.slot_of(layer, expert) >= 0 && !tier_suspect(layer, expert);
+     }
++    /// The card's own residency, no executor view: what PlacementHost::helper_cells checks the published table against
++    /// (checking it against holds(), which reads that table, would be tautological).  A CLOSED card holds nothing.
++    bool physically_holds(int64_t layer, int32_t expert) const;
++    void attach_view(const seabraid::strata_adapter::ExecutorView* view, uint8_t rung) noexcept;   // before the first window
++    seabraid::strata_adapter::QwenDecodeTier* seabraid_ptr() const noexcept { return seabraid_.get(); }
+     /// HELPER SIDE: (layer, expert)'s slot was written by a tier round whose copy did not complete, so it may hold
+     /// neither expert whole.  ExpertCache has no eviction, so the slot stays mapped and is QUARANTINED instead:
+     /// holds() and the cache reads say no, held[] publishes 0, and no tier op may write it again.
+@@ -83,7 +96,7 @@ public:
+     bool seabraid() const { return bl_ != nullptr; }
+     bool optimized_decode() const { return remote_opt_ != nullptr; }
+     bool finish(float* out, std::string& err);
+-    int64_t resident() const { return bl_ ? bl_resident_ : cache_.resident(); }
++    int64_t resident() const { return process_tier() ? bl_resident_ : cache_.resident(); }
+     int64_t computed() const { return computed_; }
+     int64_t launched_layers() const { return launched_layers_; }
+     double gib() const { return bl_ ? bl_gib_ : cache_.gib(); }
+@@ -178,7 +191,7 @@ public:
+     /// Checks the expert process offers a prefill region this engine can use (fp16 rows, `k` picks per token) and sets the
+     /// cost model's rates.  False with an error naming both sides' values; the caller then reads prompts as before.
+     bool prefill_open(int64_t k, std::string& err);
+-    bool prefill_usable() const { return bl_ != nullptr && pf_open_ && !pf_dead_ && seabraid_closed() == 0; }
++    bool prefill_usable() const { return bl_ != nullptr && pf_open_ && !pf_dead_ && seabraid_closed() == 0 && (!exec_view_ || view_open()); }
+     /// The per-chunk choice (byte/time model, remote_prefill.hpp), logged once per prompt.  Never compute when unusable.
+     /// `row_bytes`: the row element size the chunk's layers will send (4 on a fused-path engine, else 2).
+     PrefillChoice prefill_choose(int64_t tokens, bool stream_all, int64_t layers, int64_t hidden, int64_t k, int row_bytes = 2);
+@@ -207,6 +220,18 @@ public:
+ private:
+     friend class RemoteExpertOpt;
+     // seabraid (device >= seabraid::kDeviceBase): the helper process's channel, what it holds, and a pending request
++    struct SeabraidDelete { void operator()(seabraid::strata_adapter::QwenDecodeTier* ptr) const noexcept; };
++    std::unique_ptr<seabraid::strata_adapter::QwenDecodeTier, SeabraidDelete> seabraid_;
++    bool seabraid_holds(int64_t layer, int32_t expert) const;
++    bool seabraid_begin(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k,
++                    const int32_t* kind, const int32_t* primary_res, std::string& err);
++    bool seabraid_finish(std::string& err);
++    bool seabraid_owns(size_t index) const;
++    bool view_routes(int64_t layer, int32_t expert) const;   // the published executor table names this card for the cell
++    bool view_open() const;                                  // ... and its rung is not quarantined
++    const seabraid::strata_adapter::ExecutorView* exec_view_ = nullptr;   // set once by attach_view; null: legacy routing
++    uint8_t exec_rung_ = 0;
++
+     bool seabraid_open(int slots, int64_t layers, int64_t experts,
+                       const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
+                       std::vector<uint8_t>& claimed, std::string& err, bool auto_size);
+diff --git a/include/strata/core/seabraid_checkpoint.hpp b/include/strata/core/seabraid_checkpoint.hpp
+new file mode 100644
+index 000000000..76e9c6418
+--- /dev/null
++++ b/include/strata/core/seabraid_checkpoint.hpp
+@@ -0,0 +1,31 @@
++#pragma once
++
++#include <filesystem>
++#include <string>
++#include <system_error>
++
++namespace strata::core {
++
++// Old environment settings may confirm the engine's checkpoint, but a second
++// checkpoint with the same geometry could silently supply different weights.
++inline bool seabraid_checkpoint_matches(const std::string& selected, const char* supplied,
++                                   const char* variable, std::string& error) {
++    if (!supplied) return true;
++    if (selected.empty() && *supplied == '\0') return true;
++
++    std::error_code fs_error;
++    if (std::filesystem::equivalent(selected, supplied, fs_error) && !fs_error) return true;
++
++    error = std::string("Seabraid Qwen ") + variable + " must identify the engine's checkpoint path";
++    if (!selected.empty()) error += " (" + selected + ")";
++    return false;
++}
++
++inline bool validate_seabraid_checkpoint(const std::string& pack, const std::string& native,
++                                     const char* pack_override, const char* native_override,
++                                     std::string& error) {
++    return seabraid_checkpoint_matches(pack, pack_override, "SEABRAID_QWEN_PACK", error) &&
++           seabraid_checkpoint_matches(native, native_override, "SEABRAID_QWEN_NATIVE", error);
++}
++
++}  // namespace strata::core
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index 4be1d93af..9d06d2d4c 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -5524,6 +5524,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+         static thread_local std::string remote_error;
+         for (int r = 0; r < d.remote_count; ++r)
+             if (!d.remote[r]->finish(out, remote_error)) {
++#if defined(STRATA_HAVE_SEABRAID)
++                if (d.seabraid_error && d.remote[r]->seabraid_tier()) {
++                    // Keep draining this window; the serial driver will discard it.
++                    *d.seabraid_error = remote_error;
++                    continue;
++                }
++#endif
+                 d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+             }
+         for (int r = 0; r < d.remote_count; ++r)   // a helper lost mid-request: its picks are computed here, the engine goes on
+diff --git a/src/core/ownership_rungs.cpp b/src/core/ownership_rungs.cpp
+index d48438b14..0bbc606c4 100644
+--- a/src/core/ownership_rungs.cpp
++++ b/src/core/ownership_rungs.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "strata/core/expert_cache.hpp"
+ #include "strata/core/expert_nibble.hpp"
++#include "strata/core/expert_source.hpp"
+ #include "strata/core/remote_experts.hpp"
+ #include "strata/kernels/cpu/expert_layout.hpp"
+ 
+@@ -77,11 +78,10 @@ IoStatus PrimaryRung::replace(int32_t layer, int32_t old_e, int32_t new_e, const
+ IoStatus RemoteRung::stage(int32_t layer, int32_t expert, std::vector<uint8_t>& out, std::string& err) {
+     if (re_.seabraid_closed() != 0) { err = "the card is closed"; return IoStatus::kRefused; }
+     out.resize((size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer));
+-    uint8_t* dst = out.data();
+-    uint8_t hit = 0;
+-    const bool ok = re_.copy_cached_blobs(&layer, &expert, &dst, 1, &hit, err);
+-    if (!ok || !hit) {   // a read touches no slot: refused either way (a hung card fails its next layer request loudly)
+-        if (err.empty()) err = "the card does not hold layer " + std::to_string(layer) + " expert " + std::to_string(expert);
++    // WHY copy_blob and not the channel's cache read: both publishers stage through the engine's own source, so no channel op
++    // (and no helper-side cache read) sits in a placement round; the residency test keeps "the card holds it" a precondition.
++    if (!re_.physically_holds(layer, (int32_t) expert) || !src_.copy_blob(layer, expert, out.data())) {   // a read touches no slot: refused either way
++        err = "the card does not hold layer " + std::to_string(layer) + " expert " + std::to_string(expert) + ", or the engine could not read it";
+         out.clear();
+         return IoStatus::kRefused;
+     }
+diff --git a/src/core/remote_expert_opt.cu b/src/core/remote_expert_opt.cu
+index add10f987..99d9c5e90 100644
+--- a/src/core/remote_expert_opt.cu
++++ b/src/core/remote_expert_opt.cu
+@@ -84,6 +84,8 @@ void prefill_f16_to_f32(const uint16_t* x16, float* x, int64_t n, void* stream)
+     prefill_f16_to_f32_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(x16, x, n);
+ }
+ 
++int RemoteExpertOpt::routing_width() noexcept { return K; }
++
+ void RemoteExpertOpt::attach(RemoteExperts& remote) {
+     remote.remote_opt_ = this;
+     peers_.push_back({&remote});
+@@ -108,7 +110,7 @@ bool RemoteExpertOpt::init(std::string& err) {
+     for (auto& p : peers_) {
+         // WHY skip: a seabraid remote has no GPU in this process; its helper reduces on its own card and the rows come
+         // back through the channel (RemoteExperts::seabraid_helper_finish -> accumulate), so there is no device buffer to size.
+-        if (p.remote->bl_) continue;
++        if (p.remote->process_tier()) continue;
+         const OnDevice on(p.remote->device_);
+         if (!check(cudaMalloc((void**) &p.sum, MAXT * H * sizeof(float)), err)) return false;
+     }
+@@ -117,7 +119,7 @@ bool RemoteExpertOpt::init(std::string& err) {
+ 
+ RemoteExpertOpt::~RemoteExpertOpt() {
+     for (auto& p : peers_) {
+-        if (!p.remote->bl_) {   // (no device to enter for a helper process)
++        if (!p.remote->process_tier()) {   // (no device to enter for a helper process)
+             const OnDevice on(p.remote->device_);
+             if (p.remote->stream_) cudaStreamSynchronize(p.remote->stream_);
+             if (p.sum) cudaFree(p.sum);
+@@ -162,7 +164,7 @@ void RemoteExpertOpt::accumulate(const RemoteExperts& remote) { accumulate(remot
+ void RemoteExpertOpt::accumulate(const float* rows, const RemoteExperts& remote) {
+     for (int64_t i = 0; i < tokens_ * H; ++i) h_sum_[token_begin_ * H + i] += rows[i];
+     for (int i = 0; i < tokens_ * K; ++i)
+-        h_mask_[token_begin_ * K + i] |= remote.owned_[(size_t) i] != 0;
++        h_mask_[token_begin_ * K + i] |= remote.owns(i);
+ }
+ 
+ void RemoteExpertOpt::copy_rows(float* dst, const float* src, int token_begin, int tokens,
+@@ -198,7 +200,7 @@ bool RemoteExpertOpt::adapt(const std::vector<float>& usage, const std::vector<i
+     for (const auto& [i, slot] : pending) resident[(size_t) i] = 1;
+     for (const auto& p : peers_) {
+         const auto& r = *p.remote;
+-        if (r.bl_) continue;   // a helper process: the caller's helper_holds() already keeps its experts out of the candidates
++        if (r.process_tier()) continue;   // a helper process: the caller's helper_holds() already keeps its experts out of the candidates
+         for (int32_t l = 0; l < (int32_t) r.layers_present_.size(); ++l)
+             for (int32_t e = 0; e < r.n_expert_; ++e)
+                 if (r.cache_.slot_of(l, e) >= 0) resident[(size_t) l * r.n_expert_ + e] = 1;
+@@ -207,7 +209,7 @@ bool RemoteExpertOpt::adapt(const std::vector<float>& usage, const std::vector<i
+     std::string err;
+     for (auto& p : peers_) {
+         auto& r = *p.remote;
+-        if (r.bl_) continue;   // (the helper's tier moves by D7 --retier, not by this local swap)
++        if (r.process_tier()) continue;   // (the helper's tier moves by D7 --retier, not by this local swap)
+         std::vector<Swap> swaps;
+         std::vector<std::pair<float, int32_t>> candidates, victims;
+         for (int32_t l = 0; l < (int32_t) r.layers_present_.size(); ++l) {
+diff --git a/src/core/remote_experts.cpp b/src/core/remote_experts.cpp
+index 41bb0e9ac..f194295f5 100644
+--- a/src/core/remote_experts.cpp
++++ b/src/core/remote_experts.cpp
+@@ -140,6 +140,7 @@ bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
+ }
+ 
+ void RemoteExperts::close() {
++    if (seabraid_) { seabraid_.reset(); bl_resident_ = 0; return; }
+     if (bl_) {   // seabraid: tell the helper this engine is done with it
+         if (bl_pending_) { std::string ignored; seabraid_helper_finish(nullptr, ignored); }
+         bl_->header()->state.store(seabraid::kShutdown, std::memory_order_release);
+@@ -330,6 +331,7 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
+     // cumulative host time in here (staging and launches), reported per request by the driver
+     struct Timer { double& acc; std::chrono::steady_clock::time_point& end; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+         ~Timer() { end = std::chrono::steady_clock::now(); acc += std::chrono::duration<double, std::milli>(end - t0).count(); } } timer{ms_begin_, begin_end_};
++    if (seabraid_) return seabraid_begin(layer, x, ids, n_tok, k, kind, primary_res, err);
+     if (bl_) return seabraid_helper_begin(layer, x, ids, n_tok, k, kind, primary_res, err);
+     const int64_t n = n_tok * k;
+     if (n <= 0 || n > CAP || n_tok > strata::kernels::kWindowMaxT || k != (int) strata::core::kCompiledGeometry.n_expert_used || layer < 0 ||
+@@ -422,6 +424,7 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
+ }
+ 
+ bool RemoteExperts::finish(float* out, std::string& err) {
++    if (seabraid_) return seabraid_finish(err);
+     if (bl_) return seabraid_helper_finish(out, err);
+     if (group_id_.empty()) return true;
+     DeviceScope scope(device_);
+diff --git a/src/core/remote_seabraid.cpp b/src/core/remote_seabraid.cpp
+new file mode 100644
+index 000000000..f9378c967
+--- /dev/null
++++ b/src/core/remote_seabraid.cpp
+@@ -0,0 +1,155 @@
++#include "strata/core/remote_experts.hpp"
++
++#if defined(STRATA_HAVE_SEABRAID)
++#include "qwen_decode.hpp"
++#include "strata/core/geometry.hpp"
++#include "strata/core/seabraid_checkpoint.hpp"
++#include "strata/core/remote_expert_opt.hpp"
++
++#include <algorithm>
++#include <cstdlib>
++#endif
++
++namespace strata::core {
++
++void RemoteExperts::SeabraidDelete::operator()(seabraid::strata_adapter::QwenDecodeTier* ptr) const noexcept {
++#if defined(STRATA_HAVE_SEABRAID)
++    delete ptr;
++#else
++    (void) ptr;
++#endif
++}
++
++#if defined(STRATA_HAVE_SEABRAID)
++namespace {
++
++bool valid_placement(int slots, int64_t layers, int64_t experts, size_t claimed_count) {
++    constexpr auto g = kCompiledGeometry;
++    return slots > 0 && layers == g.n_layers && experts == g.n_expert &&
++           claimed_count == size_t(g.n_layers) * g.n_expert;
++}
++
++seabraid::strata_adapter::PrivateQwenPlan select_plan(
++    int slots, const std::vector<std::pair<int32_t, int32_t>>& ranked,
++    const ExpertCache& primary, const std::vector<uint8_t>& claimed) {
++    constexpr auto g = kCompiledGeometry;
++    seabraid::strata_adapter::PrivateQwenPlan plan{};
++    auto seen = claimed;
++    for (const auto& [layer, expert] : ranked) {
++        if (layer < 0 || layer >= g.n_layers || expert < 0 || expert >= g.n_expert) continue;
++        const size_t index = size_t(layer) * g.n_expert + expert;
++        if (seen[index] || primary.slot_of(layer, expert) >= 0) continue;
++        seen[index] = 1;
++        plan.ranked.push_back({layer, expert});
++        if (plan.ranked.size() == size_t(slots)) break;
++    }
++    plan.slots = static_cast<int32_t>(plan.ranked.size());
++    return plan;
++}
++
++}  // namespace
++
++bool RemoteExperts::open_seabraid(const char* helper, const std::string& pack, const std::string& native,
++                              int slots, int64_t layers, int64_t experts,
++                              const std::vector<std::pair<int32_t, int32_t>>& ranked,
++                              const ExpertCache& primary, std::vector<uint8_t>& claimed, std::string& err) {
++    if (kCompiledGeometry.n_expert_used != RemoteExpertOpt::routing_width()) {
++        err = "Seabraid Qwen requires the compiled top-k to match Strata's weighted reducer";
++        return false;
++    }
++    if (pack.empty() || !valid_placement(slots, layers, experts, claimed.size())) {
++        err = "Seabraid Qwen needs an engine pack, explicit slots and matching compiled geometry";
++        return false;
++    }
++    if (!validate_seabraid_checkpoint(pack, native, std::getenv("SEABRAID_QWEN_PACK"),
++                                  std::getenv("SEABRAID_QWEN_NATIVE"), err)) return false;
++
++    const auto plan = select_plan(slots, ranked, primary, claimed);
++    // Keep the engine's spelling because relative native shard lookup depends on the first shard's directory.
++    const seabraid::strata_adapter::PrivateQwenLaunch launch{helper ? helper : "", pack, native, 0, 60000, 1800000};
++    auto tier = seabraid::strata_adapter::QwenDecodeTier::start(launch, plan, 30000, err);
++    if (!tier) return false;
++    bl_resident_ = 0;
++    for (const auto& [layer, expert] : plan.ranked) {
++        if (!tier->holds(layer, expert)) continue;
++        claimed[size_t(layer) * kCompiledGeometry.n_expert + expert] = 1;
++        ++bl_resident_;
++    }
++    seabraid_.reset(tier.release());
++    return true;
++}
++
++void RemoteExperts::disable_seabraid() noexcept {
++    if (seabraid_) seabraid_->disable();
++    bl_resident_ = 0;
++}
++
++bool RemoteExperts::seabraid_holds(int64_t layer, int32_t expert) const {
++    return seabraid_->holds(layer, expert);
++}
++
++bool RemoteExperts::seabraid_begin(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok,
++                               int64_t k, const int32_t* kind, const int32_t* primary_res, std::string& err) {
++    const float* weights = remote_opt_ && remote_opt_->active() ? remote_opt_->weights_ : nullptr;
++    if (weights && remote_opt_->tokens_ != n_tok) {
++        err = "Seabraid Qwen window disagrees with Strata's weighted reducer";
++        return false;
++    }
++    return seabraid_->begin(layer, x, ids, weights, n_tok, k, kind, primary_res, err);
++}
++
++bool RemoteExperts::seabraid_finish(std::string& err) {
++    const float* weighted = nullptr;
++    if (!seabraid_->finish(weighted, err)) return false;
++    if (weighted) remote_opt_->accumulate(weighted, *this);
++    return true;
++}
++
++bool RemoteExperts::seabraid_owns(size_t index) const {
++    return seabraid_->owns(index);
++}
++#else
++bool RemoteExperts::open_seabraid(const char*, const std::string&, const std::string&, int, int64_t, int64_t,
++                              const std::vector<std::pair<int32_t, int32_t>>&, const ExpertCache&,
++                              std::vector<uint8_t>&, std::string& err) {
++    err = "SEABRAID_QWEN_HELPER requires a build with STRATA_SEABRAID_SOURCE_DIR";
++    return false;
++}
++void RemoteExperts::disable_seabraid() noexcept {}
++bool RemoteExperts::seabraid_holds(int64_t, int32_t) const { return false; }
++bool RemoteExperts::seabraid_begin(int64_t, const float*, const int32_t*, int64_t, int64_t,
++                               const int32_t*, const int32_t*, std::string&) { return false; }
++bool RemoteExperts::seabraid_finish(std::string&) { return false; }
++bool RemoteExperts::seabraid_owns(size_t) const { return false; }
++#endif
++
++// Placement routing (adapters/strata/executor_view.hpp), shared by both builds: a build without Seabraid never attaches a view.
++bool RemoteExperts::physically_holds(int64_t layer, int32_t expert) const {
++#if defined(STRATA_HAVE_SEABRAID)
++    if (seabraid_) return seabraid_->held(layer, expert);
++#endif
++    // A CLOSED card (fail closed: a tier round timed out or tore a slot) holds nothing as far as routing goes.
++    return bl_closed_.load(std::memory_order_relaxed) == 0 && layer >= 0 && expert >= 0 && expert < n_expert_ &&
++           (size_t) layer * (size_t) n_expert_ + (size_t) expert < bl_held_.size() &&
++           bl_held_[(size_t) layer * (size_t) n_expert_ + (size_t) expert] != 0;
++}
++
++void RemoteExperts::attach_view(const seabraid::strata_adapter::ExecutorView* view, uint8_t rung) noexcept {
++#if defined(STRATA_HAVE_SEABRAID)
++    if (seabraid_) { seabraid_->attach_view(view, rung); return; }   // the private tier gates its own holds()
++    exec_view_ = view;
++    exec_rung_ = rung;
++#else
++    (void) view; (void) rung;
++#endif
++}
++
++#if defined(STRATA_HAVE_SEABRAID)
++bool RemoteExperts::view_routes(int64_t layer, int32_t expert) const { return exec_view_->routes_to(layer, expert, exec_rung_); }
++bool RemoteExperts::view_open() const { return exec_view_->rung_open(exec_rung_); }
++#else
++bool RemoteExperts::view_routes(int64_t, int32_t) const { return true; }
++bool RemoteExperts::view_open() const { return true; }
++#endif
++
++}  // namespace strata::core
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index c8e10b21c..c1cfae28c 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -60,6 +60,10 @@
+ #if defined(STRATA_HAVE_SEABRAID_RETIER)   // seabraid D7 live re-tiering: only when built with -DSEABRAID_STRATA_SOURCE_DIR
+ #include "strata/seabraid/retier_loop.hpp"
+ #include "strata/core/ownership_rungs.hpp"   // N-card ladder M3: --retier-promote's ownership map and its live rungs
++#if defined(STRATA_HAVE_SEABRAID)
++#include "placement_driver.hpp"     // --retier-promote seabraid: the one fenced round (adapters/strata)
++#include "private_helper_rung.hpp"
++#endif
+ #endif
+ #include "strata/core/on_device.hpp"
+ #include "strata/core/peer_experts.hpp"
+@@ -4697,7 +4701,31 @@ int main(int argc, char** argv) {
+     }
+     // seabraid: with SEABRAID_STRATA_SHM set, the first helper tier (--expert-cache-device1) is a helper PROCESS of another GPU
+     // vendor reached over shared memory (src/seabraid/helper.cpp), not a GPU this process can see.
+-    if (std::getenv("SEABRAID_STRATA_SHM") != nullptr && o.expert_cache_remote[0] > 0) {
++    const char* seabraid_helper = std::getenv("SEABRAID_QWEN_HELPER");
++    if (seabraid_helper && !*seabraid_helper) seabraid_helper = nullptr;
++    if (seabraid_helper) {
++#if !defined(STRATA_HAVE_SEABRAID)
++        std::fprintf(stderr, "strata generate: SEABRAID_QWEN_HELPER needs STRATA_SEABRAID_SOURCE_DIR\n");
++        return 2;
++#endif
++        const bool single_cache = o.expert_cache_remote[0] > 0 && !o.expert_cache_remote_auto[0] &&
++                                  o.expert_cache_remote[1] == 0 && o.expert_cache_remote[2] == 0;
++#if defined(STRATA_HAVE_SEABRAID_RETIER)
++        // WHY only this pair: the private helper has one live publisher, the placement driver (the lease carries its swaps).
++        if (o.retier.mode != seabraid::RetierMode::kOff &&
++            !(o.retier.mode == seabraid::RetierMode::kOn && o.retier.promote == seabraid::RetierPromote::kSeabraid)) {
++            std::fprintf(stderr, "strata generate: private Seabraid Qwen takes only --retier on --retier-promote seabraid\n");
++            return 2;
++        }
++#endif
++        if (!o.serve || !o.remote_expert_opt || o.batch > 1 || !single_cache || multi_gpu ||
++            std::getenv("SEABRAID_STRATA_SHM") || std::getenv("SEABRAID_STRATA_HOT_SHARE")) {
++            std::fprintf(stderr, "strata generate: SEABRAID_QWEN_HELPER needs serial --serve, --remote-expert-opt, "
++                                 "one explicit remote cache, and no split, named helper or hot share\n");
++            return 2;
++        }
++        remote_dev[0] = seabraid::kDeviceBase;
++    } else if (std::getenv("SEABRAID_STRATA_SHM") != nullptr && o.expert_cache_remote[0] > 0) {
+         remote_dev[0] = seabraid::kDeviceBase;
+         std::fprintf(stderr, "strata generate: seabraid: helper tier 1 is the process on %s\n", std::getenv("SEABRAID_STRATA_SHM"));
+     }
+@@ -5203,6 +5231,8 @@ int main(int argc, char** argv) {
+     // the helper's plan from later, so the primary's fill can be decided against the helper's real capacity first
+     double seabraid_helper_free_gib = -1.0;
+     for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0 && (r == 0 || early_remote)) {
++        // The dedicated launcher opens the peer in another process once the ranked slots are known.
++        if (seabraid_helper && r == 0) continue;
+         // Keep CUDA1's proven startup order: initialise its context before
+         // allocating GPU0 weights or mapping the large host expert arena.
+         double free_gib = 0;
+@@ -9634,12 +9664,22 @@ int main(int argc, char** argv) {
+                     claimed[(size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second] = 1;
+         for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0) {
+             if (remote_opt) remote_opt->attach(remote_experts[(size_t) r]);
+-            if (!remote_experts[(size_t) r].open(remote_dev[r], o.expert_cache_remote[(size_t) r],
+-                     g.n_layers, g.n_expert, by_device[(size_t) r], xcache, *srcp, claimed, err,
+-                     o.expert_cache_remote_auto[(size_t) r])) {
++            auto& tier = remote_experts[(size_t) r];
++            const bool opened = seabraid_helper && r == 0
++                ? tier.open_seabraid(seabraid_helper, o.pack, o.native_preset, o.expert_cache_remote[0],
++                                 g.n_layers, g.n_expert, by_device[0], xcache, claimed, err)
++                : tier.open(remote_dev[r], o.expert_cache_remote[(size_t) r], g.n_layers, g.n_expert,
++                            by_device[(size_t) r], xcache, *srcp, claimed, err,
++                            o.expert_cache_remote_auto[(size_t) r]);
++            if (!opened) {
+                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                 return 1;
+             }
++            if (tier.seabraid_tier()) {
++                std::fprintf(stderr, "strata generate: Seabraid private Qwen helper, %lld additional experts\n",
++                             (long long) tier.resident());
++                continue;
++            }
+             std::fprintf(stderr, "strata generate: CUDA%d: %lld additional experts, %.2f GiB; "
+                                  "results return through pinned host rows\n", remote_dev[r],
+                          (long long) remote_experts[(size_t) r].resident(), remote_experts[(size_t) r].gib());
+@@ -9701,13 +9741,27 @@ int main(int argc, char** argv) {
+     std::vector<int8_t> ladder_rungs;                     // the last snapshot handed to the planner
+     int64_t ladder_stale = 0, ladder_both = 0;
+     bool ladder_fatal = false, ladder_closed_said = false;
++#if defined(STRATA_HAVE_SEABRAID)
++    // --retier-promote seabraid: the published executor table, its two cards and the driver (opened at the first quiet boundary).
++    seabraid::strata_adapter::ExecutorView placement_view;
++    seabraid::strata_adapter::PlacementDriverConfig placement_cfg;
++    std::unique_ptr<strata::core::RungIO> placement_lead, placement_helper;
++    std::unique_ptr<seabraid::strata_adapter::PlacementDriver> placement;
++    bool placement_on = false;
++#endif
+ #endif
+     // #731 (opt-in, STRATA_DISJOINT_ADAPT=1): the adaptive tiers leave an expert a helper GPU holds out of the primary's
+     // promotion candidates (it would sit in both caches).  Asked live, from the helper's own cache (RemoteExperts::holds,
+     // #854), so an expert the helper's tier swaps in or out later is followed - never a copy taken at load.
+     // SEABRAID_STRATA_HOT_SHARE forces it on: the helper then holds hot experts, which the adaptive tier would otherwise promote
+     // into the primary (a copy in both caches, and the split undone one swap at a time).
+-    const bool disjoint_adapt = hot_primary >= 0 ||
++    // --retier-promote seabraid forces it too: a lead adapt that took a helper-owned cell is an unowned move, and the placement
++    // driver quarantines the helper for it.
++    bool placement_seabraid = false;
++#if defined(STRATA_HAVE_SEABRAID_RETIER)
++    placement_seabraid = o.retier.promote == seabraid::RetierPromote::kSeabraid;
++#endif
++    const bool disjoint_adapt = hot_primary >= 0 || placement_seabraid ||
+         [] { const char* v = std::getenv("STRATA_DISJOINT_ADAPT"); return v != nullptr && std::atoi(v) != 0; }();
+     if (hot_primary >= 0)
+         std::fprintf(stderr, "seabraid: hot-share: the adaptive tiers keep the helper's experts out of the primary "
+@@ -11309,10 +11363,13 @@ int main(int argc, char** argv) {
+         // seabraid: a helper PROCESS cannot hand its blobs back to this engine's prompt path or PCIe share, so leaving
+         // them out of the RAM copy sends every such read to the drive (measured: 31.7 GB read in one 1.2K-token request,
+         // then a verify timeout).  Its experts stay in the RAM copy unless SEABRAID_STRATA_EXCLUDE_HELPER_RAM=1.
++        // Seabraid: the private helper is a process too and has no blob read-back either, so the same rule covers it
++        // (measured 2026-11-17, 32k prompt: 58 GB from the drive and 907-1,002 tok/s without it, 1,774-2,043 with it).
+         static const bool bl_exclude = [] { const char* v = std::getenv("SEABRAID_STRATA_EXCLUDE_HELPER_RAM"); return v && v[0] == '1'; }();
++        std::array<bool, 3> ram_keeps_process{};   // Seabraid: tiers whose experts the RAM copy also holds (below)
+         for (int r = 0; r < 3; ++r) {
+             if (o.expert_cache_remote[(size_t) r] <= 0) continue;
+-            if (remote_experts[(size_t) r].seabraid() && !bl_exclude) continue;
++            if (remote_experts[(size_t) r].process_tier() && !bl_exclude) { ram_keeps_process[(size_t) r] = true; continue; }
+             for (int64_t l = 0; l < g.n_layers; ++l)
+                 for (int64_t e = 0; e < g.n_expert; ++e)
+                     if (remote_experts[(size_t) r].holds(l, (int32_t) e)) stage_pairs.emplace_back((int32_t) l, (int32_t) e);
+@@ -11407,7 +11464,24 @@ int main(int argc, char** argv) {
+             }
+         }
+ #endif
+-        const std::vector<std::pair<int32_t, int32_t>>& rank_all = profile_all.empty() ? profile : profile_all;
++        // Seabraid: with a helper process's experts in the RAM copy, a budget takes the experts no GPU holds first and
++        // the helper's after them, each group hottest first.  Decode reads only the first group from RAM; the helper's
++        // are there for the prompt path.  Measured 2026-11-17 (R9700 main, 3090 helper, 21.9 GiB budget): one hottest-
++        // first order over both left part of the first group on the drive, 1,378-1,611 file reads per 2,000-token run
++        // and 89-91 tok/s against 92-98 without the helper's experts in RAM.
++        std::vector<std::pair<int32_t, int32_t>> rank_ram;
++        const std::vector<std::pair<int32_t, int32_t>>& rank_profile = profile_all.empty() ? profile : profile_all;
++        if (ram_keeps_process[0] || ram_keeps_process[1] || ram_keeps_process[2]) {
++            auto on_process = [&](const std::pair<int32_t, int32_t>& pr) {
++                for (int r = 0; r < 3; ++r)
++                    if (ram_keeps_process[(size_t) r] && remote_experts[(size_t) r].holds(pr.first, pr.second)) return true;
++                return false;
++            };
++            rank_ram.reserve(rank_profile.size());
++            for (const auto& pr : rank_profile) if (!on_process(pr)) rank_ram.push_back(pr);
++            for (const auto& pr : rank_profile) if (on_process(pr)) rank_ram.push_back(pr);
++        }
++        const std::vector<std::pair<int32_t, int32_t>>& rank_all = rank_ram.empty() ? rank_profile : rank_ram;
+         src.budget_is_automatic(ram_fallback_resident);   // its clamp line then names no flag
+         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
+                                                     o.resident_headroom, o.resident_budget, &rank_all);
+@@ -14052,7 +14126,7 @@ int main(int argc, char** argv) {
+ #if defined(STRATA_HAVE_SEABRAID_RETIER)
+         if (o.retier.mode != seabraid::RetierMode::kOff) {   // seabraid D7: fail fast, before the first request, never run with zero heat
+             for (int r = 0; r < 3; ++r)
+-                if (o.expert_cache_remote[(size_t) r] > 0 && remote_experts[(size_t) r].seabraid()) retier_re = &remote_experts[(size_t) r];
++                if (o.expert_cache_remote[(size_t) r] > 0 && remote_experts[(size_t) r].process_tier()) retier_re = &remote_experts[(size_t) r];
+             std::string rerr;
+             if (!seabraid::retier_check(o.retier, o.adapt_every, o.adapt_swaps, drive.d.usage.size(), g.n_layers * g.n_expert, retier_re != nullptr, rerr)) {
+                 std::fprintf(stderr, "strata serve: %s\n", rerr.c_str());
+@@ -14060,15 +14134,35 @@ int main(int argc, char** argv) {
+             }
+             // --retier-promote writes card 1's slots between windows: a layer split (another card's copy of the residency
+             // table) or the peer tier (its own adapt copies) would need writes this first build does not make.  Refuse.
+-            if (o.retier.promote && (!stages.empty() || peer.valid())) {
++            if (o.retier.promote != seabraid::RetierPromote::kOff && (!stages.empty() || peer.valid())) {
+                 std::fprintf(stderr, "strata serve: --retier-promote: not with a layer split or --peer-device (card 1's slots only)\n");
+                 return 2;
+             }
++            if (o.retier.promote == seabraid::RetierPromote::kSeabraid) {   // the placement driver replaces the RetierLoop
++#if defined(STRATA_HAVE_SEABRAID)
++                if (o.batch > 1 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0) {   // one helper rung, serial windows
++                    std::fprintf(stderr, "strata serve: --retier-promote seabraid: not with --batch > 1 or a second helper tier\n");
++                    return 2;
++                }
++                const auto& pol = o.retier.policy;
++                placement_cfg.every_windows = (uint32_t) o.retier.every_windows;
++                placement_cfg.policy = {SEABRAID_ABI_VERSION, (uint16_t) pol.max_moves_per_round, 1, (uint64_t) pol.cooldown_rounds,
++                                        pol.promote_margin, pol.max_helper_layer_share};
++                retier_re->attach_view(&placement_view, 1);   // no card claims a cell until the driver publishes
++                placement_on = true;
++                std::fprintf(stderr, "strata serve: Seabraid placement: a round every %d windows, %d moves, margin %.2f, cooldown %d rounds, layer ceiling %.3f\n",
++                             o.retier.every_windows, pol.max_moves_per_round, pol.promote_margin, pol.cooldown_rounds, pol.max_helper_layer_share);
++#else
++                std::fprintf(stderr, "strata serve: --retier-promote seabraid needs a build with STRATA_SEABRAID_SOURCE_DIR\n");
++                return 2;
++#endif
++            } else {
+             retier_loop = std::make_unique<seabraid::RetierLoop>(o.retier, g.n_layers, g.n_expert);   // built on the engine thread: the only one that may tick it
+             std::fprintf(stderr, "strata serve: seabraid re-tiering %s: a round every %d windows, %d moves, margin %.2f, cooldown %d rounds, layer ceiling %.3f\n",
+                          o.retier.mode == seabraid::RetierMode::kZeroOp ? "ZERO-OP (no ops are sent)" : "ON", o.retier.every_windows,
+                          o.retier.policy.max_moves_per_round, o.retier.policy.promote_margin, o.retier.policy.cooldown_rounds,
+                          o.retier.policy.max_helper_layer_share);
++            }
+         }
+ #endif
+         PcieAuto pcie_auto;
+@@ -14255,6 +14349,59 @@ int main(int argc, char** argv) {
+             }
+             return r;
+         };
++#if defined(STRATA_HAVE_SEABRAID_RETIER) && defined(STRATA_HAVE_SEABRAID)
++        // The engine side of a placement round: the four facts only this file knows.  WHY NO HOST TEST: it lives in main, which
++        // no test can link; the live invariants (R10: no disagreement, no unexpected quarantine, equal table hashes) and the A/A arm cover it.
++        struct EngineHost final : seabraid::strata_adapter::PlacementHost {
++            strata::core::RemoteExperts* helper; strata::core::FileExpertSource* ram; const std::vector<int32_t>* res; int64_t experts;
++            bool said = false;
++            EngineHost(strata::core::RemoteExperts* h, strata::core::FileExpertSource* r, const std::vector<int32_t>* t, int64_t e) : helper(h), ram(r), res(t), experts(e) {}
++            bool drain(std::string& err) noexcept override {   // the lead's streams idle; the helper's own drain is its swap (seabraid_retier / tier_swap refuse a pending request)
++                const cudaError_t r = cudaDeviceSynchronize();
++                if (r != cudaSuccess) err = cudaGetErrorString(r);
++                return r == cudaSuccess;
++            }
++            void lead_cells(std::vector<uint8_t>& is_lead) noexcept override {
++                for (size_t i = 0; i < res->size() && i < is_lead.size(); ++i) is_lead[i] = (*res)[i] >= 0;
++            }
++            bool helper_cells(uint8_t, std::vector<uint8_t>& held) noexcept override {   // false: the tier is gone (closed card, retired lease)
++                if (helper->seabraid_closed() != 0 || (helper->seabraid_ptr() && helper->seabraid_ptr()->retired())) return false;
++                for (size_t i = 0; i < held.size(); ++i) held[i] = helper->physically_holds((int64_t) i / experts, (int32_t) ((int64_t) i % experts));
++                return true;
++            }
++            void after_commit(uint32_t layer, uint32_t up, uint32_t down) noexcept override {   // the RAM copy follows the helper set (as ram-adapt does)
++                if (!ram->complement_ready() || !ram->has_resident(layer, up) || ram->has_resident(layer, down)) return;
++                if (ram->replace_resident(layer, down, up) || said) return;
++                said = true;   // loud once: the expert's prompt reads now go to the drive, decode is unaffected
++                std::fprintf(stderr, "strata serve: placement: the RAM copy could not follow a commit (layer %u)\n", layer);
++            }
++        } placement_host(retier_re, &src, &host_res, (int64_t) g.n_expert);
++        // First quiet boundary: host_res, the helper's held[] and res_upload are final here (like the legacy ladder's map).
++        auto open_placement = [&]() -> bool {
++            using namespace seabraid::strata_adapter;
++            std::vector<uint8_t> owners((size_t) (g.n_layers * g.n_expert), 2);
++            for (size_t i = 0; i < owners.size(); ++i)   // lead wins a duplicate, as routing resolves it
++                owners[i] = host_res[i] >= 0 ? 0 : retier_re->physically_holds((int64_t) i / g.n_expert, (int32_t) ((int64_t) i % g.n_expert)) ? 1 : 2;
++            std::vector<size_t> slot_bytes;
++            for (int64_t l = 0; l < g.n_layers; ++l) slot_bytes.push_back((size_t) strata::kernels::cpu::expert_layout().blob_bytes(l));
++            placement_lead = std::make_unique<strata::core::PrimaryRung>(xcache, host_res, g.n_expert, [&](std::string& e) {
++                const cudaError_t r = res_upload();
++                if (r != cudaSuccess) e = cudaGetErrorString(r);
++                return r == cudaSuccess;
++            });
++            std::string e;
++            if (auto* tier = retier_re->seabraid_ptr()) {   // private: the lease swaps slots, each layer with its own blob size; named: the channel does
++                // WHY the size check: a layer whose blob size the engine reports differently from the table must refuse, not stage a torn blob.
++                placement_helper = PrivateHelperRung::open(*tier, [&](int64_t l, int64_t x, uint8_t* d, size_t n) {
++                                                               return n == (size_t) strata::kernels::cpu::expert_layout().blob_bytes(l) && src.copy_blob(l, x, d);
++                                                           }, (size_t) g.n_layers, slot_bytes, placement_cfg.helper_op_timeout_ms, e);
++            } else placement_helper = std::make_unique<strata::core::RemoteRung>(*retier_re, src);
++            if (e.empty()) placement = PlacementDriver::open((uint32_t) g.n_layers, (uint32_t) g.n_expert, std::move(owners),
++                {placement_lead.get(), placement_helper.get()}, std::move(slot_bytes), placement_cfg, placement_view, e);
++            if (!placement) std::fprintf(stderr, "strata serve: placement: %s\n", e.c_str());
++            return placement != nullptr;
++        };
++#endif
+         auto apply_pending = [&](bool wait) {
+             if (peer.valid()) peer.apply_pending(wait);
+             if (pending.empty()) {
+@@ -18429,6 +18576,23 @@ int main(int argc, char** argv) {
+                 std::fflush(stdout);
+                 return true;
+             };
++            std::string seabraid_window_error;
++            auto run_serial_window = [&](int count, const int32_t* tokens, int64_t pos,
++                                         strata::core::PoolMultiFn pool, int32_t* output, std::string& error) {
++                drive.d.seabraid_error = seabraid_helper ? &seabraid_window_error : nullptr;
++                const bool drained = ver.run(count, tokens, pos, pool, win_pool_user, output, error);
++                drive.d.seabraid_error = nullptr;
++                if (!drained || drive.d.failed) seabraid_window_error.clear();
++                return drained && !drive.d.failed && seabraid_window_error.empty();
++            };
++            auto reject_seabraid_window = [&] {
++                // The drained window may contain missing expert contributions.
++                // Drop the live-cache marker so the next request restores or starts clean.
++                live_ok = false;
++                remote_experts[0].disable_seabraid();
++                std::printf("ERR %s\n", seabraid_window_error.c_str());
++                std::fflush(stdout);
++            };
+             // tokens [a, b) through the windows: commit all of them, then give the draft layer their residuals
+             auto read_windows = [&](int64_t a, int64_t b, std::string& e) -> bool {
+                 // (STRATA_LOGPOS reads every window's logits: the serial loop)
+@@ -18460,7 +18624,7 @@ int main(int argc, char** argv) {
+                     drive.d.layers = 0;
+                     drive.d.experts = 0;
+                     drive.d.failed = false;
+-                    if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
++                    if (!run_serial_window(T, win.data(), q, win_pool_fn, outw.data(), e)) {
+                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
+                         return false;
+                     }
+@@ -19612,6 +19776,7 @@ int main(int argc, char** argv) {
+                     std::fflush(stdout);
+                 }
+                 if (!sp_ok) {
++                    if (!seabraid_window_error.empty()) break;
+                     if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
+                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                         std::printf("ERR %s\n", err.c_str());
+@@ -19649,6 +19814,10 @@ int main(int argc, char** argv) {
+             }
+             if (mtp_room_open && room_close("prompt done") != 0) return 1;
+             if (head_restore() != 0) return 1;
++            if (!seabraid_window_error.empty()) {
++                reject_seabraid_window();
++                continue;
++            }
+             tr("prompt done (slots refilled)");
+             if (il_parts > 0)
+                 std::fprintf(stderr, "strata batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "
+@@ -20818,17 +20987,17 @@ int main(int argc, char** argv) {
+                 // seabraid D7: the one window-boundary hook.  Engine thread; this window's adapt thread was joined at the end of the
+                 // last one and the next is not started yet, so nothing else touches usage or the helper's residency here.  tick()
+                 // applies a finished plan through seabraid_retier (which drains and fences) and snapshots heat for the next round.
+-                if (retier_loop && !o.retier.promote)
++                if (retier_loop && !o.retier.ladder())
+                     retier_loop->tick(drive.d.usage.data(), drive.d.usage.size(), retier_re->seabraid_held(), retier_re->seabraid_free_slots(), !ajob,
+                                       [&](const seabraid::TierWireOp* ops, int32_t n, uint8_t* res, std::string& e) { return retier_re->seabraid_retier(ops, n, res, nullptr, e); });
+                 // N-card ladder, the first live move (--retier-promote): card 2's hot experts up to card 1, card 1's coldest of
+                 // the same layer down to card 2, each pair through the ownership map's prepare/commit.  Quiet = no adapt job AND
+                 // no adapt copy in flight: a promotion writes card 1's own slots, which those copies also write.
+-                if (retier_loop && o.retier.promote && retier_re->seabraid_closed() != 0 && !ladder_closed_said) {
++                if (retier_loop && o.retier.ladder() && retier_re->seabraid_closed() != 0 && !ladder_closed_said) {
+                     ladder_closed_said = true;   // fail closed: no further rounds; the card's experts come from RAM / the drive
+                     std::fprintf(stderr, "strata serve: retier promote: card 2 is CLOSED; no further rounds this session\n");
+                 }
+-                if (retier_loop && o.retier.promote && retier_re->seabraid_closed() == 0) {
++                if (retier_loop && o.retier.ladder() && retier_re->seabraid_closed() == 0) {
+                     const bool quiet = !ajob && pending.empty();
+                     if (!ladder_map) {
+                         ladder_card1 = std::make_unique<strata::core::PrimaryRung>(xcache, host_res, g.n_expert, [&](std::string& e) {
+@@ -20836,7 +21005,7 @@ int main(int argc, char** argv) {
+                             if (r != cudaSuccess) e = cudaGetErrorString(r);
+                             return r == cudaSuccess;
+                         });
+-                        ladder_card2 = std::make_unique<strata::core::RemoteRung>(*retier_re);
++                        ladder_card2 = std::make_unique<strata::core::RemoteRung>(*retier_re, src);
+                         ladder_map = std::make_unique<strata::core::OwnershipMap>();
+                         std::string e;
+                         if (!ladder_map->init(g.n_layers, g.n_expert, 3, strata::core::derive_rungs(host_res, *retier_re, g.n_layers, g.n_expert, &ladder_both), e)) {
+@@ -20882,6 +21051,18 @@ int main(int argc, char** argv) {
+                         return 1;
+                     }
+                 }
++#if defined(STRATA_HAVE_SEABRAID)
++                // --retier-promote seabraid: the same hook, the other publisher (adapters/strata/placement_driver.hpp).  One fenced
++                // round per --retier-every windows, only at a quiet boundary (no adapt job, no adapt copy in flight).
++                if (placement_on) {
++                    const bool quiet = !ajob && pending.empty();
++                    if (!placement && quiet && !open_placement()) return 2;   // startup-class failure: bad shape or policy
++                    if (placement && !placement->tick(drive.d.usage.data(), drive.d.usage.size(), quiet, placement_host)) {
++                        std::printf("ERR placement: the lead rung was lost or disagrees with the published table\n");   // legacy ladder_fatal's twin
++                        return 1;
++                    }
++                }
++#endif
+ #endif
+                 if (!adapt_tick(false)) {   // --adapt-async: the round in flight moves on a step when it can
+                     std::printf("ERR an adaptive refill failed\n");
+@@ -20915,7 +21096,11 @@ int main(int argc, char** argv) {
+                 else if (strata::spec::mtp_q_applies(use_mtp, req_df2, use_mtp && mtp.prob(), from_sfx, first_window, T_mtp)) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);   // only candidates the MTP drew
+                 const auto decode_pool_fn = use_mtp && mtp.prob() ? invariant_win_pool_fn : win_pool_fn;
+                 exit_if_gpu_fatal("");   // (the test hook counts windows here)
+-                if (!ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
++                if (!run_serial_window(T, window.data(), p, decode_pool_fn, outv.data(), err)) {
++                    if (!seabraid_window_error.empty()) {
++                        if (aflipped) apply_pending(true);
++                        break;
++                    }
+                     exit_if_gpu_fatal(drive.d.failed && drive.d.fail ? drive.d.fail : err);
+                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
+                     return 1;
+@@ -21144,6 +21329,10 @@ int main(int argc, char** argv) {
+             // (a --batch admission is a GEN of one token whose hold may be that one token: the slot must not start then)
+             if (hold_on && std::strcmp(finish, "length") == 0 && produced_n >= req_hold_n && (produced_n < max_new || admit_slot >= 0)) finish = "hold";
+             if (!keep_sync()) { std::printf("ERR %s\n", err.c_str()); return 1; }
++            if (!seabraid_window_error.empty()) {
++                reject_seabraid_window();
++                continue;
++            }
+             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
+             dc_last_end = Clock::now();   // the busy run goes on when the next request starts within CostLearner::kIdleS of this
+             if (use_df2 && o.draft_auto && bandit_key != 0 && produced_n >= 48 && decode_ms > 0.0) {
+diff --git a/tests/core/seabraid_checkpoint_test.cpp b/tests/core/seabraid_checkpoint_test.cpp
+new file mode 100644
+index 000000000..8506bd413
+--- /dev/null
++++ b/tests/core/seabraid_checkpoint_test.cpp
+@@ -0,0 +1,85 @@
++#include "strata/core/seabraid_checkpoint.hpp"
++
++#include <chrono>
++#include <cstdio>
++#include <filesystem>
++#include <fstream>
++#include <stdexcept>
++#include <string>
++#include <system_error>
++
++namespace fs = std::filesystem;
++
++namespace {
++
++class Fixture {
++public:
++    Fixture() : root(fs::temp_directory_path() /
++                     ("strata-seabraid-checkpoint-" + std::to_string(
++                         std::chrono::steady_clock::now().time_since_epoch().count()))) {
++        if (!fs::create_directory(root)) throw std::runtime_error("cannot create a unique checkpoint fixture");
++    }
++
++    ~Fixture() {
++        std::error_code ignored;
++        fs::remove_all(root, ignored);
++    }
++
++    const fs::path root;
++};
++
++bool expect_paths(const std::string& pack, const std::string& native, const char* pack_override,
++                  const char* native_override, const char* rejected_variable) {
++    std::string error;
++    const bool valid = strata::core::validate_seabraid_checkpoint(pack, native, pack_override, native_override, error);
++    if (rejected_variable ? !valid && error.find(rejected_variable) != std::string::npos : valid && error.empty()) {
++        return true;
++    }
++    std::fprintf(stderr, "checkpoint case expected %s, got %s\n",
++                 rejected_variable ? rejected_variable : "acceptance", valid ? "acceptance" : error.c_str());
++    return false;
++}
++
++}  // namespace
++
++int main() {
++    const Fixture fixture;
++    const auto& root = fixture.root;
++    const auto pack = (root / "engine-pack").string();
++    const auto other_pack = (root / "other-pack").string();
++    const auto pack_alias = (root / "alias-pack").string();
++    const auto native = (root / "engine.gguf").string();
++    const auto other_native = (root / "other.gguf").string();
++    const auto native_alias = (root / "alias.gguf").string();
++    const auto missing = (root / "missing").string();
++
++    fs::create_directory(pack);
++    fs::create_directory(other_pack);
++    // Identical file size is insufficient to distinguish two checkpoints.
++    std::ofstream(native) << 'A';
++    std::ofstream(other_native) << 'B';
++    fs::create_directory_symlink(pack, pack_alias);
++    fs::create_symlink(native, native_alias);
++
++    const struct {
++        const char* native;
++        const char* pack_override;
++        const char* native_override;
++        const char* rejected_variable;
++    } cases[] = {
++        {native.c_str(), nullptr, nullptr, nullptr},
++        {native.c_str(), pack.c_str(), native.c_str(), nullptr},
++        {native.c_str(), pack_alias.c_str(), native_alias.c_str(), nullptr},
++        {"", nullptr, "", nullptr},
++        {native.c_str(), other_pack.c_str(), nullptr, "SEABRAID_QWEN_PACK"},
++        {native.c_str(), missing.c_str(), nullptr, "SEABRAID_QWEN_PACK"},
++        {native.c_str(), "", nullptr, "SEABRAID_QWEN_PACK"},
++        {native.c_str(), nullptr, other_native.c_str(), "SEABRAID_QWEN_NATIVE"},
++        {native.c_str(), nullptr, missing.c_str(), "SEABRAID_QWEN_NATIVE"},
++        {"", nullptr, native.c_str(), "SEABRAID_QWEN_NATIVE"},
++    };
++    for (const auto& test : cases)
++        if (!expect_paths(pack, test.native, test.pack_override, test.native_override, test.rejected_variable))
++            return 1;
++    return 0;
++}
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Seabraid <seabraid@example.invalid>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH 2/3] Strata: the expert pyramid ladder (k helper rungs, the
+ fallback rung, blob swaps)
+
+Target: commit 1 of this series on the Seabraid compatibility patches 0001-0006 and 0010-0017 (0017: the SEABRAID_STRATA_SHM
+list, seabraid_retier_blob, tier_verify, retier_check_helpers and --retier-fallback / --retier-hops).
+
+- generate.cpp: SEABRAID_STRATA_SHM lists one channel per helper process; tier r is entry r (remote_dev kDeviceBase + r),
+  Seabraid rung r + 1, fixed for the session; exit 2 when the list is malformed, has more than three entries or
+  names a tier whose --expert-cache-device is unset.  --retier-promote seabraid drives every process tier (no more
+  "second helper tier" refusal) and refuses an in-process GPU tier beside them; legacy modes refuse k > 1
+  (retier_check_helpers).  Policy v2: ladder_boundaries 0, fallback_boundary = --retier-fallback, max_hops =
+  --retier-hops; SEABRAID_PLACEMENT_QUAL is handed to the driver.  EngineHost: per-rung helper_cells, the cheap
+  helper_alive (closed card / retired lease; no pid probe), after_commit(outcome) following the RAM copy only across
+  the lead <-> helper 1 boundary.  open_placement: owners over k rungs + F, one RemoteRung per tier (private: tier 0
+  only, phase 2), the FallbackRung.  D4 with more than one expert process exits 2 instead of picking one.
+  STRATA_RAM_ADAPT / RAM_ADAPT2 with SEABRAID_STRATA_EXCLUDE_HELPER_RAM=1 skip helper-executed cells as candidates and installs.
+- ownership_rungs: RemoteRung::replace sends the staged bytes (seabraid_retier_blob, kTierSwapBlob, read back by the
+  helper before the ack); FallbackRung (RAM copy + pack): stage from RAM or file (counted), replace all-or-nothing,
+  a RAM-resident leaving expert gives its place to the arriving one from the staged bytes, REFUSED while a RAM_ADAPT2
+  read is queued for either.
+- expert_source: FileExpertSource::replace_resident_from, the public face of install_resident.
+
+Design gate: owner = the engine side of the pyramid (generate.cpp wiring, the rungs in ownership_rungs); contract =
+the adapter's PlacementHost / PlacementDriver::open and the RungIO shape, nothing new on the wire; failure = exit 2 at
+startup on any bad list, count, cap or mode, per-rung quarantine at run time, the fallback never closed; checker =
+the adapter's host fixtures plus the live pyramid chain (FallbackRung and generate.cpp are not host-testable: they
+need FileExpertSource over a real pack and main()); finish line = the live chain logs NVMe -> RAM -> h2 -> h1 -> main
+and back with verified=1 on every hop.  Defenses at the sites: rung = list position (the installer maps rank to
+order); D4 refused with k > 1 (no hidden rule); F leaves RAM residency of an arriving cold expert to RAM_ADAPT (one
+owner of that decision).
+---
+ include/strata/core/expert_source.hpp   |   4 +
+ include/strata/core/ownership_rungs.hpp |  40 +++++-
+ src/core/ownership_rungs.cpp            |  42 ++++++-
+ src/program/generate.cpp                | 156 +++++++++++++++++++-----
+ 4 files changed, 199 insertions(+), 43 deletions(-)
+
+diff --git a/include/strata/core/expert_source.hpp b/include/strata/core/expert_source.hpp
+index 2196daea2..fa1ce8cb8 100644
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -871,6 +871,10 @@ public:
+     /// STRATA_RAM_ADAPT: the same move as replace_resident, but `in` is copied out of the finished stage buffer
+     /// a demand read left it in (no file read).  False, nothing changed, when `in` is not staged or still filling.
+     bool replace_resident_staged(int64_t layer, int64_t in, int64_t out);
++    /// Pyramid (the fallback rung): the same move, with `in`'s bytes supplied by the caller (`bytes`, blob_bytes(layer) of
++    /// them: a verified copy the placement round staged), so no file read.  Same preconditions; false, nothing changed, when
++    /// any fails.  The public face of install_resident.
++    bool replace_resident_from(int64_t layer, int64_t in, int64_t out, const uint8_t* bytes) { return install_resident(layer, in, out, bytes); }
+     int64_t ram_adapts() const { return ram_adapts_; }
+     int64_t ram_staged() const { return ram_staged_; }   ///< of ram_adapts(): copied out of a stage buffer
+     // ---- 149-prefetch (STRATA_RAM_ADAPT2): the same promotion, staged.  `ram_stage` queues the read of `in` on an I/O thread
+diff --git a/include/strata/core/ownership_rungs.hpp b/include/strata/core/ownership_rungs.hpp
+index 48197b773..0c1349d20 100644
+--- a/include/strata/core/ownership_rungs.hpp
++++ b/include/strata/core/ownership_rungs.hpp
+@@ -6,9 +6,9 @@
+ // DESIGN GATE
+ //   Owner    : "how a slot of THIS kind of rung is read, written and checked".  The residency tables stay with their
+ //              owners (host_res and the device tables: the engine; held[]: RemoteExperts); these adapters only call them.
+-//   Contract : PrimaryRung, RemoteRung below.  ENGINE THREAD ONLY, at a quiet window boundary: no layer request in flight
++//   Contract : PrimaryRung, RemoteRung, FallbackRung below.  ENGINE THREAD ONLY, at a quiet window boundary: no layer request in flight
+ //              (RemoteExperts' fence drains its own), no adapt copy in flight (the caller checks), no other writer.
+-//   Size     : header <= 100, cpp <= 200.
++//   Size     : header <= 130, cpp <= 220 (the pyramid's FallbackRung: ~30 + ~40).
+ //   Failure  : never throws, never aborts.  A write that started and did not complete is kFailed with the rung's view
+ //              unchanged (the map then rewrites the staged blob or closes the rung); a channel timeout is kTimeout (the
+ //              card is already closed by RemoteExperts).
+@@ -25,6 +25,7 @@
+ namespace strata::core {
+ class ExpertCache;
+ class ExpertSource;
++class FileExpertSource;
+ class RemoteExperts;
+ 
+ // Card 1: the engine's own cache.  `host_res` is the table the engine routes from (slot index or kNotResident per cell,
+@@ -46,18 +47,45 @@ private:
+ 
+ // A card behind a seabraid channel.  stage() reads the blob from the engine's ExpertSource (copy_blob), after the card's
+ // own residency says it holds the expert;
+-// replace() is ONE same-layer kTierSwap through seabraid_retier (drain, fence, ack, held[] adopted and checked).  The
+-// staged bytes are not sent: the channel has no blob-load op yet (channel v7's kTierLoadFromBlob, design M4), so the
+-// card reads the new expert from its own copy of the same pack.
++// replace() is ONE same-layer swap through the fenced round (drain, fence, ack, held[] adopted and checked).  With
++// `send_bytes` (the pyramid default) it is a wire v8 kTierSwapBlob through seabraid_retier_blob: the staged bytes go in
++// channel blob slot 0 and the helper writes them and reads them back before it acks, so the card holds exactly the
++// engine's verified copy; without, a kTierSwap and the card reads the new expert from its own copy of the pack.
+ class RemoteRung : public RungIO {
+ public:
+-    RemoteRung(RemoteExperts& re, ExpertSource& src) : re_(re), src_(src) {}
++    RemoteRung(RemoteExperts& re, ExpertSource& src, bool send_bytes = true) : re_(re), src_(src), send_bytes_(send_bytes) {}
+     IoStatus stage(int32_t layer, int32_t expert, std::vector<uint8_t>& out, std::string& err) override;
+     IoStatus replace(int32_t layer, int32_t old_e, int32_t new_e, const std::vector<uint8_t>& bytes, std::string& err) override;
+ 
+ private:
+     RemoteExperts& re_;
+     ExpertSource& src_;
++    bool send_bytes_;
++};
++
++// The fallback rung F (the engine executes it: the RAM copy and the pack on NVMe), live only on a placement handle opened
++// with fallback_boundary 1.  stage() reads from wherever the engine has the expert (RAM if resident, else the file) and
++// counts which.  replace(layer, old, new, bytes) records that F now serves `new` (arriving from the lowest helper) instead
++// of `old` (leaving for it): F serves every cell from the pack anyway, so it ACKs whenever the request is well formed; with
++// `excludes_helper_ram` (SEABRAID_STRATA_EXCLUDE_HELPER_RAM=1) a RAM-resident `old` gives its RAM place to `new` from the staged
++// bytes (one copy into a 1:1 place, no file read).  A `new` that was not RAM-resident is left to STRATA_RAM_ADAPT, which
++// already decides RAM residency by heat at window boundaries (one owner of that decision).
++// FALLBACK PROVIDER RULE (placement.h): all-or-nothing, and on any non-ACK F still serves every cell from verified bytes.
++// REFUSED while a STRATA_RAM_ADAPT2 read is queued for `old` or `new` (the only overlap: RAM_ADAPT itself runs before the
++// placement tick on this thread), or for a wrong size / an in-place rewrite.
++class FallbackRung : public RungIO {
++public:
++    FallbackRung(FileExpertSource& src, bool excludes_helper_ram) : src_(src), excludes_helper_ram_(excludes_helper_ram) {}
++    IoStatus stage(int32_t layer, int32_t expert, std::vector<uint8_t>& out, std::string& err) override;
++    IoStatus replace(int32_t layer, int32_t old_e, int32_t new_e, const std::vector<uint8_t>& bytes, std::string& err) override;
++    int64_t ram_hits() const { return ram_hits_; }       ///< stages served from the RAM copy (cumulative)
++    int64_t file_reads() const { return file_reads_; }   ///< stages read from the pack, i.e. NVMe -> card moves (cumulative)
++    int64_t ram_installs() const { return ram_installs_; }   ///< replaces that gave a RAM place to the arriving expert
++
++private:
++    FileExpertSource& src_;
++    bool excludes_helper_ram_;
++    int64_t ram_hits_ = 0, file_reads_ = 0, ram_installs_ = 0;
+ };
+ 
+ // The ownership snapshot of a two-card engine as routing really resolves it today: card 1 (rung 0) if the engine's own
+diff --git a/src/core/ownership_rungs.cpp b/src/core/ownership_rungs.cpp
+index 0bbc606c4..ae0e382cf 100644
+--- a/src/core/ownership_rungs.cpp
++++ b/src/core/ownership_rungs.cpp
+@@ -89,7 +89,6 @@ IoStatus RemoteRung::stage(int32_t layer, int32_t expert, std::vector<uint8_t>&
+ }
+ 
+ IoStatus RemoteRung::replace(int32_t layer, int32_t old_e, int32_t new_e, const std::vector<uint8_t>& bytes, std::string& err) {
+-    (void) bytes;   // no blob-load op on the wire yet: the card reads new_e from its own source (same pack, same bytes)
+     // An in-place rewrite would be SWAP(old, old), which ExpertCache::replace turns into "not resident"; the map never
+     // asks a channel card for one (it closes a torn channel card instead), and this refuses it in case that changes.
+     if (old_e == new_e) { err = "an in-place slot rewrite has no wire form"; return IoStatus::kRefused; }
+@@ -99,16 +98,51 @@ IoStatus RemoteRung::replace(int32_t layer, int32_t old_e, int32_t new_e, const
+     op.layer_old = layer; op.expert_old = old_e;
+     op.layer_new = layer; op.expert_new = new_e;
+     uint8_t res = (uint8_t) seabraid::kTierPending;
+-    const bool ok = re_.seabraid_retier(&op, 1, &res, nullptr, err);
++    // WHY send the bytes: they are the engine's verified copy, and the helper reads its slot back before it acks, so no
++    // card trusts its own pack read for a placement move (wire v8 kTierSwapBlob, compat 0017).
++    const bool ok = send_bytes_ ? re_.seabraid_retier_blob(op, bytes.data(), bytes.size(), res, err)
++                                : re_.seabraid_retier(&op, 1, &res, nullptr, err);
+     switch (re_.seabraid_closed()) {   // seabraid_retier closes the card itself on a timeout or a torn slot
++        case 0: break;
+         case 1: return IoStatus::kTimeout;
+-        case 2: return IoStatus::kFailed;
+-        default: break;
++        // 2 torn slot or stale residency; 3 the helper exited (the exit watch), 4 a missed layer deadline, 5 a helper error or
++        // bad echo, 6 gone at start: every other code is a card that cannot take this move, and a round that was not acked is a
++        // failed one, never a refusal the map would retry on a card that is gone.
++        default: return IoStatus::kFailed;
+     }
+     if (ok && res == (uint8_t) seabraid::kTierApplied) return IoStatus::kOk;
+     return IoStatus::kRefused;   // kTierRejected: the helper refused before touching the slot
+ }
+ 
++IoStatus FallbackRung::stage(int32_t layer, int32_t expert, std::vector<uint8_t>& out, std::string& err) {
++    out.resize((size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer));
++    const bool ram = src_.has_resident(layer, expert);
++    if (!src_.copy_blob(layer, expert, out.data())) {   // a read touches nothing: refused
++        err = "the engine could not read layer " + std::to_string(layer) + " expert " + std::to_string(expert);
++        out.clear();
++        return IoStatus::kRefused;
++    }
++    ++(ram ? ram_hits_ : file_reads_);
++    return IoStatus::kOk;
++}
++
++IoStatus FallbackRung::replace(int32_t layer, int32_t old_e, int32_t new_e, const std::vector<uint8_t>& bytes, std::string& err) {
++    if (old_e == new_e || bytes.size() != (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer)) {
++        err = "the fallback takes one same-layer swap of a whole blob";
++        return IoStatus::kRefused;
++    }
++    if (src_.ram_queued(layer, old_e) || src_.ram_queued(layer, new_e)) {   // a RAM_ADAPT2 read owns that place this window
++        err = "a RAM read is queued for layer " + std::to_string(layer) + " expert " + std::to_string(old_e) + " or " + std::to_string(new_e);
++        return IoStatus::kRefused;
++    }
++    // WHY ACK without touching RAM otherwise: F serves every cell from the pack, so "F now serves new" is already true;
++    // a failed install below leaves the copy exactly as it was (install_resident is one copy into a 1:1 place, or nothing).
++    if (excludes_helper_ram_ && src_.has_resident(layer, old_e) && !src_.has_resident(layer, new_e) &&
++        src_.replace_resident_from(layer, new_e, old_e, bytes.data()))
++        ++ram_installs_;
++    return IoStatus::kOk;
++}
++
+ std::vector<int8_t> derive_rungs(const std::vector<int32_t>& host_res, const RemoteExperts& card2, int64_t layers, int64_t experts,
+                                  int64_t* both) {
+     std::vector<int8_t> r((size_t) (layers * experts), 2);
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index c1cfae28c..f2904bac6 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -57,6 +57,7 @@
+ #include "strata/core/pin_budget.hpp"
+ #include "strata/core/uma_cache.hpp"
+ #include "strata/core/remote_experts.hpp"
++#include "strata/seabraid/channel_names.hpp"   // pyramid: SEABRAID_STRATA_SHM lists one channel per helper process
+ #if defined(STRATA_HAVE_SEABRAID_RETIER)   // seabraid D7 live re-tiering: only when built with -DSEABRAID_STRATA_SOURCE_DIR
+ #include "strata/seabraid/retier_loop.hpp"
+ #include "strata/core/ownership_rungs.hpp"   // N-card ladder M3: --retier-promote's ownership map and its live rungs
+@@ -4726,8 +4727,24 @@ int main(int argc, char** argv) {
+         }
+         remote_dev[0] = seabraid::kDeviceBase;
+     } else if (std::getenv("SEABRAID_STRATA_SHM") != nullptr && o.expert_cache_remote[0] > 0) {
+-        remote_dev[0] = seabraid::kDeviceBase;
+-        std::fprintf(stderr, "strata generate: seabraid: helper tier 1 is the process on %s\n", std::getenv("SEABRAID_STRATA_SHM"));
++        // Pyramid: SEABRAID_STRATA_SHM lists one channel per helper process.  Tier r is the r-th entry (remote_dev kDeviceBase + r),
++        // which is Seabraid rung r + 1, fixed for the session.  WHY position: the installer is the one place that maps a
++        // card's rank to list order, and a re-rank is a reinstall that rewrites the units and the list together.
++        std::vector<std::string> channels;
++        std::string cerr;
++        if (!seabraid::parse_channel_list(std::getenv("SEABRAID_STRATA_SHM"), channels, cerr)) {
++            std::fprintf(stderr, "strata generate: %s\n", cerr.c_str());
++            return 2;
++        }
++        for (size_t r = 0; r < channels.size(); ++r) {
++            if (o.expert_cache_remote[r] <= 0) {
++                std::fprintf(stderr, "strata generate: SEABRAID_STRATA_SHM lists %zu channels but --expert-cache-device%zu is unset\n",
++                             channels.size(), r + 1);
++                return 2;
++            }
++            remote_dev[r] = seabraid::kDeviceBase + (int) r;
++            std::fprintf(stderr, "strata generate: seabraid: helper tier %zu is the process on %s\n", r + 1, channels[r].c_str());
++        }
+     }
+ #if defined(STRATA_USE_HIP)
+     {
+@@ -9732,7 +9749,11 @@ int main(int argc, char** argv) {
+     Drive drive;
+ #if defined(STRATA_HAVE_SEABRAID_RETIER)
+     std::unique_ptr<seabraid::RetierLoop> retier_loop;     // seabraid D7: stays null unless --retier is on and checked
+-    strata::core::RemoteExperts* retier_re = nullptr;     // the helper tier the loop drives
++    strata::core::RemoteExperts* retier_re = nullptr;     // the helper tier the loop drives (legacy modes: the only one)
++    // Pyramid: every process tier in rung order (tier r = rung r + 1).  Legacy modes refuse more than one
++    // (retier_check_helpers); the placement driver takes all of them.
++    std::array<strata::core::RemoteExperts*, 3> retier_res{};
++    int retier_count = 0;
+     // --retier-promote (N-card ladder M3): ONE map of who executes each expert (card 1, card 2, fallback) and the two
+     // live rungs every promotion goes through.  Built at the first window boundary (it needs the serve loop's res_upload).
+     std::unique_ptr<strata::core::OwnershipMap> ladder_map;
+@@ -9745,9 +9766,13 @@ int main(int argc, char** argv) {
+     // --retier-promote seabraid: the published executor table, its two cards and the driver (opened at the first quiet boundary).
+     seabraid::strata_adapter::ExecutorView placement_view;
+     seabraid::strata_adapter::PlacementDriverConfig placement_cfg;
+-    std::unique_ptr<strata::core::RungIO> placement_lead, placement_helper;
++    std::unique_ptr<strata::core::RungIO> placement_lead, placement_fallback;
++    std::vector<std::unique_ptr<strata::core::RungIO>> placement_helpers;
+     std::unique_ptr<seabraid::strata_adapter::PlacementDriver> placement;
+     bool placement_on = false;
++    // SEABRAID_STRATA_EXCLUDE_HELPER_RAM=1 (the installer default): the RAM copy holds no helper-executed expert, so the fallback
++    // rung gives a RAM place up when its expert climbs to a card, and RAM_ADAPT never spends one on a helper's cell.
++    const bool placement_ram_excludes_helpers = [] { const char* v = std::getenv("SEABRAID_STRATA_EXCLUDE_HELPER_RAM"); return v && v[0] == '1'; }();
+ #endif
+ #endif
+     // #731 (opt-in, STRATA_DISJOINT_ADAPT=1): the adaptive tiers leave an expert a helper GPU holds out of the primary's
+@@ -11713,9 +11738,13 @@ int main(int argc, char** argv) {
+         if (const char* dv = std::getenv("STRATA_PREFILL_REMOTE_COMPUTE"); dv != nullptr && std::atoi(dv) != 0) {
+             for (strata::core::RemoteExperts* r : prefill_helpers)
+                 if (r->seabraid()) d4_remote = r;
++            int d4_processes = 0;
++            for (strata::core::RemoteExperts* r : prefill_helpers) d4_processes += r->process_tier() ? 1 : 0;
+             std::string d4err;
+             if (d4_remote == nullptr || srcp == nullptr || multi_gpu || !stages.empty() || o.batch > 0)
+                 d4err = "needs a seabraid expert process, an expert source and a serial single-GPU prompt path";
++            else if (d4_processes > 1)   // WHY refuse: computing on one of k helpers would be a hidden rule (D4 fan-out is N-card M5)
++                d4err = "computes on ONE expert process; SEABRAID_STRATA_SHM lists " + std::to_string(d4_processes) + " (unset it or run one helper)";
+             else
+                 (void) d4_remote->prefill_open(K, d4err);
+             if (!d4err.empty()) {
+@@ -14125,10 +14154,16 @@ int main(int argc, char** argv) {
+             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+ #if defined(STRATA_HAVE_SEABRAID_RETIER)
+         if (o.retier.mode != seabraid::RetierMode::kOff) {   // seabraid D7: fail fast, before the first request, never run with zero heat
+-            for (int r = 0; r < 3; ++r)
+-                if (o.expert_cache_remote[(size_t) r] > 0 && remote_experts[(size_t) r].process_tier()) retier_re = &remote_experts[(size_t) r];
++            bool in_process_tier = false;
++            for (int r = 0; r < 3; ++r) {
++                if (o.expert_cache_remote[(size_t) r] <= 0) continue;
++                if (remote_experts[(size_t) r].process_tier()) retier_res[(size_t) retier_count++] = &remote_experts[(size_t) r];
++                else in_process_tier = true;
++            }
++            retier_re = retier_count > 0 ? retier_res[0] : nullptr;
+             std::string rerr;
+-            if (!seabraid::retier_check(o.retier, o.adapt_every, o.adapt_swaps, drive.d.usage.size(), g.n_layers * g.n_expert, retier_re != nullptr, rerr)) {
++            if (!seabraid::retier_check(o.retier, o.adapt_every, o.adapt_swaps, drive.d.usage.size(), g.n_layers * g.n_expert, retier_re != nullptr, rerr) ||
++                !seabraid::retier_check_helpers(o.retier, retier_count, rerr)) {   // legacy modes: one helper (one publisher)
+                 std::fprintf(stderr, "strata serve: %s\n", rerr.c_str());
+                 return 2;
+             }
+@@ -14140,18 +14175,31 @@ int main(int argc, char** argv) {
+             }
+             if (o.retier.promote == seabraid::RetierPromote::kSeabraid) {   // the placement driver replaces the RetierLoop
+ #if defined(STRATA_HAVE_SEABRAID)
+-                if (o.batch > 1 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0) {   // one helper rung, serial windows
+-                    std::fprintf(stderr, "strata serve: --retier-promote seabraid: not with --batch > 1 or a second helper tier\n");
++                // WHY refuse an in-process GPU tier beside the process tiers: the driver's rungs are the process tiers in list
++                // order, and a tier it does not drive would route cells nobody publishes.
++                if (o.batch > 1 || in_process_tier) {
++                    std::fprintf(stderr, "strata serve: --retier-promote seabraid: not with --batch > 1 or an in-process remote GPU tier beside the helper processes\n");
+                     return 2;
+                 }
+                 const auto& pol = o.retier.policy;
+                 placement_cfg.every_windows = (uint32_t) o.retier.every_windows;
+-                placement_cfg.policy = {SEABRAID_ABI_VERSION, (uint16_t) pol.max_moves_per_round, 1, (uint64_t) pol.cooldown_rounds,
+-                                        pol.promote_margin, pol.max_helper_layer_share};
+-                retier_re->attach_view(&placement_view, 1);   // no card claims a cell until the driver publishes
++                placement_cfg.policy = seabraid_placement_policy_v2{};
++                placement_cfg.policy.abi_version = SEABRAID_PLACEMENT_POLICY_V2_VERSION;
++                placement_cfg.policy.struct_size = sizeof placement_cfg.policy;
++                placement_cfg.policy.max_moves_per_round = (uint16_t) pol.max_moves_per_round;
++                placement_cfg.policy.ladder_boundaries = 0;   // every card boundary: k helpers are k - 1 more boundaries
++                placement_cfg.policy.fallback_boundary = (uint8_t) o.retier.fallback_boundary;
++                placement_cfg.policy.max_hops_per_round = (uint8_t) o.retier.max_hops;
++                placement_cfg.policy.cooldown_rounds = (uint64_t) pol.cooldown_rounds;
++                placement_cfg.policy.promote_margin = pol.promote_margin;
++                placement_cfg.policy.max_helper_layer_share = pol.max_helper_layer_share;
++                if (const char* q = std::getenv("SEABRAID_PLACEMENT_QUAL"); q != nullptr && *q) placement_cfg.qual_heat_path = q;
++                for (int r = 0; r < retier_count; ++r)   // no card claims a cell until the driver publishes
++                    retier_res[(size_t) r]->attach_view(&placement_view, (uint8_t) (r + 1));
+                 placement_on = true;
+-                std::fprintf(stderr, "strata serve: Seabraid placement: a round every %d windows, %d moves, margin %.2f, cooldown %d rounds, layer ceiling %.3f\n",
+-                             o.retier.every_windows, pol.max_moves_per_round, pol.promote_margin, pol.cooldown_rounds, pol.max_helper_layer_share);
++                std::fprintf(stderr, "strata serve: Seabraid placement: %d helper rung(s)%s, a round every %d windows, %d moves, hops %d, margin %.2f, cooldown %d rounds, layer ceiling %.3f\n",
++                             retier_count, o.retier.fallback_boundary ? " + fallback swaps" : "", o.retier.every_windows,
++                             pol.max_moves_per_round, o.retier.max_hops, pol.promote_margin, pol.cooldown_rounds, pol.max_helper_layer_share);
+ #else
+                 std::fprintf(stderr, "strata serve: --retier-promote seabraid needs a build with STRATA_SEABRAID_SOURCE_DIR\n");
+                 return 2;
+@@ -14353,9 +14401,20 @@ int main(int argc, char** argv) {
+         // The engine side of a placement round: the four facts only this file knows.  WHY NO HOST TEST: it lives in main, which
+         // no test can link; the live invariants (R10: no disagreement, no unexpected quarantine, equal table hashes) and the A/A arm cover it.
+         struct EngineHost final : seabraid::strata_adapter::PlacementHost {
+-            strata::core::RemoteExperts* helper; strata::core::FileExpertSource* ram; const std::vector<int32_t>* res; int64_t experts;
++            const std::array<strata::core::RemoteExperts*, 3>* helpers; const int* count;
++            strata::core::FileExpertSource* ram; const std::vector<int32_t>* res; int64_t experts;
+             bool said = false;
+-            EngineHost(strata::core::RemoteExperts* h, strata::core::FileExpertSource* r, const std::vector<int32_t>* t, int64_t e) : helper(h), ram(r), res(t), experts(e) {}
++            EngineHost(const std::array<strata::core::RemoteExperts*, 3>* h, const int* n, strata::core::FileExpertSource* r,
++                       const std::vector<int32_t>* t, int64_t e) : helpers(h), count(n), ram(r), res(t), experts(e) {}
++            strata::core::RemoteExperts* tier(uint8_t rung) const noexcept { return rung >= 1 && rung <= *count ? (*helpers)[rung - 1u] : nullptr; }
++            // Cheap, every tick (F11): a closed card or a retired private lease.  WHY no pid probe: a named helper is not our
++            // child, and a numeric probe can name a recycled pid.  seabraid_closed() folds in the exit watch bound to the helper's
++            // pid AND start time (wire v10), so a helper that exited reads closed within ~0.1 s, and a layer request it leaves
++            // unanswered closes the card at the layer deadline; the engine computes that card's rows itself and keeps serving.
++            bool helper_alive(uint8_t rung) noexcept override {
++                const auto* h = tier(rung);
++                return h != nullptr && h->seabraid_closed() == 0 && !(h->seabraid_ptr() && h->seabraid_ptr()->retired());
++            }
+             bool drain(std::string& err) noexcept override {   // the lead's streams idle; the helper's own drain is its swap (seabraid_retier / tier_swap refuse a pending request)
+                 const cudaError_t r = cudaDeviceSynchronize();
+                 if (r != cudaSuccess) err = cudaGetErrorString(r);
+@@ -14364,24 +14423,31 @@ int main(int argc, char** argv) {
+             void lead_cells(std::vector<uint8_t>& is_lead) noexcept override {
+                 for (size_t i = 0; i < res->size() && i < is_lead.size(); ++i) is_lead[i] = (*res)[i] >= 0;
+             }
+-            bool helper_cells(uint8_t, std::vector<uint8_t>& held) noexcept override {   // false: the tier is gone (closed card, retired lease)
+-                if (helper->seabraid_closed() != 0 || (helper->seabraid_ptr() && helper->seabraid_ptr()->retired())) return false;
++            bool helper_cells(uint8_t rung, std::vector<uint8_t>& held) noexcept override {   // false: the tier is gone (closed card, retired lease)
++                if (!helper_alive(rung)) return false;
++                const auto* helper = tier(rung);
+                 for (size_t i = 0; i < held.size(); ++i) held[i] = helper->physically_holds((int64_t) i / experts, (int32_t) ((int64_t) i % experts));
+                 return true;
+             }
+-            void after_commit(uint32_t layer, uint32_t up, uint32_t down) noexcept override {   // the RAM copy follows the helper set (as ram-adapt does)
++            void after_commit(const seabraid_placement_outcome_v1& o) noexcept override {   // the RAM copy follows the lead's complement
++                if (!seabraid::strata_adapter::ram_follows(o)) return;   // other boundaries: the lead is unchanged, F decides its own RAM
++                const uint32_t layer = o.layer, up = o.promote, down = o.displace;
+                 if (!ram->complement_ready() || !ram->has_resident(layer, up) || ram->has_resident(layer, down)) return;
+                 if (ram->replace_resident(layer, down, up) || said) return;
+                 said = true;   // loud once: the expert's prompt reads now go to the drive, decode is unaffected
+                 std::fprintf(stderr, "strata serve: placement: the RAM copy could not follow a commit (layer %u)\n", layer);
+             }
+-        } placement_host(retier_re, &src, &host_res, (int64_t) g.n_expert);
++        } placement_host(&retier_res, &retier_count, &src, &host_res, (int64_t) g.n_expert);
+         // First quiet boundary: host_res, the helper's held[] and res_upload are final here (like the legacy ladder's map).
+         auto open_placement = [&]() -> bool {
+             using namespace seabraid::strata_adapter;
+-            std::vector<uint8_t> owners((size_t) (g.n_layers * g.n_expert), 2);
+-            for (size_t i = 0; i < owners.size(); ++i)   // lead wins a duplicate, as routing resolves it
+-                owners[i] = host_res[i] >= 0 ? 0 : retier_re->physically_holds((int64_t) i / g.n_expert, (int32_t) ((int64_t) i % g.n_expert)) ? 1 : 2;
++            const uint8_t fallback = (uint8_t) (retier_count + 1);
++            std::vector<uint8_t> owners((size_t) (g.n_layers * g.n_expert), fallback);
++            for (size_t i = 0; i < owners.size(); ++i) {   // the lead wins a duplicate, then the lowest rung, as routing resolves it
++                if (host_res[i] >= 0) { owners[i] = 0; continue; }
++                for (int r = 0; r < retier_count; ++r)
++                    if (retier_res[(size_t) r]->physically_holds((int64_t) i / g.n_expert, (int32_t) ((int64_t) i % g.n_expert))) { owners[i] = (uint8_t) (r + 1); break; }
++            }
+             std::vector<size_t> slot_bytes;
+             for (int64_t l = 0; l < g.n_layers; ++l) slot_bytes.push_back((size_t) strata::kernels::cpu::expert_layout().blob_bytes(l));
+             placement_lead = std::make_unique<strata::core::PrimaryRung>(xcache, host_res, g.n_expert, [&](std::string& e) {
+@@ -14390,14 +14456,21 @@ int main(int argc, char** argv) {
+                 return r == cudaSuccess;
+             });
+             std::string e;
+-            if (auto* tier = retier_re->seabraid_ptr()) {   // private: the lease swaps slots, each layer with its own blob size; named: the channel does
+-                // WHY the size check: a layer whose blob size the engine reports differently from the table must refuse, not stage a torn blob.
+-                placement_helper = PrivateHelperRung::open(*tier, [&](int64_t l, int64_t x, uint8_t* d, size_t n) {
+-                                                               return n == (size_t) strata::kernels::cpu::expert_layout().blob_bytes(l) && src.copy_blob(l, x, d);
+-                                                           }, (size_t) g.n_layers, slot_bytes, placement_cfg.helper_op_timeout_ms, e);
+-            } else placement_helper = std::make_unique<strata::core::RemoteRung>(*retier_re, src);
++            std::vector<strata::core::RungIO*> cards{placement_lead.get()};
++            for (int r = 0; r < retier_count && e.empty(); ++r) {
++                auto* re = retier_res[(size_t) r];
++                if (auto* tier = re->seabraid_ptr()) {   // private (tier 0 only, phase 2 for k): the lease swaps slots, each layer its own blob size
++                    // WHY the size check: a layer whose blob size the engine reports differently from the table must refuse, not stage a torn blob.
++                    placement_helpers.push_back(PrivateHelperRung::open(*tier, [&](int64_t l, int64_t x, uint8_t* d, size_t n) {
++                                                                            return n == (size_t) strata::kernels::cpu::expert_layout().blob_bytes(l) && src.copy_blob(l, x, d);
++                                                                        }, (size_t) g.n_layers, slot_bytes, placement_cfg.helper_op_timeout_ms, e));
++                } else placement_helpers.push_back(std::make_unique<strata::core::RemoteRung>(*re, src, placement_cfg.verify_writes));
++                cards.push_back(placement_helpers.back().get());
++            }
++            // The fallback rung (RAM copy + the pack) takes part only with --retier-fallback 1; bound either way, never planned otherwise.
++            placement_fallback = std::make_unique<strata::core::FallbackRung>(src, placement_ram_excludes_helpers);
+             if (e.empty()) placement = PlacementDriver::open((uint32_t) g.n_layers, (uint32_t) g.n_expert, std::move(owners),
+-                {placement_lead.get(), placement_helper.get()}, std::move(slot_bytes), placement_cfg, placement_view, e);
++                std::move(cards), placement_fallback.get(), std::move(slot_bytes), placement_cfg, placement_view, e);
+             if (!placement) std::fprintf(stderr, "strata serve: placement: %s\n", e.c_str());
+             return placement != nullptr;
+         };
+@@ -20872,6 +20945,18 @@ int main(int argc, char** argv) {
+                     const char* e = std::getenv("STRATA_RAM_ADAPT");
+                     return e != nullptr ? std::max(0, std::atoi(e)) : 0;
+                 }();
++                // Pyramid: with SEABRAID_STRATA_EXCLUDE_HELPER_RAM=1 a cell a helper executes is never a RAM candidate (in or out) and
++                // an install never lands on one; before, only the lead's cells were skipped (r[e] >= 0).
++                std::vector<int32_t> ram_res;   // host_res with every helper-executed cell marked taken (empty: host_res as is)
++                auto helper_cell = [&](int64_t l, int64_t e) {
++#if defined(STRATA_HAVE_SEABRAID_RETIER) && defined(STRATA_HAVE_SEABRAID)
++                    if (placement && placement_ram_excludes_helpers)
++                        for (int r = 0; r < retier_count; ++r)
++                            if (placement_view.routes_to(l, e, (uint8_t) (r + 1))) return true;
++#endif
++                    (void) l; (void) e;
++                    return false;
++                };
+                 if (ram_adapt_n > 0 && ram_adapt2.on && !first_window && !drive.d.usage.empty() && pending.empty() &&
+                     (!ajob || astate == AState::Idle) && src.complement_ready() && !multi_gpu && !peer.valid() &&
+                     !remote_opt && o.batch == 0) {
+@@ -20881,7 +20966,12 @@ int main(int argc, char** argv) {
+                     // a drive read, one in the page cache STRATA_RAM_ADAPT_CACHED_W of that), against what the evicted
+                     // one is expected to cost; up to STRATA_RAM_ADAPT_PER_LAYER pairs a layer.  The reads run on the
+                     // source's I/O thread, not here.
+-                    ram_adapt2.installed += src.ram_install(host_res.data(), g.n_expert);
++                    for (int64_t i = 0; i < g.n_layers * g.n_expert; ++i)
++                        if (helper_cell(i / g.n_expert, i % g.n_expert)) {
++                            if (ram_res.empty()) ram_res = host_res;
++                            ram_res[(size_t) i] = 0;
++                        }
++                    ram_adapt2.installed += src.ram_install(ram_res.empty() ? host_res.data() : ram_res.data(), g.n_expert);
+                     for (float& x : ram_adapt2.seed) x *= 0.95f;
+                     struct Cand { float score; int32_t e; };
+                     struct RamSwap2 { float gain; int32_t layer, in, out; };
+@@ -20894,7 +20984,7 @@ int main(int argc, char** argv) {
+                         ins.clear();
+                         outs.clear();
+                         for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+-                            if (r[e] >= 0) continue;   // in VRAM
++                            if (r[e] >= 0 || helper_cell(l, e)) continue;   // in VRAM (the lead's or a helper's)
+                             const float ue = u[e] + (sd != nullptr ? sd[e] : 0.0f);
+                             if (src.has_resident(l, e)) outs.push_back({ue, e});
+                             else if (ue >= 2.0f) ins.push_back({ue, e});
+@@ -20961,7 +21051,7 @@ int main(int argc, char** argv) {
+                         ins.clear();
+                         outs.clear();
+                         for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+-                            if (r[e] >= 0) continue;   // in VRAM: the RAM copy does not hold it
++                            if (r[e] >= 0 || helper_cell(l, e)) continue;   // in VRAM (the lead's or a helper's): the RAM copy does not hold it
+                             if (src.has_resident(l, e)) outs.push_back(e);
+                             else if (u[e] >= kRamAdaptRouted) ins.push_back(e);
+                         }
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Seabraid <seabraid@example.invalid>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH 3/3] Strata: file-reference expert moves
+ (--retier-file-moves), the counters and checks that go with them
+
+Target: commit 3 of this series, on the Seabraid compatibility patches 0001-0006 and 0010-0018 (0018: FileExpertSource::file_extents,
+RemoteExperts::seabraid_retier_file) and commits 1-2 of this file.
+
+- ownership_map.hpp: RungIO::replace_from_fallback (default REFUSED: "this rung reads no files") and RungIO::reads_files(); two small
+  interfaces, FileMover (one helper rung's decision) and ReadCheck (main's own read against the pack manifest), both implemented by
+  the Seabraid adapter (adapters/strata/file_moves.hpp) so the rule is host-tested and this file stays free of the helper wire.
+- ownership_rungs: RemoteRung forwards replace_from_fallback to its FileMover and reports reads_files() from it; its stage() asks the
+  ReadCheck after copy_blob (a mismatch is REFUSED: the cell never moves, serving is unchanged).  FallbackRung::stage asks the same
+  check, and counts the RAM installs that did not happen (ram_install_misses(), one WARN each) that used to be silent.
+- remote_experts: seabraid_file_facts() (what the helper announced, plus its cumulative file counters); open_seabraid takes
+  compact_rows.
+- generate.cpp: --seabraid-compact-rows 0|1 (adapters/strata/engine_flags.hpp; default 0) now reaches the private helper launch, which
+  used to hard-code it off; --retier-file-moves is the compat add-on's flag (refused without --retier-promote seabraid).  At the first
+  quiet boundary open_placement stamps the pack's files, loads expert-sums.v1 ONCE (missing, malformed or stale: file moves OFF with
+  one WARN, serving unchanged), gives every named helper a FileMoves over an EngineFileBackend, and hands the fallback rung the same
+  read check.  EngineHost::after_round logs "helper file io: direct_bytes=N buffered_bytes=N reads=N bad_sum=N" (cumulative, summed over
+  helpers; nothing when file moves are off).  TRACE handover: placement_cfg.fallback_counters is set from the FallbackRung.  REVFIX
+  handover: the private tier gets set_blob_bytes(per-layer blob bytes) before its first swap, so the exact-size blob check is live.
+
+Design gate.
+  Owner    : the rule is adapters/strata/file_moves.cpp (PackSums, FileMoves); the addressing is FileExpertSource::file_extents (0018);
+             the FileRef rules are the wire's file_ref_valid (run by seabraid_retier_file); the engine only answers facts.
+  Contract : RungIO::replace_from_fallback + reads_files; FileMover; ReadCheck.  REFUSED always means "use bytes" and writes nothing.
+  Size     : the engine side of this commit is under 260 changed lines; every new adapter file is under its header budget.
+  Failure  : fail open to bytes.  Manifest missing/stale = one WARN, off.  Helper bad sum = off for that helper for the session + one
+             WARN.  Main-side mismatch = ERROR, the cell keeps serving and never moves.  Timeout or torn slot = as for a blob swap.
+  Checker  : adapters/strata file_moves_test, placement_file_moves_test (real runtime), engine_flags_test, placement_trace_test;
+             compat retier_loop_test and test_patch_v7_commit3.py.
+  Finish   : git am 0001..0018 then this mbox on STRATA_BASE; generate.cpp syntax check shows no new errors; the adapter tests pass.
+             The live qualification (a GPU window) is not part of this commit.
+---
+ include/strata/core/ownership_map.hpp   | 30 +++++++++
+ include/strata/core/ownership_rungs.hpp | 16 ++++-
+ include/strata/core/remote_experts.hpp  | 17 +++++-
+ src/core/ownership_rungs.cpp            | 22 ++++++-
+ src/core/remote_seabraid.cpp            |  6 +-
+ src/program/generate.cpp                | 81 +++++++++++++++++++++++--
+ 6 files changed, 159 insertions(+), 13 deletions(-)
+
+diff --git a/include/strata/core/ownership_map.hpp b/include/strata/core/ownership_map.hpp
+index 305acc5bc..e7e3e6962 100644
+--- a/include/strata/core/ownership_map.hpp
++++ b/include/strata/core/ownership_map.hpp
+@@ -31,6 +31,7 @@
+ //
+ // THREADING.  Not synchronised.  The caller drives it from ONE thread at a window boundary with layer requests
+ // drained and admission closed (in the engine: the engine thread, where every RungIO write already has to happen).
++#include <cstddef>
+ #include <cstdint>
+ #include <string>
+ #include <vector>
+@@ -57,6 +58,35 @@ public:
+     // which is how a torn slot is restored.  The view moves ONLY on kOk.
+     virtual IoStatus replace(int32_t layer, int32_t old_e, int32_t new_e, const std::vector<uint8_t>& bytes,
+                              std::string& err) = 0;
++    // FILE MOVES: replace(), but the caller supplies no bytes; the rung loads new_e itself from the pack (a helper reads the
++    // model file).  kRefused means "use bytes": NOTHING was written and the caller (Seabraid's swap) runs stage + replace in
++    // the same swap, so a refusal is not a failure and must not be logged as one.  Default: this rung reads no files.
++    // WHY on RungIO and not a subclass: Seabraid's provider asks every masked rung through one callback.
++    virtual IoStatus replace_from_fallback(int32_t /*layer*/, int32_t /*old_e*/, int32_t /*new_e*/, std::string& err) {
++        err = "this rung reads no files";
++        return IoStatus::kRefused;
++    }
++    // Whether replace_from_fallback() may succeed right now (file moves on, not switched off for this rung).  The adapter
++    // builds the provider's rung mask from it before every apply, so a rung that turns itself off leaves the mask at once.
++    virtual bool reads_files() const { return false; }
++};
++
++// FILE MOVES: the rule behind one helper rung's replace_from_fallback, implemented by the Seabraid adapter
++// (adapters/strata/file_moves.hpp) so it is host-testable and this file stays free of Seabraid and of the helper wire.
++class FileMover {
++public:
++    virtual ~FileMover() = default;
++    virtual bool active() const = 0;
++    virtual IoStatus move(int32_t layer, int32_t old_e, int32_t new_e, std::string& err) = 0;
++};
++
++// FILE MOVES: checks main's OWN read of a blob against the pack's manifest (the same sums a helper's file read is checked
++// with).  false = the pack's bytes for this cell disagree with the manifest: the caller refuses to stage it and the cell
++// never moves; serving it from the pack is unchanged.
++class ReadCheck {
++public:
++    virtual ~ReadCheck() = default;
++    virtual bool read_ok(int32_t layer, int32_t expert, const uint8_t* bytes, size_t n, std::string& err) = 0;
+ };
+ 
+ // A same-layer exchange across ONE rung boundary: `up` moves from rung hi + 1 to rung hi, `down` from hi to hi + 1.
+diff --git a/include/strata/core/ownership_rungs.hpp b/include/strata/core/ownership_rungs.hpp
+index 0c1349d20..9831e4556 100644
+--- a/include/strata/core/ownership_rungs.hpp
++++ b/include/strata/core/ownership_rungs.hpp
+@@ -56,11 +56,19 @@ public:
+     RemoteRung(RemoteExperts& re, ExpertSource& src, bool send_bytes = true) : re_(re), src_(src), send_bytes_(send_bytes) {}
+     IoStatus stage(int32_t layer, int32_t expert, std::vector<uint8_t>& out, std::string& err) override;
+     IoStatus replace(int32_t layer, int32_t old_e, int32_t new_e, const std::vector<uint8_t>& bytes, std::string& err) override;
++    // FILE MOVES (--retier-file-moves): the helper reads the expert from the model file itself (wire v9 kTierSwapFile).  The rule
++    // and the send live in `mover` (the adapter's FileMoves), the manifest check of main's own read in `check`; both are borrowed
++    // and may be null (file moves off: replace_from_fallback REFUSES, stage is unchecked).
++    void set_file_moves(FileMover* mover, ReadCheck* check) { mover_ = mover; check_ = check; }
++    IoStatus replace_from_fallback(int32_t layer, int32_t old_e, int32_t new_e, std::string& err) override;
++    bool reads_files() const override { return mover_ != nullptr && mover_->active(); }
+ 
+ private:
+     RemoteExperts& re_;
+     ExpertSource& src_;
+     bool send_bytes_;
++    FileMover* mover_ = nullptr;
++    ReadCheck* check_ = nullptr;
+ };
+ 
+ // The fallback rung F (the engine executes it: the RAM copy and the pack on NVMe), live only on a placement handle opened
+@@ -81,11 +89,17 @@ public:
+     int64_t ram_hits() const { return ram_hits_; }       ///< stages served from the RAM copy (cumulative)
+     int64_t file_reads() const { return file_reads_; }   ///< stages read from the pack, i.e. NVMe -> card moves (cumulative)
+     int64_t ram_installs() const { return ram_installs_; }   ///< replaces that gave a RAM place to the arriving expert
++    /// replaces that wanted to give a RAM place to the arriving expert and could not (replace_resident_from said no); the swap
++    /// still commits, the arriving expert is then served from the pack.  Cumulative; each one logs a WARN.
++    int64_t ram_install_misses() const { return ram_install_misses_; }
++    /// FILE MOVES: with a manifest loaded, stage() checks main's own read of the blob against it (see ReadCheck); null = unchecked.
++    void set_read_check(ReadCheck* check) { check_ = check; }
+ 
+ private:
+     FileExpertSource& src_;
+     bool excludes_helper_ram_;
+-    int64_t ram_hits_ = 0, file_reads_ = 0, ram_installs_ = 0;
++    int64_t ram_hits_ = 0, file_reads_ = 0, ram_installs_ = 0, ram_install_misses_ = 0;
++    ReadCheck* check_ = nullptr;
+ };
+ 
+ // The ownership snapshot of a two-card engine as routing really resolves it today: card 1 (rung 0) if the engine's own
+diff --git a/include/strata/core/remote_experts.hpp b/include/strata/core/remote_experts.hpp
+index 29322dd44..2b390a469 100644
+--- a/include/strata/core/remote_experts.hpp
++++ b/include/strata/core/remote_experts.hpp
+@@ -43,7 +43,7 @@ public:
+     bool open_seabraid(const char* helper, const std::string& pack, const std::string& native,
+                    int slots, int64_t layers, int64_t experts,
+                    const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
+-                   std::vector<uint8_t>& claimed, std::string& err);
++                   std::vector<uint8_t>& claimed, std::string& err, bool compact_rows = false);
+     void close();
+     void disable_seabraid() noexcept;
+     bool seabraid_tier() const { return seabraid_ != nullptr; }
+@@ -118,6 +118,21 @@ public:
+         ms_begin = (double) h->svc_begin_ns.load(std::memory_order_relaxed) / 1e6;
+     }
+ 
++    /// seabraid wire v9 (file moves): what the helper announced it can do with the model file, and its cumulative file-read counters.
++    /// `io` is a seabraid::FileIo (0: it serves no file moves); `count` / `table_id` identify the files it opened (main compares them
++    /// with the manifest's).  Zeros without a channel.  A snapshot: the helper's counters keep moving.
++    struct FileFacts { int32_t io = 0, count = 0; uint64_t table_id = 0, direct_bytes = 0, buffered_bytes = 0, reads = 0; };
++    FileFacts seabraid_file_facts() const {
++        FileFacts f;
++        if (!bl_) return f;
++        const auto* h = bl_->header();
++        f.io = h->file_io; f.count = h->file_count; f.table_id = h->file_table_id;
++        f.direct_bytes = __atomic_load_n(&h->file_direct_bytes, __ATOMIC_RELAXED);
++        f.buffered_bytes = __atomic_load_n(&h->file_buffered_bytes, __ATOMIC_RELAXED);
++        f.reads = __atomic_load_n(&h->file_reads, __ATOMIC_RELAXED);
++        return f;
++    }
++
+     /// STRATA_PREFILL_HELPER_SOURCE (opt-in): copy up to `n` cached blobs into the host buffers `dst[i]`
+     /// on this helper's own stream and wait.  `hit[i]` is set where this helper held (layer, expert); the
+     /// bytes are the ones open() filled from the same source, so the prompt path gets identical bytes.
+diff --git a/src/core/ownership_rungs.cpp b/src/core/ownership_rungs.cpp
+index ae0e382cf..364a7e9e8 100644
+--- a/src/core/ownership_rungs.cpp
++++ b/src/core/ownership_rungs.cpp
+@@ -9,6 +9,8 @@
+ 
+ #include <cuda_runtime.h>
+ 
++#include <cstdio>
++
+ namespace strata::core {
+ 
+ namespace {
+@@ -85,9 +87,16 @@ IoStatus RemoteRung::stage(int32_t layer, int32_t expert, std::vector<uint8_t>&
+         out.clear();
+         return IoStatus::kRefused;
+     }
++    // A manifest is loaded: main's own read must be the expert the manifest names, or this cell never moves (still served as ever).
++    if (check_ != nullptr && !check_->read_ok(layer, expert, out.data(), out.size(), err)) { out.clear(); return IoStatus::kRefused; }
+     return IoStatus::kOk;
+ }
+ 
++IoStatus RemoteRung::replace_from_fallback(int32_t layer, int32_t old_e, int32_t new_e, std::string& err) {
++    if (mover_ == nullptr || re_.seabraid_closed() != 0) { err = "file moves are off for this card"; return IoStatus::kRefused; }
++    return mover_->move(layer, old_e, new_e, err);   // REFUSED = bytes follow in the same swap; the mover maps the helper's answer
++}
++
+ IoStatus RemoteRung::replace(int32_t layer, int32_t old_e, int32_t new_e, const std::vector<uint8_t>& bytes, std::string& err) {
+     // An in-place rewrite would be SWAP(old, old), which ExpertCache::replace turns into "not resident"; the map never
+     // asks a channel card for one (it closes a torn channel card instead), and this refuses it in case that changes.
+@@ -122,6 +131,7 @@ IoStatus FallbackRung::stage(int32_t layer, int32_t expert, std::vector<uint8_t>
+         out.clear();
+         return IoStatus::kRefused;
+     }
++    if (check_ != nullptr && !check_->read_ok(layer, expert, out.data(), out.size(), err)) { out.clear(); return IoStatus::kRefused; }
+     ++(ram ? ram_hits_ : file_reads_);
+     return IoStatus::kOk;
+ }
+@@ -137,9 +147,15 @@ IoStatus FallbackRung::replace(int32_t layer, int32_t old_e, int32_t new_e, cons
+     }
+     // WHY ACK without touching RAM otherwise: F serves every cell from the pack, so "F now serves new" is already true;
+     // a failed install below leaves the copy exactly as it was (install_resident is one copy into a 1:1 place, or nothing).
+-    if (excludes_helper_ram_ && src_.has_resident(layer, old_e) && !src_.has_resident(layer, new_e) &&
+-        src_.replace_resident_from(layer, new_e, old_e, bytes.data()))
+-        ++ram_installs_;
++    if (excludes_helper_ram_ && src_.has_resident(layer, old_e) && !src_.has_resident(layer, new_e)) {
++        if (src_.replace_resident_from(layer, new_e, old_e, bytes.data())) {
++            ++ram_installs_;
++        } else {   // WHY count and say: a silent miss reads as "RAM follows" while the arriving expert is quietly served from the pack
++            ++ram_install_misses_;
++            std::fprintf(stderr, "strata serve: WARN placement: the RAM copy could not take layer %d expert %d (swap still commits; served from the pack), %lld so far\n",
++                         (int) layer, (int) new_e, (long long) ram_install_misses_);
++        }
++    }
+     return IoStatus::kOk;
+ }
+ 
+diff --git a/src/core/remote_seabraid.cpp b/src/core/remote_seabraid.cpp
+index f9378c967..2754db14b 100644
+--- a/src/core/remote_seabraid.cpp
++++ b/src/core/remote_seabraid.cpp
+@@ -52,7 +52,7 @@ seabraid::strata_adapter::PrivateQwenPlan select_plan(
+ bool RemoteExperts::open_seabraid(const char* helper, const std::string& pack, const std::string& native,
+                               int slots, int64_t layers, int64_t experts,
+                               const std::vector<std::pair<int32_t, int32_t>>& ranked,
+-                              const ExpertCache& primary, std::vector<uint8_t>& claimed, std::string& err) {
++                              const ExpertCache& primary, std::vector<uint8_t>& claimed, std::string& err, bool compact_rows) {
+     if (kCompiledGeometry.n_expert_used != RemoteExpertOpt::routing_width()) {
+         err = "Seabraid Qwen requires the compiled top-k to match Strata's weighted reducer";
+         return false;
+@@ -66,7 +66,7 @@ bool RemoteExperts::open_seabraid(const char* helper, const std::string& pack, c
+ 
+     const auto plan = select_plan(slots, ranked, primary, claimed);
+     // Keep the engine's spelling because relative native shard lookup depends on the first shard's directory.
+-    const seabraid::strata_adapter::PrivateQwenLaunch launch{helper ? helper : "", pack, native, 0, 60000, 1800000};
++    const seabraid::strata_adapter::PrivateQwenLaunch launch{helper ? helper : "", pack, native, 0, 60000, 1800000, compact_rows};   // --seabraid-compact-rows
+     auto tier = seabraid::strata_adapter::QwenDecodeTier::start(launch, plan, 30000, err);
+     if (!tier) return false;
+     bl_resident_ = 0;
+@@ -111,7 +111,7 @@ bool RemoteExperts::seabraid_owns(size_t index) const {
+ #else
+ bool RemoteExperts::open_seabraid(const char*, const std::string&, const std::string&, int, int64_t, int64_t,
+                               const std::vector<std::pair<int32_t, int32_t>>&, const ExpertCache&,
+-                              std::vector<uint8_t>&, std::string& err) {
++                              std::vector<uint8_t>&, std::string& err, bool) {
+     err = "SEABRAID_QWEN_HELPER requires a build with STRATA_SEABRAID_SOURCE_DIR";
+     return false;
+ }
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index f2904bac6..8edf29bb7 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -64,6 +64,9 @@
+ #if defined(STRATA_HAVE_SEABRAID)
+ #include "placement_driver.hpp"     // --retier-promote seabraid: the one fenced round (adapters/strata)
+ #include "private_helper_rung.hpp"
++#include "engine_flags.hpp"   // --seabraid-compact-rows (adapters/strata)
++#include "file_moves.hpp"     // --retier-file-moves: the manifest and the per-helper decision
++#include "strata/seabraid/file_stamp.hpp"
+ #endif
+ #endif
+ #include "strata/core/on_device.hpp"
+@@ -1070,6 +1073,9 @@ struct Options {
+     bool vision = false;
+ #if defined(STRATA_HAVE_SEABRAID_RETIER)
+     seabraid::RetierConfig retier;   ///< --retier*: seabraid D7 live re-tiering (default off; strata-ext/include/strata/seabraid/retier_loop.hpp)
++#endif
++#if defined(STRATA_HAVE_SEABRAID)
++    seabraid::strata_adapter::EngineFlags seabraid;   ///< --seabraid-*: the adapter's own flags (adapters/strata/engine_flags.hpp)
+ #endif
+     int adapt_swaps = 96;
+     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole
+@@ -1471,6 +1477,9 @@ void usage() {
+ #if defined(STRATA_HAVE_SEABRAID_RETIER)
+     std::fputs(seabraid::retier_help(), stderr);
+ #endif
++#if defined(STRATA_HAVE_SEABRAID)
++    std::fputs(seabraid::strata_adapter::engine_flags_help(), stderr);
++#endif
+ }
+ 
+ // --lookup-chain: the context's last tokens for the draft sources (at most 64), the MTP's pending drafts last
+@@ -3683,6 +3692,9 @@ int main(int argc, char** argv) {
+     bool ram_keep_by_flag = false;
+ #if defined(STRATA_HAVE_SEABRAID_RETIER)
+     std::string retier_err;
++#endif
++#if defined(STRATA_HAVE_SEABRAID)
++    std::string seabraid_err;
+ #endif
+     for (int i = 1; i < argc; ++i) {
+         const std::string a = argv[i];
+@@ -4076,6 +4088,11 @@ int main(int argc, char** argv) {
+         else if (const int rr = seabraid::retier_parse_flag(a, next, o.retier, retier_err); rr != 0) {
+             if (rr == 2) { std::fprintf(stderr, "strata generate: %s\n", retier_err.c_str()); return 2; }
+         }
++#endif
++#if defined(STRATA_HAVE_SEABRAID)
++        else if (const int sr = seabraid::strata_adapter::parse_engine_flag(a, next, o.seabraid, seabraid_err); sr != 0) {
++            if (sr == 2) { std::fprintf(stderr, "strata generate: %s\n", seabraid_err.c_str()); return 2; }
++        }
+ #endif
+         else {
+             // An unknown flag is an ERROR and not a warning: a typo'd `--max-neww` that silently generated 16
+@@ -9684,7 +9701,7 @@ int main(int argc, char** argv) {
+             auto& tier = remote_experts[(size_t) r];
+             const bool opened = seabraid_helper && r == 0
+                 ? tier.open_seabraid(seabraid_helper, o.pack, o.native_preset, o.expert_cache_remote[0],
+-                                 g.n_layers, g.n_expert, by_device[0], xcache, claimed, err)
++                                 g.n_layers, g.n_expert, by_device[0], xcache, claimed, err, o.seabraid.compact_rows)
+                 : tier.open(remote_dev[r], o.expert_cache_remote[(size_t) r], g.n_layers, g.n_expert,
+                             by_device[(size_t) r], xcache, *srcp, claimed, err,
+                             o.expert_cache_remote_auto[(size_t) r]);
+@@ -9768,6 +9785,10 @@ int main(int argc, char** argv) {
+     seabraid::strata_adapter::PlacementDriverConfig placement_cfg;
+     std::unique_ptr<strata::core::RungIO> placement_lead, placement_fallback;
+     std::vector<std::unique_ptr<strata::core::RungIO>> placement_helpers;
++    // --retier-file-moves: the pack's manifest (null = off), one FileMoves per named helper, and the list the counter line sums.
++    std::shared_ptr<seabraid::strata_adapter::PackSums> placement_sums;
++    std::vector<std::unique_ptr<seabraid::strata_adapter::FileMoves>> placement_file_movers;
++    std::vector<const seabraid::strata_adapter::FileMoves*> placement_file_io;
+     std::unique_ptr<seabraid::strata_adapter::PlacementDriver> placement;
+     bool placement_on = false;
+     // SEABRAID_STRATA_EXCLUDE_HELPER_RAM=1 (the installer default): the RAM copy holds no helper-executed expert, so the fallback
+@@ -14400,12 +14421,41 @@ int main(int argc, char** argv) {
+ #if defined(STRATA_HAVE_SEABRAID_RETIER) && defined(STRATA_HAVE_SEABRAID)
+         // The engine side of a placement round: the four facts only this file knows.  WHY NO HOST TEST: it lives in main, which
+         // no test can link; the live invariants (R10: no disagreement, no unexpected quarantine, equal table hashes) and the A/A arm cover it.
++        // FILE MOVES: the engine facts the adapter's FileMoves asks for (the rule is adapters/strata/file_moves.cpp, host-tested; this only
++        // answers from RemoteExperts and the file source).  The extents are copied field by field: Strata's FileExtent and the wire's are
++        // two types with one layout.
++        struct EngineFileBackend final : seabraid::strata_adapter::FileBackend {
++            strata::core::RemoteExperts& re; strata::core::FileExpertSource& source;
++            EngineFileBackend(strata::core::RemoteExperts& r, strata::core::FileExpertSource& s) : re(r), source(s) {}
++            HelperFacts helper_facts() noexcept override {
++                const auto f = re.seabraid_file_facts();
++                return {f.io, f.count, f.table_id, f.direct_bytes, f.buffered_bytes, f.reads};
++            }
++            bool extents(int32_t l, int32_t e, seabraid::FileExtent out[3], int& n) override {
++                strata::core::FileExpertSource::FileExtent x[3];
++                if (!source.file_extents(l, e, x, n)) return false;
++                for (int i = 0; i < n; ++i) out[i] = {x[i].file, x[i].length, x[i].offset};
++                return true;
++            }
++            bool in_ram(int32_t l, int32_t e) override { return source.has_resident(l, e); }
++            bool send(int32_t l, int32_t old_e, int32_t new_e, const seabraid::FileRef& ref, const uint64_t* sizes, int32_t count,
++                      uint8_t& res, std::string& err) override {
++                seabraid::TierWireOp op{};
++                op.kind = seabraid::kTierSwap; op.helper = 0;
++                op.layer_old = l; op.expert_old = old_e; op.layer_new = l; op.expert_new = new_e;
++                return re.seabraid_retier_file(op, ref, sizes, count, res, err);
++            }
++            int closed() noexcept override { return re.seabraid_closed(); }
++        };
+         struct EngineHost final : seabraid::strata_adapter::PlacementHost {
+             const std::array<strata::core::RemoteExperts*, 3>* helpers; const int* count;
+             strata::core::FileExpertSource* ram; const std::vector<int32_t>* res; int64_t experts;
++            const std::vector<const seabraid::strata_adapter::FileMoves*>* file_io;
+             bool said = false;
+             EngineHost(const std::array<strata::core::RemoteExperts*, 3>* h, const int* n, strata::core::FileExpertSource* r,
+-                       const std::vector<int32_t>* t, int64_t e) : helpers(h), count(n), ram(r), res(t), experts(e) {}
++                       const std::vector<int32_t>* t, int64_t e, const std::vector<const seabraid::strata_adapter::FileMoves*>* io)
++                : helpers(h), count(n), ram(r), res(t), experts(e), file_io(io) {}
++            void after_round() noexcept override { seabraid::strata_adapter::log_file_io(*file_io); }   // an empty list (file moves off) logs nothing
+             strata::core::RemoteExperts* tier(uint8_t rung) const noexcept { return rung >= 1 && rung <= *count ? (*helpers)[rung - 1u] : nullptr; }
+             // Cheap, every tick (F11): a closed card or a retired private lease.  WHY no pid probe: a named helper is not our
+             // child, and a numeric probe can name a recycled pid.  seabraid_closed() folds in the exit watch bound to the helper's
+@@ -14437,7 +14487,7 @@ int main(int argc, char** argv) {
+                 said = true;   // loud once: the expert's prompt reads now go to the drive, decode is unaffected
+                 std::fprintf(stderr, "strata serve: placement: the RAM copy could not follow a commit (layer %u)\n", layer);
+             }
+-        } placement_host(&retier_res, &retier_count, &src, &host_res, (int64_t) g.n_expert);
++        } placement_host(&retier_res, &retier_count, &src, &host_res, (int64_t) g.n_expert, &placement_file_io);
+         // First quiet boundary: host_res, the helper's held[] and res_upload are final here (like the legacy ladder's map).
+         auto open_placement = [&]() -> bool {
+             using namespace seabraid::strata_adapter;
+@@ -14456,19 +14506,40 @@ int main(int argc, char** argv) {
+                 return r == cudaSuccess;
+             });
+             std::string e;
++            if (o.retier.file_moves != 0) {   // read ONCE, here; a missing or stale manifest turns file moves off with one WARN, never a refusal
++                PackSums::Facts facts;
++                facts.layers = g.n_layers; facts.experts = g.n_expert;
++                for (const size_t b : slot_bytes) facts.blob_bytes.push_back((uint32_t) b);
++                std::string serr;
++                if (seabraid::sums::stamp_files(src.file_paths(), facts.files, serr)) placement_sums = PackSums::load(PackSums::pack_file(o.pack), facts);
++                else std::fprintf(stderr, "strata serve: WARN file moves OFF: %s\n", serr.c_str());
++            }
+             std::vector<strata::core::RungIO*> cards{placement_lead.get()};
+             for (int r = 0; r < retier_count && e.empty(); ++r) {
+                 auto* re = retier_res[(size_t) r];
+                 if (auto* tier = re->seabraid_ptr()) {   // private (tier 0 only, phase 2 for k): the lease swaps slots, each layer its own blob size
++                    tier->set_blob_bytes(slot_bytes);   // the exact-size check of every blob swap is live in production (a short blob would leave a torn tail)
+                     // WHY the size check: a layer whose blob size the engine reports differently from the table must refuse, not stage a torn blob.
+                     placement_helpers.push_back(PrivateHelperRung::open(*tier, [&](int64_t l, int64_t x, uint8_t* d, size_t n) {
+                                                                             return n == (size_t) strata::kernels::cpu::expert_layout().blob_bytes(l) && src.copy_blob(l, x, d);
+                                                                         }, (size_t) g.n_layers, slot_bytes, placement_cfg.helper_op_timeout_ms, e));
+-                } else placement_helpers.push_back(std::make_unique<strata::core::RemoteRung>(*re, src, placement_cfg.verify_writes));
++                } else {
++                    auto rung = std::make_unique<strata::core::RemoteRung>(*re, src, placement_cfg.verify_writes);
++                    if (placement_sums) {   // a named helper and a fresh manifest: it may load promoted experts from the model file itself
++                        placement_file_movers.push_back(std::make_unique<FileMoves>(placement_sums, std::make_unique<EngineFileBackend>(*re, src), (unsigned) (r + 1)));
++                        placement_file_io.push_back(placement_file_movers.back().get());
++                        rung->set_file_moves(placement_file_movers.back().get(), placement_sums.get());
++                    }
++                    placement_helpers.push_back(std::move(rung));
++                }
+                 cards.push_back(placement_helpers.back().get());
+             }
+             // The fallback rung (RAM copy + the pack) takes part only with --retier-fallback 1; bound either way, never planned otherwise.
+-            placement_fallback = std::make_unique<strata::core::FallbackRung>(src, placement_ram_excludes_helpers);
++            auto fallback_rung = std::make_unique<strata::core::FallbackRung>(src, placement_ram_excludes_helpers);
++            if (placement_sums) fallback_rung->set_read_check(placement_sums.get());   // main's own pack reads are checked against the manifest
++            // TRACE: a round record says how many fallback stages came from RAM and how many from the drive (the silent install misses WARN).
++            placement_cfg.fallback_counters = [fb = fallback_rung.get()](int64_t& ram, int64_t& file) { ram = fb->ram_hits(); file = fb->file_reads(); };
++            placement_fallback = std::move(fallback_rung);
+             if (e.empty()) placement = PlacementDriver::open((uint32_t) g.n_layers, (uint32_t) g.n_expert, std::move(owners),
+                 std::move(cards), placement_fallback.get(), std::move(slot_bytes), placement_cfg, placement_view, e);
+             if (!placement) std::fprintf(stderr, "strata serve: placement: %s\n", e.c_str());

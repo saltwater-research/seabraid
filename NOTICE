@@ -1,0 +1,87 @@
+Seabraid
+Copyright 2026 Saltwater Research LLC
+
+This product is created by Saltwater Research LLC.
+
+Licensing of the parts of this repository
+-----------------------------------------
+* The runtime (Rust core in src/, CMake files, Python package in
+  bindings/python, adapters, tools and documentation) is licensed under the
+  Apache License, Version 2.0. See LICENSE.
+* The public C headers, include/seabraid/*.h, are available under
+  "Apache-2.0 OR MIT" at the user's choice, so that engines under the MIT
+  license can vendor them. See LICENSE and LICENSE-MIT.
+* The patch files compat/strata/patches/strata/*.patch and
+  adapters/ggml/*.patch and adapters/strata/*.patch modify MIT-licensed upstream
+  code (Strata and llama.cpp/ggml) and are MIT-licensed (LICENSE-MIT) so that
+  they can land in those trees. The patch files themselves carry no license
+  header; this notice is the statement.
+
+Third-party attribution
+-----------------------
+* Strata, https://github.com/Niko1221/Strata, MIT License,
+  Copyright (c) 2026 Niko1221 and the Strata contributors.
+  The Strata integration under compat/strata builds on Strata. The helper
+  (compat/strata/strata-ext/) compiles against and links Strata's libraries,
+  and the Strata adapter (adapters/strata) speaks Strata's helper channel.
+  The Rust ownership map (src/placement.rs) is a port of the ownership map that
+  this project's patch 0012 (compat/strata/patches/strata) adds to Strata.
+* llama.cpp and ggml, https://github.com/ggml-org/llama.cpp, MIT License,
+  Copyright (c) 2023-2026 The ggml authors. The ggml adapter (adapters/ggml)
+  links ggml, and its opt-in scheduler patch modifies llama.cpp.
+
+Upstream license texts
+----------------------
+The patch files named above contain lines of the upstream projects they modify.
+For that material the upstream license applies. Each upstream's MIT copyright
+and permission notice is reproduced here, as published in its repository.
+
+Strata (https://github.com/Niko1221/Strata), applies to
+compat/strata/patches/strata/*.patch and adapters/strata/*.patch:
+
+MIT License
+
+Copyright (c) 2026 Niko1221 and the Strata contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+llama.cpp and ggml (https://github.com/ggml-org/llama.cpp), applies to
+adapters/ggml/*.patch:
+
+MIT License
+
+Copyright (c) 2023-2026 The ggml authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

@@ -1,0 +1,13 @@
+# Design A/B 2 (docs/design/N-CARD-LADDER.md section 8): D4, the expert card computes its own experts while a prompt is read
+# (engine STRATA_PREFILL_REMOTE_COMPUTE=1) vs today's lending.  NOT RE-RUN on the integrated build.
+# The helper must offer the prefill region in BOTH arms (same helper, one variable):  HELPER_CMD="... seabraid-helper ... --prefill-tokens 1024"
+# D4L: region offered, engine variable unset = lending (the control).  D4C: cost model picks per chunk.  D4A: every eligible chunk.
+# `prefill` = prompts of ~0.9k / 3.5k / 14k tokens, then a 400-token decode (decode must be unchanged).  The KL arms are the
+# gate: run `kl` for D4L first, then set KL_BASELINE to its TSV so D4C / D4A are judged by tools/kl.py (mean KL <= 0.03, top-1 >= 0.95).
+# Measured earlier on the pre-integration builds (see docs/DESIGN-LOG.md): prompt reading 1.6-3x the lending path, KL vs lending 0.021-0.028.
+D4L  | prefill | 1 | -                                         | -
+D4C  | prefill | 1 | STRATA_PREFILL_REMOTE_COMPUTE=1           | -
+D4A  | prefill | 1 | STRATA_PREFILL_REMOTE_COMPUTE=2           | -
+D4Lk | kl      | 1 | -                                         | -
+D4Ck | kl      | 1 | STRATA_PREFILL_REMOTE_COMPUTE=1           | -
+D4Ak | kl      | 1 | STRATA_PREFILL_REMOTE_COMPUTE=2           | -

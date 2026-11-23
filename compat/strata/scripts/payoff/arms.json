@@ -1,0 +1,130 @@
+{
+ "_doc": "Config of payoff.py (the three-arm second-GPU payoff comparison). Same schema as scripts/placement-qual/arms.json for vars, engine, arms, variants, limits, so qual_cfg.load and qual_engine.Engine run it unchanged; the sweep, the gates and the estimate are this harness's. {name} placeholders come from vars (override with --var name=value) plus {rundir}. WHY each arm flag is what it is: README.md section Design. Flags this file owns and the launcher's base config must NOT contain: --expert-cache, --expert-cache-device1, --pcie-frac, --resident-budget-gib, --max-context, --short-read, --stats.",
+ "vars": {
+  "launcher": "bin/launch_engine.sh",
+  "helper": "bin/helper-cuda",
+  "shm": "/seabraid-payoff",
+  "port": "8795",
+  "ram_gib": "10",
+  "max_context": "32768",
+  "gpu": "UNSET: pass --var gpu=<CUDA_VISIBLE_DEVICES for the second card: an index or a GPU UUID; a UUID identifies one machine, so it is never kept in the repo>",
+  "rocm": "UNSET: pass --var rocm=<the ROCm install dir>",
+  "pack": "UNSET: pass --var pack=<the model pack dir>",
+  "native": "UNSET: pass --var native=<the model GGUF (part 1)>"
+ },
+ "engine": {
+  "argv": [
+   "bash",
+   "{launcher}",
+   "{rundir}",
+   "--stats",
+   "--resident-budget-gib",
+   "{ram_gib}",
+   "--max-context",
+   "{max_context}"
+  ],
+  "env": {
+   "QUAL_PORT": "{port}",
+   "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+   "HIP_VISIBLE_DEVICES": "0",
+   "CUDA_VISIBLE_DEVICES": "{gpu}",
+   "LD_LIBRARY_PATH": "{rocm}/lib:{rocm}/lib/rocm_sysdeps/lib:/usr/lib64:/usr/lib",
+   "STRATA_DECODE_TIMING": "1",
+   "HSA_USERPTR_FOR_PAGED_MEM": "0",
+   "HSA_SVM_FOR_PAGED_MEM": "0",
+   "STRATA_HIP_ARENA_NONCOHERENT": "1",
+   "GPU_PINNED_MIN_XFER_SIZE": "1048576"
+  },
+  "ready_s": 2400,
+  "stop_grace_s": 90,
+  "helper_match": "{helper}",
+  "stdout_name": "launcher.out",
+  "log_name": "strata.log"
+ },
+ "variants": {
+  "base": {}
+ },
+ "arms": {
+  "A": {
+   "label": "local RAM experts",
+   "transport": "none",
+   "no_helper": true,
+   "env": {
+    "NOHELPER": "1"
+   },
+   "args": [
+    "--pcie-frac",
+    "0"
+   ],
+   "note": "one GPU; every expert the cache lacks is computed by the CPU pool where it sits in RAM (Strata default for a weak link)"
+  },
+  "B": {
+   "label": "host weights transferred",
+   "transport": "none",
+   "no_helper": true,
+   "env": {
+    "NOHELPER": "1"
+   },
+   "args": [
+    "--pcie-frac",
+    "1"
+   ],
+   "note": "one GPU; every expert the cache lacks is copied over PCIe and computed on the GPU. The log is checked to prove the share took effect (gates.b_pcie_min_share)"
+  },
+  "C": {
+   "label": "second GPU holds experts",
+   "transport": "named",
+   "env": {
+    "SEABRAID_STRATA_SHM": "{shm}"
+   },
+   "helper_start": "named",
+   "args": [
+    "--pcie-frac",
+    "0",
+    "--expert-cache-device1",
+    "auto"
+   ],
+   "note": "the seabraid helper holds what the main cache lacks (static placement); --pcie-frac 0 so what is left over is CPU-computed exactly as in A, which makes A-vs-C differ by the helper alone"
+  }
+ },
+ "workloads": {},
+ "thresholds": {},
+ "limits": {
+  "request_timeout_s": 900,
+  "needle_secret": "amber-7314-harbor",
+  "chars_per_token": 4.0
+ },
+ "helpers": "placement-qual",
+ "sweep": {
+  "arms": ["A", "B", "C"],
+  "baseline_arm": "A",
+  "second_gpu_arm": "C",
+  "caps": [11000, 8000, 6000, 4000, 2500],
+  "caps_note": "ESTIMATE for IQ2_XS on an R9700 32 GB main: 11000 (fits on main) and 4000 (heavy overflow) are the measured rows in compat/strata/README.md; 8000, 6000 and 2500 are spread points. The slot count the engine really logs is what the analysis uses.",
+  "n_requests": 6,
+  "warmup": 1,
+  "decode_prompt": "w1_decode.txt",
+  "decode_tokens": 400,
+  "prefill_tokens": 3500,
+  "kl": true,
+  "kl_texts": ["kl_t1.txt", "kl_t2.txt", "kl_t3.txt"],
+  "baseline_repeats": 2
+ },
+ "gates": {
+  "margin_pct": 3.0,
+  "b_pcie_min_share": 0.9,
+  "a_pcie_max_share": 0.02,
+  "prefill_reuse_max_frac": 0.01,
+  "max_consecutive_failures": 2,
+  "settle_s": 1.5,
+  "settle_timeout_s": 20
+ },
+ "estimate": {
+  "note": "ESTIMATE: none of these were measured by this harness; they bound the GPU window so the maintainers can book it. Decode tok/s 20..105 spans heavy-overflow stock (README: 52-60 at cap 4000, hangs seen) to all-in-VRAM (105); prefill 150..1500 tok/s and the engine load are guesses; replace them with the first live run's chain.tsv.",
+  "load_s": [180, 480],
+  "decode_tps": [20, 105],
+  "prefill_tps": [150, 1500],
+  "kl_text_s": [8, 40],
+  "stop_s": 30
+ }
+}

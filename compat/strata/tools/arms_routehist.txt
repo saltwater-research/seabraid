@@ -1,0 +1,10 @@
+# route-histogram arms: RTX 3090 = card 1 (CUDA, the new build), R9700 = card 2 (HIP helper).
+# Use the usual exports, but HELPER_CMD's binary must be the route-histogram tree's own helper (same channel version):
+#   <build-dir>/strata-routehist/build-hip/seabraid/seabraid-helper
+# and run this tree's tools/arms.sh (it has the `hist` mode) with TOOLS pointing at this tree's tools/.
+# RHC: control, new build, STRATA_ROUTE_HIST unset (speed must match the run2 R2P arm; decode timing line unchanged).
+# RH1/RH2: four long prompts (summary, translation, code, arithmetic) x 600 tokens; req-*.json under RUN/hist_NAME,
+#          report_NAME.txt written by tools/route_hist_report.py. RH2 repeats RH1 to show the coverage numbers repeat.
+RHC | speed | 1 | -                                              | .exe="<build-dir>/strata-routehist/build-cuda/strata"
+RH1 | hist  | 1 | -                                              | .exe="<build-dir>/strata-routehist/build-cuda/strata"
+RH2 | hist  | 1 | -                                              | .exe="<build-dir>/strata-routehist/build-cuda/strata"

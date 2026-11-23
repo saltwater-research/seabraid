@@ -1,0 +1,5 @@
+{
+ "compat/strata/strata-ext/src/card_bench_run.cpp": 1,
+ "compat/strata/tests/install/test_probe.py": 1,
+ "native-tests/provider_smoke.cpp": 1
+}

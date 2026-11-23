@@ -1,0 +1,653 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Seabraid <seabraid@example.invalid>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH 06/16] SEABRAID_STRATA_HOT_SHARE: opt-in f-paced interleave
+ gives the helper GPU a share of the HOT experts
+
+Today the primary cache takes the top of the expert ranking and seabraid_open gives the helper "ranked
+order, nothing the primary holds" - the colder tail. Routing is skewed: in the IQ3_S all-VRAM run the
+3090 held 45% of the experts (11,110 of 24,576) but did 13.6% of the expert work.
+
+SEABRAID_STRATA_HOT_SHARE=<f in [0,1]>|auto (unset = today's fill, bit for bit) walks the ranking hottest-first
+and deals pair n to the helper when floor((n+1)f) > helper picks so far, until one side's budget is
+full; then the other side takes the following ranks until it is full. "auto" is the helper's share of
+both byte capacities. The primary sizes and fills from its picks only (hot_order); `profile` keeps the
+true ranking, which the helper walks (skipping what the primary holds, so it lands on its picks first)
+and which the RAM copy, K/V refills and heat ranks keep reading.
+
+The helper's capacity is known before the primary decides: its preflight free figure (the same header
+field seabraid_open sizes from) less 512 MiB, its own 256-byte blob rounding, and its slot count - the
+arithmetic seabraid_open uses. The primary's cost/budget are the sized-slot loop's own.
+
+Disjointness: at load it stays seabraid_open's own primary.slot_of check, and a startup line counts the
+pairs both caches hold and refuses to start if any. STRATA_DISJOINT_ADAPT is forced on with hot share
+(the adaptive tier would otherwise promote the helper's hot experts into the primary). Refused, not
+ignored, with a layer split, more than one helper tier, --peer-device, --expert-cache-per-layer,
+--remote-expert-opt, STRATA_EXPERT_NIBBLE or --retier.
+
+Host test: tests/program/seabraid_hot_share_test.cpp re-enacts the primary's sized-slot loop and
+seabraid_open's walk: disjoint, helper lands on its planned picks, f=0 equals today's prefix, top-2000
+ranks split f within one pair. Not run on a GPU.
+---
+ CMakeLists.txt                                |   6 +
+ include/strata/program/seabraid_hot_share.hpp | 115 +++++++++++
+ src/program/generate.cpp                      | 159 +++++++++++++--
+ tests/program/seabraid_hot_share_test.cpp     | 188 ++++++++++++++++++
+ 4 files changed, 446 insertions(+), 22 deletions(-)
+ create mode 100644 include/strata/program/seabraid_hot_share.hpp
+ create mode 100644 tests/program/seabraid_hot_share_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 638f98413..b886fe55a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -408,6 +408,12 @@ if(STRATA_BUILD_TESTS)
+   target_include_directories(stage_reserve_test PRIVATE include)
+   add_test(NAME stage_reserve_test COMMAND stage_reserve_test)
+ 
++  # SEABRAID_STRATA_HOT_SHARE: the f-paced interleave of the expert ranking between the primary and the helper (header-only;
++  # re-enacts the primary's sized-slot loop and seabraid_open's walk, checks them disjoint and on plan)
++  add_executable(seabraid_hot_share_test tests/program/seabraid_hot_share_test.cpp)
++  target_include_directories(seabraid_hot_share_test PRIVATE include)
++  add_test(NAME seabraid_hot_share_test COMMAND seabraid_hot_share_test)
++
+   # the layer split's spill walk (header-only arithmetic: who is short, which step comes next)
+   add_executable(split_walk_test tests/program/split_walk_test.cpp)
+   target_include_directories(split_walk_test PRIVATE include)
+diff --git a/include/strata/program/seabraid_hot_share.hpp b/include/strata/program/seabraid_hot_share.hpp
+new file mode 100644
+index 000000000..dcabf65e3
+--- /dev/null
++++ b/include/strata/program/seabraid_hot_share.hpp
+@@ -0,0 +1,115 @@
++// seabraid hot share (opt-in, SEABRAID_STRATA_HOT_SHARE=<f>|auto): which ranked experts the primary cache fills, so the
++// helper GPU gets a share f of the HOT experts instead of only the ranks the primary leaves over.
++//
++// Today the primary takes the top of the expert profile and the helper (RemoteExperts::seabraid_open) takes "ranked
++// order, nothing the primary holds" - i.e. the colder tail.  Routing is skewed, so a helper holding 45% of the
++// experts measured 13.6% of the expert work.  This walks the ranking hottest-first and deals each pair to one side by
++// f-paced interleave (the helper gets pair n when floor((n+1)f) > helper picks so far), until a side is full; then
++// the other side takes the ranks that follow until it is full too.
++//
++// The result is a FILL ORDER for the primary: its own picks (rank order), then the helper's picks (rank order), then
++// everything neither takes (rank order).  The primary fills only its first `n_primary` entries; the helper is NOT
++// given this list - it keeps walking the original ranking and skipping what the primary holds, which visits exactly
++// its picks first.  So disjointness at load stays the helper's own check (primary.slot_of), not this function's.
++//
++// "Full" is the first pair that does not fit, as both real fills define it (the primary's sized-slot loop and
++// seabraid_open both stop at the first pair over budget).  Header-only and host-testable: no device code.
++#pragma once
++
++#include <cmath>
++#include <cstdint>
++#include <cstdlib>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace strata::program {
++
++struct HotShareSplit {
++    std::vector<std::pair<int32_t, int32_t>> order;   // primary picks, helper picks, rest (each in rank order)
++    int64_t n_primary = 0;
++    int64_t n_helper = 0;
++    int64_t walked = 0;                               // ranks dealt (n_primary + n_helper; invalid pairs skipped)
++    uint64_t primary_bytes = 0;
++    uint64_t helper_bytes = 0;
++    bool primary_full = false;
++    bool helper_full = false;
++};
++
++// SEABRAID_STRATA_HOT_SHARE's value.  Returns false (with `why`) for anything that is not a number in [0,1] or "auto".
++// `is_auto` set: the caller passes f = helper capacity / (primary + helper capacity).
++inline bool hot_share_parse(const char* v, double& f, bool& is_auto, std::string& why) {
++    f = -1.0;
++    is_auto = false;
++    if (v == nullptr || v[0] == '\0') { why = "unset"; return false; }
++    if (std::string(v) == "auto") { is_auto = true; return true; }
++    char* end = nullptr;
++    const double x = std::strtod(v, &end);
++    if (end == v || *end != '\0' || !std::isfinite(x) || x < 0.0 || x > 1.0) {
++        why = std::string("SEABRAID_STRATA_HOT_SHARE=") + v + ": expected a share in [0,1] or 'auto'";
++        return false;
++    }
++    f = x;
++    return true;
++}
++
++// primary_cost(layer) / helper_cost(layer): the bytes one expert of that layer takes on each side (each side's own
++// rounding).  *_cap: the byte budget.  *_slots: a count cap (INT64_MAX = none).
++template <class PrimaryCost, class HelperCost>
++HotShareSplit hot_share_split(const std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t n_layers, int64_t n_expert,
++                              double f, PrimaryCost primary_cost, uint64_t primary_cap, int64_t primary_slots,
++                              HelperCost helper_cost, uint64_t helper_cap, int64_t helper_slots) {
++    HotShareSplit s;
++    std::vector<std::pair<int32_t, int32_t>> prim, help, rest;
++    prim.reserve(ranked.size());
++    help.reserve(ranked.size());
++    std::vector<uint8_t> seen((size_t) (n_layers > 0 && n_expert > 0 ? n_layers * n_expert : 0), 0);
++    if (f < 0.0) f = 0.0;
++    if (f > 1.0) f = 1.0;
++    bool p_open = primary_slots > 0, h_open = helper_slots > 0;
++    for (const auto& pr : ranked) {
++        const bool valid = pr.first >= 0 && pr.first < n_layers && pr.second >= 0 && pr.second < n_expert;
++        if (valid) {
++            const size_t at = (size_t) pr.first * (size_t) n_expert + (size_t) pr.second;
++            if (seen[at]) { rest.push_back(pr); continue; }   // a duplicate rank: the first one decides
++            seen[at] = 1;
++        }
++        if (!valid || (!p_open && !h_open)) { rest.push_back(pr); continue; }
++        const int64_t n = (int64_t) (prim.size() + help.size());
++        const bool want_helper = (int64_t) std::floor((double) (n + 1) * f) > (int64_t) help.size();
++        bool placed = false;
++        for (int attempt = 0; attempt < 2 && !placed; ++attempt) {
++            const bool to_helper = attempt == 0 ? want_helper : !want_helper;
++            if (to_helper) {
++                if (!h_open) continue;
++                const uint64_t b = (uint64_t) helper_cost(pr.first);
++                if (s.helper_bytes + b > helper_cap) { h_open = false; continue; }
++                help.push_back(pr);
++                s.helper_bytes += b;
++                if ((int64_t) help.size() >= helper_slots) h_open = false;
++                placed = true;
++            } else {
++                if (!p_open) continue;
++                const uint64_t b = (uint64_t) primary_cost(pr.first);
++                if (s.primary_bytes + b > primary_cap) { p_open = false; continue; }
++                prim.push_back(pr);
++                s.primary_bytes += b;
++                if ((int64_t) prim.size() >= primary_slots) p_open = false;
++                placed = true;
++            }
++        }
++        if (!placed) rest.push_back(pr);
++    }
++    s.n_primary = (int64_t) prim.size();
++    s.n_helper = (int64_t) help.size();
++    s.walked = s.n_primary + s.n_helper;
++    s.primary_full = !p_open;
++    s.helper_full = !h_open;
++    s.order.reserve(ranked.size());
++    s.order.insert(s.order.end(), prim.begin(), prim.end());
++    s.order.insert(s.order.end(), help.begin(), help.end());
++    s.order.insert(s.order.end(), rest.begin(), rest.end());
++    return s;
++}
++
++}  // namespace strata::program
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 436c7dfa7..b82588969 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -115,6 +115,7 @@
+ #endif
+ #include "strata/core/native_dense.hpp"
+ #include "strata/program/adapt_decay.hpp"
++#include "strata/program/seabraid_hot_share.hpp"
+ #include "strata/program/batch_read.hpp"
+ #include "strata/program/logits_selection.hpp"
+ #include "strata/program/conv_cache.hpp"
+@@ -5204,6 +5205,9 @@ int main(int argc, char** argv) {
+     // and a new context then fails with cudaErrorMemoryAllocation (CUDA2: "cudaSetDevice(2) failed: out of memory").
+     const char* early_env = std::getenv("STRATA_EARLY_REMOTE_CONTEXTS");
+     const bool early_remote = early_env && early_env[0] == '1';
++    // SEABRAID_STRATA_HOT_SHARE: the helper's free figure as its preflight read it - the same header field seabraid_open sizes
++    // the helper's plan from later, so the primary's fill can be decided against the helper's real capacity first
++    double seabraid_helper_free_gib = -1.0;
+     for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0 && (r == 0 || early_remote)) {
+         // Keep CUDA1's proven startup order: initialise its context before
+         // allocating GPU0 weights or mapping the large host expert arena.
+@@ -5212,6 +5216,7 @@ int main(int argc, char** argv) {
+             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+             return 1;
+         }
++        if (r == 0 && remote_dev[0] >= seabraid::kDeviceBase) seabraid_helper_free_gib = free_gib;
+         std::fprintf(stderr, "strata generate: CUDA%d context ready, %.2f GiB free before expert arena registration\n",
+                      remote_dev[r], free_gib);
+     }
+@@ -8811,6 +8816,74 @@ int main(int argc, char** argv) {
+     // blobs, and the quota is however many copies of every layer fit in it.
+     std::vector<int64_t> sized_slots;
+     uint64_t per_layer_bytes = 0;
++    // ---- SEABRAID_STRATA_HOT_SHARE=<f>|auto (opt-in; unset = the fill below is today's, bit for bit): the primary fills from
++    // `hot_order` instead of the profile - its share of an f-paced interleave of the ranking (seabraid_hot_share.hpp) -
++    // so the helper process, which takes the ranked pairs the primary does not hold, gets a share f of the HOT ones.
++    // Decided here, before the primary's cache is sized and filled, against the helper's capacity as seabraid_open will
++    // compute it (its preflight free figure less 512 MiB, its own blob rounding, its slot count).  `profile` itself
++    // keeps the true ranking: the helper walks it, and so do the RAM copy, the K/V refills and the heat ranks.
++    std::vector<std::pair<int32_t, int32_t>> hot_order;
++    int64_t hot_primary = -1, hot_helper = -1;   // planned counts (-1: off)
++    const char* hot_env = std::getenv("SEABRAID_STRATA_HOT_SHARE");
++    const bool hot_asked = hot_env != nullptr && hot_env[0] != '\0';
++    double hot_f = -1.0;
++    bool hot_auto = false;
++    if (hot_asked) {
++        std::string why;
++        if (!strata::program::hot_share_parse(hot_env, hot_f, hot_auto, why)) {
++            std::fprintf(stderr, "strata generate: %s\n", why.c_str());
++            return 2;
++        }
++        const char* off = remote_dev[0] < seabraid::kDeviceBase || o.expert_cache_remote[0] <= 0 ? "it needs a seabraid helper (SEABRAID_STRATA_SHM and --expert-cache-device1)"
++                        : seabraid_helper_free_gib <= 0.0 ? "the helper's free memory was not read at its preflight"
++                        : o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0 ? "not with more than one helper tier"
++                        : multi_gpu || !stages.empty() ? "not with a layer split"
++                        : o.peer_device >= 1 ? "not with --peer-device"
++                        : o.expert_cache_per_layer ? "not with --expert-cache-per-layer (each layer fills its own range)"
++                        : o.remote_expert_opt ? "not with --remote-expert-opt"
++                        : profile.empty() ? "it needs --expert-profile (the ranking)"
++                        : o.expert_cache <= 0 ? "it needs the CUDA0 expert cache"
++                        : nib::any_on() ? "not with STRATA_EXPERT_NIBBLE"
++                        : nullptr;
++#if defined(STRATA_HAVE_SEABRAID_RETIER)
++        // D7's policy starts from the helper's residency and caps the helper's share of a layer's heat; a hot-share
++        // placement can start over that cap and the two would fight.  One mechanism per A/B arm.
++        if (off == nullptr && o.retier.mode != seabraid::RetierMode::kOff) off = "not with --retier (D7 moves experts by its own policy)";
++#endif
++        if (off != nullptr) {   // an opt-in A/B knob that silently did nothing would mislabel the arm: refuse
++            std::fprintf(stderr, "strata generate: SEABRAID_STRATA_HOT_SHARE=%s: %s\n", hot_env, off);
++            return 2;
++        }
++    }
++    // primary_cost / primary_cap / primary_slots: the primary sizing's own terms (the branch that sizes it passes them)
++    auto hot_share_plan = [&](auto primary_cost, uint64_t primary_cap, int64_t primary_slots) {
++        const auto& lay = strata::kernels::cpu::expert_layout();
++        const uint64_t hfree = (uint64_t) (seabraid_helper_free_gib * 1073741824.0);   // seabraid_open's exact arithmetic
++        const bool h_auto = o.expert_cache_remote_auto[0];
++        const uint64_t hcap = !h_auto ? UINT64_MAX : hfree > (512ull << 20) ? hfree - (512ull << 20) : 0;
++        auto helper_cost = [&](int32_t l) -> uint64_t {
++            return lay.native ? (lay.blob_bytes(l) + 255) / 256 * 256 : (uint64_t) lay.max_blob;
++        };
++        double f = hot_f;
++        if (hot_auto) {   // capacity-proportional: the helper's bytes over both sides' bytes
++            const double hc = h_auto ? (double) hcap : (double) o.expert_cache_remote[0] * (double) lay.max_blob;
++            const double pc = (double) primary_cap;
++            f = hc + pc > 0.0 ? hc / (hc + pc) : 0.0;
++        }
++        const auto sp = strata::program::hot_share_split(profile, g.n_layers, g.n_expert, f, primary_cost, primary_cap,
++                                                         primary_slots, helper_cost, hcap,
++                                                         (int64_t) o.expert_cache_remote[0]);
++        hot_order = sp.order;
++        hot_primary = sp.n_primary;
++        hot_helper = sp.n_helper;
++        std::fprintf(stderr, "seabraid: hot-share %.3f%s: primary %lld experts (%.2f GiB), helper %lld (%.2f GiB), from ranks "
++                             "0..%lld interleaved (f-paced until a side filled; full: %s); %lld ranks on neither\n",
++                     f, hot_auto ? " (auto: the helper's share of both capacities)" : "", (long long) sp.n_primary,
++                     (double) sp.primary_bytes / 1073741824.0, (long long) sp.n_helper,
++                     (double) sp.helper_bytes / 1073741824.0, (long long) sp.walked - 1,
++                     sp.primary_full && sp.helper_full ? "both" : sp.primary_full ? "primary" : sp.helper_full ? "helper" : "none",
++                     (long long) ((int64_t) profile.size() - sp.walked));
++    };
+     if (native_pack && o.expert_cache > 0 && o.expert_cache_per_layer) {
+         const size_t free_b = strata::core::device_free_bytes();   // the same reading the shared-cache sizing uses
+         const auto& lay = strata::kernels::cpu::expert_layout();
+@@ -8848,9 +8921,14 @@ int main(int argc, char** argv) {
+         const size_t keep_free = ((size_t) o.vram_reserve_mib << 20) + (size_t) pipe_first;
+         size_t free_room = free_b > keep_free ? free_b - keep_free : 0;
+         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
+-        for (const auto& pr : profile) {
++        if (hot_asked)   // SEABRAID_STRATA_HOT_SHARE: the same cost and budget as the loop below, so the loop takes its picks
++            hot_share_plan([&](int32_t l) -> uint64_t {
++                return (uint64_t) strata::core::ExpertCache::slot_stride((int64_t) nib::slot_bytes(l), slot_guard); },
++                cap, INT64_MAX);
++        for (const auto& pr : hot_asked ? hot_order : profile) {
+             const uint64_t b = (uint64_t) strata::core::ExpertCache::slot_stride((int64_t) nib::slot_bytes(pr.first), slot_guard);
+             if (used + b > cap) break;
++            if (hot_asked && (int64_t) sized_slots.size() >= hot_primary) break;   // the helper's picks follow
+             used += b;
+             sized_slots.push_back((int64_t) nib::slot_bytes(pr.first));
+         }
+@@ -8897,6 +8975,10 @@ int main(int argc, char** argv) {
+         }
+ #endif
+     }
++    if (hot_asked && hot_primary < 0) {   // uniform slots (not a native pack): o.expert_cache slots of the largest blob
++        const uint64_t mb = (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
++        hot_share_plan([mb](int32_t) -> uint64_t { return mb; }, (uint64_t) o.expert_cache * mb, (int64_t) o.expert_cache);
++    }
+ #if defined(STRATA_USE_HIP) && defined(__linux__)
+     // LEND (kfd_quiet.hpp), integrated gfx11 under Linux: the prompt path keeps its own buffers instead of lending cache slots, the
+     // rule of the Strix Halo on Windows (0.2.8, above) for this class.  Every lent slot is copied back from the host arena after each
+@@ -9113,21 +9195,25 @@ int main(int argc, char** argv) {
+     NibbleCache nib_x;
+     std::vector<NibbleCache> nib_st;
+     nib_st.reserve(stages.size());
+-    if (!profile.empty() && srcp != nullptr) {
++    // SEABRAID_STRATA_HOT_SHARE: the primary's share of the interleave (its picks first, then the helper's, which it never
++    // reaches: its slots were sized to its picks).  Unset: the profile, as before.
++    const std::vector<std::pair<int32_t, int32_t>>& fill_order = hot_order.empty() ? profile : hot_order;
++    if (!fill_order.empty() && srcp != nullptr) {
+         // #369 (dag08): per layer, a full layer skips only its own pairs - each layer takes its hottest experts until
+         // its range is full (one full layer used to end the whole fill, leaving most layers empty)
+         const bool per_layer = xcache.per_layer_admission();
+-        const int64_t want = per_layer ? (int64_t) profile.size()
+-                                       : std::min<int64_t>((int64_t) profile.size(), xcache.slots());
++        const int64_t want = per_layer ? (int64_t) fill_order.size()
++                                       : std::min<int64_t>(hot_primary >= 0 ? hot_primary : (int64_t) fill_order.size(),
++                                                           xcache.slots());   // (hot share: never into the helper's picks)
+         // #286: an unbuffered file tier reads the pairs in batches of 64, the next batch while this one is copied
+         std::future<void> ahead;
+-        auto read_batch = [&](int64_t at) { src.prefetch_pairs(profile.data() + at, std::min<int64_t>(64, want - at)); };
++        auto read_batch = [&](int64_t at) { src.prefetch_pairs(fill_order.data() + at, std::min<int64_t>(64, want - at)); };
+         // mapped reads: advise the next `fill_ahead` pairs so their reads overlap; STRATA_FILL_AHEAD=0 turns it off
+         int64_t fill_ahead = 0;
+         if (!per_layer && srcp == &src && !src.unbuffered()) {
+             const char* v = std::getenv("STRATA_FILL_AHEAD");
+             fill_ahead = v == nullptr ? 256 : std::max(0, std::atoi(v));
+-            if (fill_ahead > 0 && !src.advise_pairs(profile.data(), std::min<int64_t>(fill_ahead, want))) fill_ahead = 0;
++            if (fill_ahead > 0 && !src.advise_pairs(fill_order.data(), std::min<int64_t>(fill_ahead, want))) fill_ahead = 0;
+             std::fprintf(stderr, "strata generate: the profile fill asks for %lld pairs ahead (STRATA_FILL_AHEAD)\n",
+                          (long long) fill_ahead);
+         }
+@@ -9135,7 +9221,7 @@ int main(int argc, char** argv) {
+         uint64_t fill_bytes = 0;
+         if (nib::any_on()) {   // STRATA_EXPERT_NIBBLE: the converted layers' pairs go through the 4-bit fill instead
+             int64_t conv = 0;
+-            for (int64_t i = 0; i < want; ++i) conv += nib::layer(profile[(size_t) i].first).on ? 1 : 0;
++            for (int64_t i = 0; i < want; ++i) conv += nib::layer(fill_order[(size_t) i].first).on ? 1 : 0;
+             if (conv > 0 && !nib_x.begin(xcache, conv, err)) {
+                 std::fprintf(stderr, "strata generate: STRATA_EXPERT_NIBBLE: %s\n", err.c_str());
+                 return 1;
+@@ -9147,22 +9233,22 @@ int main(int argc, char** argv) {
+                 else read_batch(i);
+                 if (i + 64 < want) ahead = std::async(std::launch::async, [&read_batch](int64_t b) { strata::aux_cpus::pin_current_thread(); read_batch(b); }, i + 64);
+             }
+-            if (fill_ahead > 0 && i + fill_ahead < want) (void) src.advise_pairs(profile.data() + i + fill_ahead, 1);
+-            const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
++            if (fill_ahead > 0 && i + fill_ahead < want) (void) src.advise_pairs(fill_order.data() + i + fill_ahead, 1);
++            const int32_t slot = xcache.admit(fill_order[(size_t) i].first, fill_order[(size_t) i].second);
+             if (slot == strata::core::kNotResident) {
+                 if (per_layer) continue;
+                 break;
+             }
+-            const uint8_t* b = srcp->blob_stable(profile[(size_t) i].first, profile[(size_t) i].second);
+-            const bool nib_pair = nib_x.active() && nib::layer(profile[(size_t) i].first).on;   // STRATA_EXPERT_NIBBLE
+-            if (b == nullptr || !(nib_pair ? nib_x.add(profile[(size_t) i].first, profile[(size_t) i].second, slot, b, err)
++            const uint8_t* b = srcp->blob_stable(fill_order[(size_t) i].first, fill_order[(size_t) i].second);
++            const bool nib_pair = nib_x.active() && nib::layer(fill_order[(size_t) i].first).on;   // STRATA_EXPERT_NIBBLE
++            if (b == nullptr || !(nib_pair ? nib_x.add(fill_order[(size_t) i].first, fill_order[(size_t) i].second, slot, b, err)
+                                            : xcache.fill_slot_blocking(slot, b, err,
+-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first)))) {
++                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(fill_order[(size_t) i].first)))) {
+                 std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
+                              (long long) i, err.c_str());
+                 return 1;
+             }
+-            fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
++            fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(fill_order[(size_t) i].first);
+             ++prefilled;
+         }
+         if (nib_x.active() && !nib_x.finish(err)) {
+@@ -9174,10 +9260,10 @@ int main(int argc, char** argv) {
+         // about bytes produces a plausible token, which is this project's most expensive failure mode; the
+         // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup.
+         // (STRATA_EXPERT_NIBBLE: a converted slot holds 4-bit codes, not the blob's bytes - the 4-bit check below is its check)
+-        if (prefilled > 0 && !nib::layer(profile[0].first).on &&
+-            !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
+-                                srcp->blob_stable(profile[0].first, profile[0].second), err,
+-                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
++        if (prefilled > 0 && !nib::layer(fill_order[0].first).on &&
++            !xcache.verify_slot(xcache.slot_of(fill_order[0].first, fill_order[0].second),
++                                srcp->blob_stable(fill_order[0].first, fill_order[0].second), err,
++                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(fill_order[0].first))) {
+             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+             return 1;
+         }
+@@ -9185,8 +9271,8 @@ int main(int argc, char** argv) {
+             // STRATA_EXPERT_NIBBLE: the hottest converted pair read back (its hash, its down rows); every item and every
+             // rebuilt GGUF block of every converted slot was already checked on the device
+             size_t c = 0;
+-            while (c < (size_t) want && !nib::layer(profile[c].first).on) ++c;
+-            if (!nib_x.check(profile[c].first, profile[c].second, srcp->blob_stable(profile[c].first, profile[c].second),
++            while (c < (size_t) want && !nib::layer(fill_order[c].first).on) ++c;
++            if (!nib_x.check(fill_order[c].first, fill_order[c].second, srcp->blob_stable(fill_order[c].first, fill_order[c].second),
+                              err)) {
+                 std::fprintf(stderr, "strata generate: STRATA_EXPERT_NIBBLE: CUDA0: %s\n", err.c_str());
+                 return 1;
+@@ -9196,7 +9282,7 @@ int main(int argc, char** argv) {
+             std::fprintf(stderr, "strata generate: STRATA_EXPERT_NIBBLE: CUDA0: %lld slots of %zu layers transcoded to 4-bit "
+                                  "codes (%.2f s; every item round-tripped, every slot's GGUF blocks rebuilt and compared, "
+                                  "slot hashes recorded); layer %d expert %d read back\n", (long long) nib_x.n, ls.size(),
+-                         nib_x.seconds, (int) profile[c].first, (int) profile[c].second);
++                         nib_x.seconds, (int) fill_order[c].first, (int) fill_order[c].second);
+         }
+         mem_mark("the profile fill");
+         std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile in %.1f s (%.0f MB/s); "
+@@ -9562,6 +9648,29 @@ int main(int argc, char** argv) {
+                                  "results return through pinned host rows\n", remote_dev[r],
+                          (long long) remote_experts[(size_t) r].resident(), remote_experts[(size_t) r].gib());
+         }
++        if (hot_primary >= 0) {   // SEABRAID_STRATA_HOT_SHARE: what really landed, and the two caches checked disjoint
++            const strata::core::RemoteExperts& hre = remote_experts[0];
++            int64_t both = 0, p_all = 0, p_top = 0, h_top = 0;
++            for (int64_t l = 0; l < g.n_layers; ++l)
++                for (int64_t e = 0; e < g.n_expert; ++e) {
++                    const bool in_p = xcache.slot_of(l, (int32_t) e) >= 0;
++                    p_all += in_p ? 1 : 0;
++                    both += (in_p && hre.holds(l, (int32_t) e)) ? 1 : 0;
++                }
++            const size_t top = std::min<size_t>(profile.size(), 2000);   // the hottest ranks: who holds them
++            for (size_t i = 0; i < top; ++i) {
++                p_top += xcache.slot_of(profile[i].first, profile[i].second) >= 0 ? 1 : 0;
++                h_top += hre.holds(profile[i].first, profile[i].second) ? 1 : 0;
++            }
++            std::fprintf(stderr, "seabraid: hot-share: primary holds %lld (planned %lld), helper %lld (planned %lld); "
++                                 "of the %zu hottest ranks the primary holds %lld, the helper %lld; %lld held by both\n",
++                         (long long) p_all, (long long) hot_primary, (long long) hre.resident(),
++                         (long long) hot_helper, top, (long long) p_top, (long long) h_top, (long long) both);
++            if (both != 0) {
++                std::fprintf(stderr, "strata generate: SEABRAID_STRATA_HOT_SHARE: %lld experts are in both caches\n", (long long) both);
++                return 1;
++            }
++        }
+     }
+ 
+     // ---- Multi-GPU: the second GPU's expert tier, filled with the ranked pairs the primary does not hold
+@@ -9592,7 +9701,13 @@ int main(int argc, char** argv) {
+     // #731 (opt-in, STRATA_DISJOINT_ADAPT=1): the adaptive tiers leave an expert a helper GPU holds out of the primary's
+     // promotion candidates (it would sit in both caches).  Asked live, from the helper's own cache (RemoteExperts::holds,
+     // #854), so an expert the helper's tier swaps in or out later is followed - never a copy taken at load.
+-    const bool disjoint_adapt = [] { const char* v = std::getenv("STRATA_DISJOINT_ADAPT"); return v != nullptr && std::atoi(v) != 0; }();
++    // SEABRAID_STRATA_HOT_SHARE forces it on: the helper then holds hot experts, which the adaptive tier would otherwise promote
++    // into the primary (a copy in both caches, and the split undone one swap at a time).
++    const bool disjoint_adapt = hot_primary >= 0 ||
++        [] { const char* v = std::getenv("STRATA_DISJOINT_ADAPT"); return v != nullptr && std::atoi(v) != 0; }();
++    if (hot_primary >= 0)
++        std::fprintf(stderr, "seabraid: hot-share: the adaptive tiers keep the helper's experts out of the primary "
++                             "(STRATA_DISJOINT_ADAPT on)\n");
+     auto helper_holds = [&](int64_t l, int32_t e) -> bool {
+         if (!disjoint_adapt) return false;
+         for (int r = 0; r < drive.d.remote_count; ++r)
+diff --git a/tests/program/seabraid_hot_share_test.cpp b/tests/program/seabraid_hot_share_test.cpp
+new file mode 100644
+index 000000000..6fa1395fb
+--- /dev/null
++++ b/tests/program/seabraid_hot_share_test.cpp
+@@ -0,0 +1,188 @@
++// tests/program/seabraid_hot_share_test.cpp - SEABRAID_STRATA_HOT_SHARE: the f-paced interleave of the expert ranking
++// (include/strata/program/seabraid_hot_share.hpp).  Host only.  The two real consumers are re-enacted here as they are
++// written in the engine: the primary's sized-slot loop (walk the order, stop at the first pair over budget or at
++// n_primary) and RemoteExperts::seabraid_open (walk the ORIGINAL ranking, skip what the primary holds, stop at the
++// first pair over budget).  The checks: the two sides are disjoint, the helper's walk lands exactly on its planned
++// picks, f = 0 is today's fill, and the hot ranks are shared ~f.
++#include "strata/program/seabraid_hot_share.hpp"
++
++#include <cstdint>
++#include <cstdio>
++#include <set>
++#include <string>
++#include <utility>
++#include <vector>
++
++using strata::program::hot_share_parse;
++using strata::program::hot_share_split;
++using Pair = std::pair<int32_t, int32_t>;
++
++namespace {
++int g_fail = 0;
++void check(bool ok, const std::string& what) {
++    if (ok) return;
++    std::fprintf(stderr, "FAIL: %s\n", what.c_str());
++    ++g_fail;
++}
++
++// a ranking over every (layer, expert) of L x E, in a fixed shuffled order (layers interleaved, as a real profile's are)
++std::vector<Pair> make_ranking(int32_t L, int32_t E) {
++    std::vector<Pair> out;
++    for (int32_t l = 0; l < L; ++l)
++        for (int32_t e = 0; e < E; ++e) out.emplace_back(l, e);
++    uint64_t x = 0x9E3779B97F4A7C15ull;
++    for (size_t i = out.size(); i > 1; --i) {   // Fisher-Yates with a fixed xorshift
++        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
++        std::swap(out[i - 1], out[(size_t) (x % i)]);
++    }
++    return out;
++}
++
++struct Sim {
++    std::set<Pair> primary, helper;
++};
++
++// primary: the engine's sized-slot loop over `order`, capped at n_primary; helper: seabraid_open over `ranked`
++template <class PC, class HC>
++Sim simulate(const std::vector<Pair>& ranked, const std::vector<Pair>& order, int64_t n_primary, PC pcost, uint64_t pcap,
++             HC hcost, uint64_t hcap) {
++    Sim s;
++    uint64_t used = 0;
++    for (const auto& p : order) {
++        if (used + pcost(p.first) > pcap) break;
++        if ((int64_t) s.primary.size() >= n_primary) break;
++        used += pcost(p.first);
++        s.primary.insert(p);
++    }
++    uint64_t need = 0;
++    for (const auto& p : ranked) {
++        if (s.primary.count(p) || s.helper.count(p)) continue;
++        if (need + hcost(p.first) > hcap) break;
++        s.helper.insert(p);
++        need += hcost(p.first);
++    }
++    return s;
++}
++
++void test_parse() {
++    double f;
++    bool a;
++    std::string why;
++    check(!hot_share_parse(nullptr, f, a, why), "unset is off");
++    check(!hot_share_parse("", f, a, why), "empty is off");
++    check(hot_share_parse("0.45", f, a, why) && !a && f == 0.45, "0.45 parses");
++    check(hot_share_parse("0", f, a, why) && f == 0.0, "0 parses");
++    check(hot_share_parse("1", f, a, why) && f == 1.0, "1 parses");
++    check(hot_share_parse("auto", f, a, why) && a, "auto parses");
++    check(!hot_share_parse("1.5", f, a, why), "1.5 refused");
++    check(!hot_share_parse("-0.1", f, a, why), "negative refused");
++    check(!hot_share_parse("0.4x", f, a, why), "trailing junk refused");
++    check(!hot_share_parse("nan", f, a, why), "nan refused");
++}
++
++void test_uniform(double f) {
++    const int32_t L = 48, E = 512;   // 24,576 pairs, the model's shape
++    const auto ranked = make_ranking(L, E);
++    auto cost = [](int32_t) -> uint64_t { return 100; };
++    const uint64_t pcap = 13466 * 100, hcap = 11110 * 100;   // the measured IQ3_S all-VRAM counts
++    const auto sp = hot_share_split(ranked, L, E, f, cost, pcap, INT64_MAX, cost, hcap, INT64_MAX);
++    const std::string tag = "f=" + std::to_string(f) + ": ";
++    check(sp.order.size() == ranked.size(), tag + "order keeps every pair");
++    check(sp.n_primary == 13466 && sp.n_helper == 11110, tag + "both sides filled to capacity (" +
++          std::to_string(sp.n_primary) + ", " + std::to_string(sp.n_helper) + ")");
++    const Sim s = simulate(ranked, sp.order, sp.n_primary, cost, pcap, cost, hcap);
++    int64_t both = 0;
++    for (const auto& p : s.primary) both += s.helper.count(p) ? 1 : 0;
++    check(both == 0, tag + "disjoint");
++    check((int64_t) s.primary.size() == sp.n_primary, tag + "primary fill lands on n_primary");
++    check((int64_t) s.helper.size() == sp.n_helper, tag + "helper walk lands on n_helper");
++    for (int64_t i = sp.n_primary; i < sp.n_primary + sp.n_helper; ++i)
++        if (!s.helper.count(sp.order[(size_t) i])) { check(false, tag + "a planned helper pick the helper did not take"); break; }
++    // the hot ranks: the first 2000 split ~f (exact pacing: |helper - f*2000| <= 1) while both sides are open
++    int64_t h_top = 0;
++    for (size_t i = 0; i < 2000; ++i) h_top += s.helper.count(ranked[i]) ? 1 : 0;
++    const double want = f * 2000.0;
++    check(h_top >= (int64_t) want - 1 && h_top <= (int64_t) want + 1,
++          tag + "top-2000 helper share " + std::to_string(h_top) + " vs " + std::to_string(want));
++}
++
++void test_f0_is_today() {
++    const int32_t L = 8, E = 64;
++    const auto ranked = make_ranking(L, E);
++    auto cost = [](int32_t l) -> uint64_t { return 100 + (uint64_t) (l % 3) * 30; };   // per-layer blob sizes
++    const uint64_t pcap = 250 * 110, hcap = 180 * 110;
++    const auto sp = hot_share_split(ranked, L, E, 0.0, cost, pcap, INT64_MAX, cost, hcap, INT64_MAX);
++    // today's primary: the ranking until the first pair over budget
++    uint64_t used = 0;
++    int64_t today = 0;
++    for (const auto& p : ranked) { if (used + cost(p.first) > pcap) break; used += cost(p.first); ++today; }
++    check(sp.n_primary == today, "f=0: the primary takes today's prefix (" + std::to_string(sp.n_primary) + " vs " +
++                                 std::to_string(today) + ")");
++    bool same = true;
++    for (int64_t i = 0; i < today; ++i) same = same && sp.order[(size_t) i] == ranked[(size_t) i];
++    check(same, "f=0: in today's order");
++}
++
++void test_helper_full_first() {
++    const int32_t L = 4, E = 50;
++    const auto ranked = make_ranking(L, E);
++    auto cost = [](int32_t) -> uint64_t { return 10; };
++    const auto sp = hot_share_split(ranked, L, E, 0.5, cost, 150 * 10, INT64_MAX, cost, 20 * 10, INT64_MAX);
++    check(sp.n_helper == 20 && sp.helper_full, "helper full first: 20 picks");
++    check(sp.n_primary == 150 && sp.primary_full, "then the primary keeps taking ranks to its 150");
++    const Sim s = simulate(ranked, sp.order, sp.n_primary, cost, 150 * 10, cost, 20 * 10);
++    check((int64_t) s.helper.size() == 20 && (int64_t) s.primary.size() == 150, "helper-full-first lands as planned");
++    for (const auto& p : s.primary) check(!s.helper.count(p), "helper-full-first disjoint");
++}
++
++void test_primary_full_first_and_slots() {
++    const int32_t L = 4, E = 50;
++    const auto ranked = make_ranking(L, E);
++    auto cost = [](int32_t) -> uint64_t { return 10; };
++    // helper count cap (a numeric --expert-cache-device1) honoured
++    const auto sp = hot_share_split(ranked, L, E, 0.5, cost, 30 * 10, INT64_MAX, cost, UINT64_MAX, 100);
++    check(sp.n_primary == 30 && sp.n_helper == 100, "primary full first, helper to its slot cap");
++    const auto sp2 = hot_share_split(ranked, L, E, 0.5, cost, UINT64_MAX, 40, cost, UINT64_MAX, 1000);
++    check(sp2.n_primary == 40, "primary slot cap honoured");
++}
++
++void test_varying_sizes_disjoint() {
++    const int32_t L = 48, E = 512;
++    const auto ranked = make_ranking(L, E);
++    auto pcost = [](int32_t l) -> uint64_t { return 2000 + (uint64_t) ((l * 37) % 5) * 300; };
++    auto hcost = [](int32_t l) -> uint64_t { return (2000 + (uint64_t) ((l * 37) % 5) * 300 + 255) / 256 * 256; };
++    for (double f : {0.1, 0.3, 0.45, 0.6, 0.9, 1.0}) {
++        const uint64_t pcap = 9000ull * 2400, hcap = 7000ull * 2400;
++        const auto sp = hot_share_split(ranked, L, E, f, pcost, pcap, INT64_MAX, hcost, hcap, INT64_MAX);
++        const Sim s = simulate(ranked, sp.order, sp.n_primary, pcost, pcap, hcost, hcap);
++        int64_t both = 0;
++        for (const auto& p : s.primary) both += s.helper.count(p) ? 1 : 0;
++        check(both == 0, "varying sizes f=" + std::to_string(f) + ": disjoint");
++        check((int64_t) s.primary.size() == sp.n_primary, "varying sizes f=" + std::to_string(f) + ": primary as planned");
++        // the helper may take MORE than planned (a smaller blob after its first non-fit), never fewer
++        check((int64_t) s.helper.size() >= sp.n_helper, "varying sizes f=" + std::to_string(f) + ": helper >= planned");
++        for (int64_t i = sp.n_primary; i < sp.n_primary + sp.n_helper; ++i)
++            if (!s.helper.count(sp.order[(size_t) i])) { check(false, "varying sizes: a planned helper pick missed"); break; }
++    }
++}
++
++void test_invalid_and_duplicates() {
++    std::vector<Pair> r = {{0, 0}, {0, 1}, {-1, 2}, {0, 1}, {9, 0}, {1, 1}, {1, 0}};
++    auto cost = [](int32_t) -> uint64_t { return 1; };
++    const auto sp = hot_share_split(r, 2, 2, 0.5, cost, 10, INT64_MAX, cost, 10, INT64_MAX);
++    check(sp.order.size() == r.size(), "invalid/duplicate pairs kept (as rest)");
++    check(sp.n_primary + sp.n_helper == 4, "only the 4 distinct valid pairs dealt");
++}
++}  // namespace
++
++int main() {
++    test_parse();
++    for (double f : {0.0, 0.25, 0.45, 0.5}) test_uniform(f);
++    test_f0_is_today();
++    test_helper_full_first();
++    test_primary_full_first_and_slots();
++    test_varying_sizes_disjoint();
++    test_invalid_and_duplicates();
++    if (g_fail == 0) std::printf("seabraid_hot_share_test: all passed\n");
++    return g_fail == 0 ? 0 : 1;
++}

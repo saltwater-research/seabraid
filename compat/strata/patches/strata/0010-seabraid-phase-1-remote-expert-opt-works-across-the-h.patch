@@ -1,0 +1,528 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Seabraid <seabraid@example.invalid>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH 10/16] seabraid phase 1: --remote-expert-opt works across the
+ helper process; the helper returns per-token weighted sums
+
+seabraid_helper_begin writes each helper-owned pick's router weight into the channel weights region and asks for kOutPerToken; the helper sums w * expert(x) per token on its own card (the same RemoteExpertOpt reduce an in-process helper GPU uses) and returns n_tok rows instead of one row per pick. seabraid_helper_finish requires the echo (out_mode == kOutPerToken, out_rows == n_tok), else it is a helper error, then RemoteExpertOpt::accumulate fills h_sum_/h_mask_ exactly as for an in-process remote. Without an active RemoteExpertOpt window nothing changes (per-pick).
+
+RemoteExpertOpt: init/destructor/adapt/owns skip or ask holds() for a helper-process remote (no GPU, no cache_ in this process); accumulate takes the rows pointer; sum_rows() for the helper; init_host_only() for CPU tests. SEABRAID_STRATA_HOT_SHARE no longer refuses --remote-expert-opt (the refusal existed because the helper could not serve it).
+
+Test: tests/core/remote_experts_seabraid_opt_test.cpp, an in-process fake helper on a real shm channel (CPU only). Sabotaged: weight 1.0, accept wrong out_rows, accept a per-pick answer: each fails it.
+---
+ cmake/strata_gpu_engine.cmake                 |   8 +
+ include/strata/core/remote_expert_opt.hpp     |   9 +
+ include/strata/core/remote_experts.hpp        |   3 +
+ src/core/remote_expert_opt.cu                 |  31 ++-
+ src/core/remote_experts.cpp                   |  41 ++-
+ src/program/generate.cpp                      |   4 +-
+ .../core/remote_experts_seabraid_opt_test.cpp | 261 ++++++++++++++++++
+ 7 files changed, 348 insertions(+), 9 deletions(-)
+ create mode 100644 tests/core/remote_experts_seabraid_opt_test.cpp
+
+diff --git a/cmake/strata_gpu_engine.cmake b/cmake/strata_gpu_engine.cmake
+index 945ca0e5b..ff55c12c8 100644
+--- a/cmake/strata_gpu_engine.cmake
++++ b/cmake/strata_gpu_engine.cmake
+@@ -347,6 +347,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+       set_tests_properties(split_lend_complement_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
+     endif()
+   endif()
++  if(NOT WIN32)
++    # --remote-expert-opt across a seabraid helper process: per-token weighted sums against an in-process fake helper on a
++    # real shm channel.  CPU only (RemoteExpertOpt::init_host_only): no GPU, no CUDA context, no model.
++    add_executable(remote_experts_seabraid_opt_test tests/core/remote_experts_seabraid_opt_test.cpp)
++    target_link_libraries(remote_experts_seabraid_opt_test PRIVATE strata_engine)
++    add_test(NAME remote_experts_seabraid_opt_test COMMAND remote_experts_seabraid_opt_test)
++    set_tests_properties(remote_experts_seabraid_opt_test PROPERTIES TIMEOUT 60)
++  endif()
+   # #477: the learned expert profile (--expert-profile-save): its order and make_profile.py's file format (CPU only)
+   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/expert_profile_save_test.cpp")
+     enable_testing()
+diff --git a/include/strata/core/remote_expert_opt.hpp b/include/strata/core/remote_expert_opt.hpp
+index 5eb488c73..a3a44745f 100644
+--- a/include/strata/core/remote_expert_opt.hpp
++++ b/include/strata/core/remote_expert_opt.hpp
+@@ -20,6 +20,12 @@ public:
+ 
+     void attach(RemoteExperts& remote); // before RemoteExperts::open
+     bool init(std::string& err);        // after all helper caches are open
++    /// CPU tests only: take caller-owned host memory (kWindowMaxT * (H + 10) floats) for the sums instead of init()'s
++    /// pinned allocation, so no CUDA context is created.  combine()/copy_rows() read the device mapping and are not usable.
++    void init_host_only(float* mem);
++    /// The helper process (seabraid-helper) reads the window's reduced rows here after RemoteExperts::finish():
++    /// tokens x H floats, the first token being the one begin() was given.  Valid until the next begin().
++    const float* sum_rows() const;
+     bool owns(int64_t layer, int32_t expert) const;
+     bool adapt(const std::vector<float>& usage, const std::vector<int32_t>& primary,
+                const std::vector<std::pair<int32_t, int32_t>>& pending, int max_swaps,
+@@ -40,6 +46,8 @@ private:
+     void prepare(const RemoteExperts& remote, void* metadata) const;
+     bool reduce(RemoteExperts& remote, const void* metadata, std::string& err);
+     void accumulate(const RemoteExperts& remote);
++    /// `rows` = this window's tokens x H reduced rows: the in-process remote's h_out_, or a seabraid helper's channel `out`.
++    void accumulate(const float* rows, const RemoteExperts& remote);
+ 
+     struct Peer { RemoteExperts* remote; float* sum = nullptr; };
+     std::vector<Peer> peers_;
+@@ -49,5 +57,6 @@ private:
+     int32_t* m_mask_ = nullptr;
+     const float* weights_ = nullptr;
+     int token_begin_ = 0, tokens_ = 0;
++    bool host_only_ = false;   // h_sum_ is caller-owned (init_host_only): never cudaFreeHost it
+ };
+ } // namespace strata::core
+diff --git a/include/strata/core/remote_experts.hpp b/include/strata/core/remote_experts.hpp
+index f76dc6efe..33aa9efc5 100644
+--- a/include/strata/core/remote_experts.hpp
++++ b/include/strata/core/remote_experts.hpp
+@@ -152,6 +152,9 @@ private:
+     int64_t bl_resident_ = 0;
+     double bl_gib_ = 0;
+     bool bl_pending_ = false;
++    bool bl_per_token_ = false;            ///< the request in flight asked for kOutPerToken (--remote-expert-opt): finish() checks the echo
++    int64_t bl_ntok_ = 0;                  ///< its n_tok: the rows the helper must report
++    int64_t bl_npick_ = 0;                 ///< n_tok * k: the rows a per-pick answer must report
+     uint64_t bl_seq_ = 0;
+     uint64_t bl_blob_seq_ = 0;
+     RemoteExpertOpt* remote_opt_ = nullptr;
+diff --git a/src/core/remote_expert_opt.cu b/src/core/remote_expert_opt.cu
+index 531008e9e..858004280 100644
+--- a/src/core/remote_expert_opt.cu
++++ b/src/core/remote_expert_opt.cu
+@@ -54,6 +54,14 @@ void RemoteExpertOpt::attach(RemoteExperts& remote) {
+     peers_.push_back({&remote});
+ }
+ 
++void RemoteExpertOpt::init_host_only(float* mem) {
++    h_sum_ = mem;
++    h_mask_ = reinterpret_cast<int32_t*>(mem + MAXT * H);
++    host_only_ = true;
++}
++
++const float* RemoteExpertOpt::sum_rows() const { return h_sum_ + token_begin_ * H; }
++
+ bool RemoteExpertOpt::init(std::string& err) {
+     void* mapped = nullptr;
+     if (!check(cudaHostAlloc((void**) &h_sum_, MAXT * (H + K) * sizeof(float),
+@@ -63,6 +71,9 @@ bool RemoteExpertOpt::init(std::string& err) {
+     h_mask_ = reinterpret_cast<int32_t*>(h_sum_ + MAXT * H);
+     m_mask_ = reinterpret_cast<int32_t*>(m_sum_ + MAXT * H);
+     for (auto& p : peers_) {
++        // WHY skip: a seabraid remote has no GPU in this process; its helper reduces on its own card and the rows come
++        // back through the channel (RemoteExperts::seabraid_helper_finish -> accumulate), so there is no device buffer to size.
++        if (p.remote->bl_) continue;
+         const OnDevice on(p.remote->device_);
+         if (!check(cudaMalloc((void**) &p.sum, MAXT * H * sizeof(float)), err)) return false;
+     }
+@@ -71,12 +82,14 @@ bool RemoteExpertOpt::init(std::string& err) {
+ 
+ RemoteExpertOpt::~RemoteExpertOpt() {
+     for (auto& p : peers_) {
+-        const OnDevice on(p.remote->device_);
+-        if (p.remote->stream_) cudaStreamSynchronize(p.remote->stream_);
+-        if (p.sum) cudaFree(p.sum);
++        if (!p.remote->bl_) {   // (no device to enter for a helper process)
++            const OnDevice on(p.remote->device_);
++            if (p.remote->stream_) cudaStreamSynchronize(p.remote->stream_);
++            if (p.sum) cudaFree(p.sum);
++        }
+         p.remote->remote_opt_ = nullptr;
+     }
+-    if (h_sum_) cudaFreeHost(h_sum_);
++    if (h_sum_ && !host_only_) cudaFreeHost(h_sum_);
+ }
+ 
+ size_t RemoteExpertOpt::metadata_bytes() { return sizeof(ReduceMeta); }
+@@ -109,8 +122,10 @@ bool RemoteExpertOpt::reduce(RemoteExperts& remote, const void* metadata, std::s
+                                   cudaMemcpyDeviceToHost, remote.stream_), err);
+ }
+ 
+-void RemoteExpertOpt::accumulate(const RemoteExperts& remote) {
+-    for (int64_t i = 0; i < tokens_ * H; ++i) h_sum_[token_begin_ * H + i] += remote.h_out_[i];
++void RemoteExpertOpt::accumulate(const RemoteExperts& remote) { accumulate(remote.h_out_, remote); }
++
++void RemoteExpertOpt::accumulate(const float* rows, const RemoteExperts& remote) {
++    for (int64_t i = 0; i < tokens_ * H; ++i) h_sum_[token_begin_ * H + i] += rows[i];
+     for (int i = 0; i < tokens_ * K; ++i)
+         h_mask_[token_begin_ * K + i] |= remote.owned_[(size_t) i] != 0;
+ }
+@@ -134,7 +149,7 @@ void RemoteExpertOpt::combine(float* dst, float* scratch, int token_begin, int t
+ 
+ bool RemoteExpertOpt::owns(int64_t layer, int32_t expert) const {
+     for (const auto& p : peers_)
+-        if (p.remote->cache_.slot_of(layer, expert) >= 0) return true;
++        if (p.remote->holds(layer, expert)) return true;   // (holds() also answers for a seabraid remote, whose cache_ is unopened)
+     return false;
+ }
+ 
+@@ -148,6 +163,7 @@ bool RemoteExpertOpt::adapt(const std::vector<float>& usage, const std::vector<i
+     for (const auto& [i, slot] : pending) resident[(size_t) i] = 1;
+     for (const auto& p : peers_) {
+         const auto& r = *p.remote;
++        if (r.bl_) continue;   // a helper process: the caller's helper_holds() already keeps its experts out of the candidates
+         for (int32_t l = 0; l < (int32_t) r.layers_present_.size(); ++l)
+             for (int32_t e = 0; e < r.n_expert_; ++e)
+                 if (r.cache_.slot_of(l, e) >= 0) resident[(size_t) l * r.n_expert_ + e] = 1;
+@@ -156,6 +172,7 @@ bool RemoteExpertOpt::adapt(const std::vector<float>& usage, const std::vector<i
+     std::string err;
+     for (auto& p : peers_) {
+         auto& r = *p.remote;
++        if (r.bl_) continue;   // (the helper's tier moves by D7 --retier, not by this local swap)
+         std::vector<Swap> swaps;
+         std::vector<std::pair<float, int32_t>> candidates, victims;
+         for (int32_t l = 0; l < (int32_t) r.layers_present_.size(); ++l) {
+diff --git a/src/core/remote_experts.cpp b/src/core/remote_experts.cpp
+index 89bd22dae..05aa27604 100644
+--- a/src/core/remote_experts.cpp
++++ b/src/core/remote_experts.cpp
+@@ -515,7 +515,6 @@ bool RemoteExperts::tier_sync(std::string& err) {
+ bool RemoteExperts::seabraid_open(int slots, int64_t layers, int64_t experts,
+                                  const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
+                                  std::vector<uint8_t>& claimed, std::string& err, bool auto_size) {
+-    if (remote_opt_) { err = "seabraid: --remote-expert-opt is not supported with a helper process"; device_ = -1; return false; }
+     if (slots <= 0 || ranked.empty() || layers <= 0 || experts <= 0 ||
+         claimed.size() != (size_t) layers * (size_t) experts) {
+         err = "seabraid: need ranked experts and a positive slot count"; device_ = -1; return false;
+@@ -622,6 +621,26 @@ bool RemoteExperts::seabraid_helper_begin(int64_t layer, const float* x, const i
+     if (original_row_.empty()) return true;
+     std::memcpy(bl_->x(), x, (size_t) n_tok * H * sizeof(float));
+     seabraid::Header* hd = bl_->header();
++    // --remote-expert-opt: ask the helper for ONE weighted row per token instead of one row per pick.  WHY here: the
++    // reducer of record stays RemoteExpertOpt (accumulate/combine), exactly as for an in-process helper GPU; only where the
++    // weighted sum is computed moves, to the helper's card, so the PCIe return and the shm copies shrink by ~k/owned-per-token.
++    // The weights are the router's own (verify.cpp publishes h_w_ = the w_ that moe_combine applies to the primary's rows),
++    // so helper-side sum(w * row) is the sum the primary would have formed.  Inactive (prefill, no begin()): per-pick, as before.
++    bl_per_token_ = remote_opt_ != nullptr && remote_opt_->active();
++    if (bl_per_token_) {
++        if (remote_opt_->tokens_ != n_tok) {   // accumulate() sums remote_opt_->tokens_ rows; a different n_tok would mis-add
++            err = "seabraid experts: --remote-expert-opt window of " + std::to_string(remote_opt_->tokens_) +
++                  " tokens but a request for " + std::to_string(n_tok);
++            bl_per_token_ = false;
++            return false;
++        }
++        float* wt = bl_->weights();
++        for (int64_t i = 0; i < n; ++i) wt[i] = sid[i] >= 0 ? remote_opt_->weights_[i] : 0.0f;   // (0 for the picks that are not the helper's)
++        bl_ntok_ = n_tok;
++    }
++    hd->out_mode = bl_per_token_ ? seabraid::kOutPerToken : seabraid::kOutPerPick;
++    hd->out_rows = -1;   // a stale count from the previous request must never pass the check in seabraid_helper_finish()
++    bl_npick_ = n;
+     hd->layer = layer; hd->n_tok = n_tok; hd->k = k;
+     hd->req_seq.store(++bl_seq_, std::memory_order_release);
+     bl_pending_ = true;
+@@ -644,6 +663,26 @@ bool RemoteExperts::seabraid_helper_finish(float* out, std::string& err) {
+     ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+     if (!hd->ok) { err = std::string("seabraid helper: ") + hd->err; return false; }
+     if (out == nullptr) return true;
++    if (bl_per_token_) {
++        // The helper must echo what it did.  A per-pick answer to a per-token request, or a different row count, means
++        // the rows in `out` are not the n_tok weighted sums accumulate() expects: an error (like any helper error),
++        // never partial or mixed data.
++        if (hd->out_mode != seabraid::kOutPerToken || hd->out_rows != (int32_t) bl_ntok_) {
++            err = "seabraid helper: answered out_mode " + std::to_string(hd->out_mode) + ", " + std::to_string(hd->out_rows) +
++                  " rows to a per-token request of " + std::to_string((long long) bl_ntok_) + " tokens";
++            return false;
++        }
++        remote_opt_->accumulate(bl_->out(), *this);   // h_sum_ / h_mask_ filled exactly as for an in-process remote
++        return true;
++    }
++    // The per-pick echo, checked like the per-token one above: the helper writes one row per pick at its pick index
++    // and must report n_tok * k rows in kOutPerPick.  Any other answer means `out` is not laid out the way the copy
++    // below reads it, so it is an error, never a silent mix of rows.
++    if (hd->out_mode != seabraid::kOutPerPick || hd->out_rows != (int32_t) bl_npick_) {
++        err = "seabraid helper: answered out_mode " + std::to_string(hd->out_mode) + ", " + std::to_string(hd->out_rows) +
++              " rows to a per-pick request of " + std::to_string((long long) bl_npick_) + " picks";
++        return false;
++    }
+     const float* src = bl_->out();
+     for (const int32_t row : original_row_)
+         std::memcpy(out + (size_t) row * H, src + (size_t) row * H, (size_t) H * sizeof(float));
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index b82588969..ba2d1cf84 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -8834,13 +8834,15 @@ int main(int argc, char** argv) {
+             std::fprintf(stderr, "strata generate: %s\n", why.c_str());
+             return 2;
+         }
++        // --remote-expert-opt is no longer refused here: it was refused because a seabraid helper could not serve it at all
++        // (seabraid_open said so); the helper now returns per-token weighted sums, and RemoteExpertOpt::adapt()/owns() skip
++        // a helper-process remote, so the hot placement and the reduced return do not touch each other's state.
+         const char* off = remote_dev[0] < seabraid::kDeviceBase || o.expert_cache_remote[0] <= 0 ? "it needs a seabraid helper (SEABRAID_STRATA_SHM and --expert-cache-device1)"
+                         : seabraid_helper_free_gib <= 0.0 ? "the helper's free memory was not read at its preflight"
+                         : o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0 ? "not with more than one helper tier"
+                         : multi_gpu || !stages.empty() ? "not with a layer split"
+                         : o.peer_device >= 1 ? "not with --peer-device"
+                         : o.expert_cache_per_layer ? "not with --expert-cache-per-layer (each layer fills its own range)"
+-                        : o.remote_expert_opt ? "not with --remote-expert-opt"
+                         : profile.empty() ? "it needs --expert-profile (the ranking)"
+                         : o.expert_cache <= 0 ? "it needs the CUDA0 expert cache"
+                         : nib::any_on() ? "not with STRATA_EXPERT_NIBBLE"
+diff --git a/tests/core/remote_experts_seabraid_opt_test.cpp b/tests/core/remote_experts_seabraid_opt_test.cpp
+new file mode 100644
+index 000000000..fdfc78269
+--- /dev/null
++++ b/tests/core/remote_experts_seabraid_opt_test.cpp
+@@ -0,0 +1,261 @@
++// remote_experts_seabraid_opt_test: --remote-expert-opt across a seabraid helper process (RemoteExperts::seabraid_helper_begin/finish
++// + RemoteExpertOpt::accumulate), against an in-process FAKE helper on a real POSIX shm channel.  CPU only: no GPU is
++// touched (RemoteExpertOpt::init_host_only keeps its sums in this process's memory, so no CUDA context is created).
++//
++// What it pins: main writes the router weight of every helper-owned pick into the channel `weights` region and asks for
++// kOutPerToken; the helper's n_tok weighted rows land in h_sum_ exactly as an in-process remote's would, with h_mask_ set
++// for the helper's picks only; a helper that answers per-pick, or with the wrong row count, is an ERROR; without an active
++// RemoteExpertOpt the request is the old per-pick one, and a wrong row count there is an ERROR too.
++#include <algorithm>
++#include <atomic>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <string>
++#include <thread>
++#include <unistd.h>
++#include <vector>
++
++#include "strata/seabraid/channel.hpp"
++#include "strata/core/expert_cache.hpp"
++#include "strata/core/expert_source.hpp"
++#include "strata/core/remote_expert_opt.hpp"
++#include "strata/core/remote_experts.hpp"
++#include "strata/kernels/cpu/expert.hpp"
++#include "strata/kernels/cpu/expert_layout.hpp"
++#include "strata/kernels/window_limits.hpp"
++
++namespace bl = seabraid;
++using strata::core::RemoteExperts;
++using strata::core::RemoteExpertOpt;
++
++static int g_fail = 0;
++#define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); ++g_fail; } } while (0)
++
++constexpr int H = strata::kernels::cpu::H, K = 10, MAXT = strata::kernels::kWindowMaxT, NL = 3, NE = 16, LAYER = 1;
++enum Mode { kNormal, kAnswerPerPick, kWrongRows };
++
++// The fake helper's expert: expert e on activation x gives (e + 1) * x.  Known, so every merged value is predictable.
++static float expert_val(int e, float xj) { return (float) (e + 1) * xj; }
++
++struct Fixture {
++    bl::Channel ch;
++    std::atomic<int> mode{kNormal};
++    std::atomic<int> last_req_mode{-1};     // the out_mode main asked for on the last request
++    std::vector<float> last_weights;        // the channel's weights region as the helper saw it
++    std::thread th;
++    RemoteExperts re;
++    std::unique_ptr<RemoteExpertOpt> opt;
++    std::vector<float> sum_mem = std::vector<float>((size_t) MAXT * (H + K), 0.0f);
++    strata::core::ExpertCache primary;
++    strata::core::FileExpertSource src;
++    std::string err;
++
++    Fixture(const char* tag, bool with_opt) {
++        const std::string name = std::string("/rebl") + std::to_string(getpid()) + tag;
++        std::string e;
++        if (!ch.create(name, H, (int64_t) MAXT * K, NL, NE, (uint32_t) MAXT, (int64_t) strata::kernels::cpu::expert_layout().max_blob, e)) {
++            std::printf("create failed: %s\n", e.c_str()); std::exit(2);
++        }
++        ch.header()->free_gib = 8.0;
++        std::strcpy(ch.header()->helper_name, "fake-helper");
++        ch.header()->state.store(bl::kHelperUp, std::memory_order_release);
++        th = std::thread([this] { serve(); });
++        setenv("SEABRAID_STRATA_SHM", name.c_str(), 1);
++        if (with_opt) { opt = std::make_unique<RemoteExpertOpt>(); opt->attach(re); opt->init_host_only(sum_mem.data()); }
++        std::vector<std::pair<int32_t, int32_t>> ranked;
++        for (int e2 : {2, 3, 5, 7, 9}) ranked.emplace_back(LAYER, e2);
++        std::vector<uint8_t> claimed((size_t) NL * NE, 0);
++        if (!re.open(bl::kDeviceBase, 5, NL, NE, ranked, primary, src, claimed, err, false)) {
++            std::printf("open failed: %s\n", err.c_str()); std::exit(2);
++        }
++    }
++    ~Fixture() {
++        re.close();   // sets kShutdown, which ends the helper loop
++        ch.header()->state.store(bl::kShutdown, std::memory_order_release);
++        th.join();
++    }
++    void serve() {
++        bl::Header* hd = ch.header();
++        while (hd->state.load(std::memory_order_acquire) != bl::kPlanReady) {
++            if (hd->state.load() == bl::kShutdown) return;
++            usleep(200);
++        }
++        for (int64_t i = 0; i < hd->plan_count; ++i) ch.held()[(size_t) ch.plan()[2 * i] * NE + (size_t) ch.plan()[2 * i + 1]] = 1;
++        hd->resident = hd->plan_count; hd->gib = 0.1;
++        hd->resp_seq.store(hd->req_seq.load(), std::memory_order_release);
++        hd->state.store(bl::kLoaded, std::memory_order_release);
++        uint64_t seen = hd->req_seq.load();
++        while (hd->state.load(std::memory_order_acquire) != bl::kShutdown) {
++            if (hd->req_seq.load(std::memory_order_acquire) == seen) { usleep(50); continue; }
++            seen = hd->req_seq.load(std::memory_order_acquire);
++            const int T = (int) hd->n_tok;
++            const bool per_token = hd->out_mode == bl::kOutPerToken;
++            last_req_mode = (int) hd->out_mode;
++            last_weights.assign(ch.weights(), ch.weights() + T * K);
++            float* out = ch.out();
++            if (per_token) {
++                for (int i = 0; i < T * H; ++i) out[i] = 0.0f;
++                for (int t = 0; t < T; ++t)
++                    for (int i = 0; i < K; ++i) {
++                        const int e = ch.ids()[t * K + i];
++                        if (e < 0) continue;
++                        for (int j = 0; j < H; ++j) out[t * H + j] += ch.weights()[t * K + i] * expert_val(e, ch.x()[t * H + j]);
++                    }
++            } else {   // per-pick: one UNWEIGHTED row per owned pick, at its pick index
++                for (int p = 0; p < T * K; ++p) {
++                    const int e = ch.ids()[p];
++                    if (e < 0) continue;
++                    for (int j = 0; j < H; ++j) out[(size_t) p * H + j] = expert_val(e, ch.x()[(p / K) * H + j]);
++                }
++            }
++            hd->ok = 1;
++            // A dishonest echo is how the mismatch tests make the helper misbehave.
++            hd->out_mode = mode == kAnswerPerPick ? bl::kOutPerPick : (per_token ? bl::kOutPerToken : bl::kOutPerPick);
++            hd->out_rows = mode == kWrongRows ? T + 1 : (per_token ? T : T * K);
++            hd->resp_seq.store(seen, std::memory_order_release);
++        }
++    }
++};
++
++struct Window {
++    int T;
++    std::vector<float> x, w;
++    std::vector<int32_t> ids;
++    explicit Window(int t) : T(t), x((size_t) t * H), w((size_t) t * K), ids((size_t) t * K) {
++        for (size_t i = 0; i < x.size(); ++i) x[i] = 0.25f + (float) (i % 5) * 0.5f;
++        // held by the helper: 2 3 5 7 9; the others (11..15) are foreign picks that the primary serves.
++        const int pool[K] = {2, 11, 3, 5, 12, 7, 9, 13, 14, 15};
++        for (int tk = 0; tk < t; ++tk)
++            for (int i = 0; i < K; ++i) {
++                ids[(size_t) tk * K + i] = tk == 1 ? pool[(i + 3) % K] : pool[i];
++                w[(size_t) tk * K + i] = 0.05f + 0.07f * (float) ((tk * K + i) % 9);   // distinct, nonzero, like a normalised router
++            }
++    }
++    static bool held(int e) { return e == 2 || e == 3 || e == 5 || e == 7 || e == 9; }
++};
++
++static double rel_err(const float* a, const std::vector<double>& ref) {
++    double worst = 0.0;
++    for (size_t i = 0; i < ref.size(); ++i) {
++        const double d = std::fabs((double) a[i] - ref[i]) / std::max(1.0, std::fabs(ref[i]));
++        worst = std::max(worst, d);
++    }
++    return worst;
++}
++
++int main() {
++    const int TB = 2, T = 3;   // a window of 3 tokens that starts at token 2 of the verify batch (token_begin != 0)
++    // ---- 1. per-token round trip with a token_begin offset
++    {
++        Fixture f("a", true);
++        Window win(T);
++        f.opt->begin(win.w.data(), TB, T);
++        std::string err;
++        CHECK(f.re.begin(LAYER, win.x.data(), win.ids.data(), T, K, nullptr, nullptr, err));
++        std::vector<float> rows((size_t) T * K * H, -7.0f);
++        CHECK(f.re.finish(rows.data(), err));
++        if (!err.empty()) std::printf("  err: %s\n", err.c_str());
++        f.opt->end();
++        CHECK(f.last_req_mode.load() == (int) bl::kOutPerToken);
++        // the weights region carries each HELPER-OWNED pick's router weight and 0 for the rest
++        bool wt_ok = f.last_weights.size() == (size_t) T * K;
++        for (int i = 0; wt_ok && i < T * K; ++i) wt_ok = f.last_weights[(size_t) i] == (Window::held(win.ids[(size_t) i]) ? win.w[(size_t) i] : 0.0f);
++        CHECK(wt_ok);
++        // the sum equals sum over the helper's picks of w * expert(x_t)
++        std::vector<double> ref((size_t) T * H, 0.0);
++        for (int t = 0; t < T; ++t)
++            for (int i = 0; i < K; ++i) {
++                const int e = win.ids[(size_t) t * K + i];
++                if (!Window::held(e)) continue;
++                for (int j = 0; j < H; ++j) ref[(size_t) t * H + j] += (double) win.w[(size_t) t * K + i] * expert_val(e, win.x[(size_t) t * H + j]);
++            }
++        CHECK(f.opt->sum_rows() == f.sum_mem.data() + (size_t) TB * H);
++        CHECK(rel_err(f.opt->sum_rows(), ref) < 1e-6);
++        // h_mask_ is set for exactly the helper's picks
++        const int32_t* mask = reinterpret_cast<const int32_t*>(f.sum_mem.data() + (size_t) MAXT * H) + TB * K;
++        bool mask_ok = true;
++        for (int i = 0; i < T * K; ++i) mask_ok = mask_ok && ((mask[i] != 0) == Window::held(win.ids[(size_t) i]));
++        CHECK(mask_ok);
++        CHECK(rows[0] == -7.0f);   // the per-pick destination is untouched in per-token mode
++    }
++    // ---- 2. the helper reports the wrong row count: an error, not partial data
++    {
++        Fixture f("b", true);
++        Window win(T);
++        f.mode = kWrongRows;
++        f.opt->begin(win.w.data(), TB, T);
++        std::string err;
++        CHECK(f.re.begin(LAYER, win.x.data(), win.ids.data(), T, K, nullptr, nullptr, err));
++        std::vector<float> rows((size_t) T * K * H);
++        CHECK(!f.re.finish(rows.data(), err));
++        CHECK(err.find("per-token request") != std::string::npos);
++        f.opt->end();
++        bool zero = true;   // nothing was accumulated
++        for (int i = 0; i < T * H; ++i) zero = zero && f.opt->sum_rows()[i] == 0.0f;
++        CHECK(zero);
++    }
++    // ---- 3. the helper answers per-pick to a per-token request: an error
++    {
++        Fixture f("c", true);
++        Window win(T);
++        f.mode = kAnswerPerPick;
++        f.opt->begin(win.w.data(), TB, T);
++        std::string err;
++        CHECK(f.re.begin(LAYER, win.x.data(), win.ids.data(), T, K, nullptr, nullptr, err));
++        std::vector<float> rows((size_t) T * K * H);
++        CHECK(!f.re.finish(rows.data(), err));
++        CHECK(err.find("out_mode") != std::string::npos);
++        f.opt->end();
++        bool zero = true;   // and nothing was accumulated from the wrong-shaped rows
++        for (int i = 0; i < T * H; ++i) zero = zero && f.opt->sum_rows()[i] == 0.0f;
++        CHECK(zero);
++    }
++    // ---- 4. no active RemoteExpertOpt window: the request is the old per-pick one and rows land at the pick indices
++    {
++        Fixture f("d", true);
++        Window win(T);
++        std::string err;
++        CHECK(f.re.begin(LAYER, win.x.data(), win.ids.data(), T, K, nullptr, nullptr, err));   // (no opt->begin: inactive)
++        std::vector<float> rows((size_t) T * K * H, -7.0f);
++        CHECK(f.re.finish(rows.data(), err));
++        CHECK(f.last_req_mode.load() == (int) bl::kOutPerPick);
++        bool ok = true;
++        for (int p = 0; p < T * K; ++p) {
++            const int e = win.ids[(size_t) p];
++            const float want = Window::held(e) ? expert_val(e, win.x[(size_t) (p / K) * H]) : -7.0f;
++            ok = ok && rows[(size_t) p * H] == want;
++        }
++        CHECK(ok);
++    }
++    // ---- 5. no RemoteExpertOpt at all (today's engine): per-pick, unchanged
++    {
++        Fixture f("e", false);
++        Window win(T);
++        std::string err;
++        CHECK(f.re.begin(LAYER, win.x.data(), win.ids.data(), T, K, nullptr, nullptr, err));
++        std::vector<float> rows((size_t) T * K * H, -7.0f);
++        CHECK(f.re.finish(rows.data(), err));
++        CHECK(f.last_req_mode.load() == (int) bl::kOutPerPick);
++        CHECK(rows[0] == (Window::held(win.ids[0]) ? expert_val(win.ids[0], win.x[0]) : -7.0f));
++    }
++    // ---- 6. per-pick request, wrong row count echoed: an ERROR, and the per-pick destination is left untouched
++    {
++        Fixture f("g", false);
++        f.mode = kWrongRows;
++        Window win(T);
++        std::string err;
++        CHECK(f.re.begin(LAYER, win.x.data(), win.ids.data(), T, K, nullptr, nullptr, err));
++        std::vector<float> rows((size_t) T * K * H, -7.0f);
++        CHECK(!f.re.finish(rows.data(), err));
++        CHECK(err.find("per-pick request") != std::string::npos);
++        bool untouched = true;
++        for (const float v : rows) untouched = untouched && v == -7.0f;
++        CHECK(untouched);
++    }
++    if (g_fail == 0) { std::printf("ALL OK\n"); return 0; }
++    std::printf("FAILED: %d\n", g_fail);
++    return 1;
++}

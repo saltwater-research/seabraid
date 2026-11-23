@@ -1,0 +1,142 @@
+% Copyright 2026 Saltwater Research LLC. SPDX-License-Identifier: Apache-2.0
+% URLs are given without the scheme (the repository egress checker reads any scheme-qualified URL in a non-doc file as code).
+% Only fields recorded in the repository (docs/TECHNICAL-NOTE.md section 8, docs/RESEARCH-LOG.md) are given. Authors and full
+% titles were not recorded there, so they are left out rather than guessed; the year of an arXiv entry is the one its
+% identifier (yymm) encodes. Fill in authors and titles from the arXiv abstract pages before submission if wanted.
+@misc{llamacpp,
+  title        = {llama.cpp},
+  howpublished = {\Rl{github.com/ggml-org/llama.cpp}},
+  note         = {Vulkan backend, RPC backend, MoE expert cache}
+}
+@misc{ggml,
+  title        = {ggml},
+  howpublished = {\Rl{github.com/ggml-org/ggml}},
+  note         = {backend scheduler API}
+}
+@misc{strata,
+  title        = {Strata},
+  howpublished = {\Rl{github.com/Niko1221/Strata}},
+  note         = {tiered expert cache; v0.2.15 \texttt{--peer-device}, \texttt{docs/SECOND\_GPU.md}}
+}
+@misc{maya,
+  title        = {Project Maya},
+  note         = {vendored in Strata (\texttt{third\_party/project-maya}); no separate identifier recorded}
+}
+@misc{heterollm,
+  title        = {HeteroLLM},
+  note         = {repository \texttt{coffeescript53/HeteroLLM}}
+}
+@misc{ktransformers,
+  title        = {KTransformers},
+  howpublished = {\Rl{github.com/kvcache-ai/ktransformers}}
+}
+@misc{sglang,
+  title        = {SGLang: expert parallelism},
+  howpublished = {\Rl{docs.sglang.io/docs/advanced_features/expert_parallelism}}
+}
+@misc{mlcllm,
+  title        = {MLC-LLM},
+  note         = {no identifier recorded}
+}
+@misc{fiddler,
+  title        = {Fiddler},
+  note         = {CPU-GPU orchestration for MoE inference; no identifier recorded}
+}
+@misc{moelightning,
+  title        = {MoE-Lightning},
+  note         = {no identifier recorded}
+}
+@misc{odmoe,
+  title        = {OD-MoE},
+  note         = {on-demand expert loading; no identifier recorded}
+}
+@misc{tritonmoe,
+  title        = {TritonMoE},
+  year         = {2026},
+  note         = {arXiv:2605.23911},
+  eprint       = {2605.23911},
+  archivePrefix = {arXiv}
+}
+@misc{adaoffload,
+  title        = {AdaOffload},
+  year         = {2026},
+  note         = {arXiv:2611.10219},
+  eprint       = {2611.10219},
+  archivePrefix = {arXiv}
+}
+@misc{thunderep,
+  title        = {ThunderEP},
+  year         = {2026},
+  note         = {arXiv:2609.40093},
+  eprint       = {2609.40093},
+  archivePrefix = {arXiv}
+}
+@misc{uccl,
+  title        = {UCCL-EP},
+  year         = {2025},
+  note         = {arXiv:2512.19849},
+  eprint       = {2512.19849},
+  archivePrefix = {arXiv}
+}
+@misc{megascale,
+  title        = {MegaScale-Infer},
+  year         = {2025},
+  note         = {arXiv:2504.02263},
+  eprint       = {2504.02263},
+  archivePrefix = {arXiv}
+}
+@misc{hap,
+  title        = {HAP},
+  year         = {2024},
+  note         = {arXiv:2401.05965},
+  eprint       = {2401.05965},
+  archivePrefix = {arXiv}
+}
+@misc{hetermoe,
+  title        = {HeterMoE},
+  year         = {2025},
+  note         = {arXiv:2504.03871},
+  eprint       = {2504.03871},
+  archivePrefix = {arXiv}
+}
+@misc{moeinfinity,
+  title        = {MoE-Infinity},
+  author       = {Xue, L. and others},
+  year         = {2024},
+  note         = {expert caching; no identifier recorded}
+}
+@misc{pregated,
+  title        = {Pre-gated MoE},
+  author       = {Hwang, R. and others},
+  year         = {2024},
+  note         = {ISCA 2024; no identifier recorded}
+}
+@misc{tutel,
+  title        = {Tutel: Adaptive Mixture-of-Experts at Scale},
+  author       = {Hwang, Changho and Cui, Wei and Xiong, Yifan and others},
+  year         = {2022},
+  note         = {arXiv:2206.03382},
+  eprint       = {2206.03382},
+  archivePrefix = {arXiv}
+}
+@misc{flexmoe,
+  title        = {FlexMoE: Scaling Large-scale Sparse Pre-trained Model Training via Dynamic Device Placement},
+  author       = {Nie, Xiaonan and Miao, Xupeng and Wang, Zilong and Yang, Zichao and Xue, Jilong and Ma, Lingxiao and Cao, Gang and Cui, Bin},
+  year         = {2023},
+  note         = {arXiv:2304.03946},
+  eprint       = {2304.03946},
+  archivePrefix = {arXiv}
+}
+@misc{eplb,
+  title        = {Expert Parallelism Load Balancer (EPLB)},
+  howpublished = {\Rl{github.com/deepseek-ai/EPLB}},
+  note         = {README and \texttt{eplb.py}, read 2026-11-19}
+}
+@misc{coxmoe,
+  title        = {CoX-MoE: Coalesced Expert Execution for High-Throughput MoE Inference with AMX-Enabled CPU-GPU Co-Execution},
+  author       = {Son, Muyoung and Chen, Yi and Yoo, Seungjae and Choi, Soongyu and Kim, Joo-Young},
+  year         = {2026},
+  note         = {arXiv:2605.17889},
+  eprint       = {2605.17889},
+  archivePrefix = {arXiv}
+}

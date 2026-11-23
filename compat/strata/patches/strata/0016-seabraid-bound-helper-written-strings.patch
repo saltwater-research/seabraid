@@ -1,0 +1,207 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Seabraid <seabraid@example.invalid>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH 16/16] seabraid: bound every helper-written string the engine
+ reads
+
+The helper is a separate process the engine does not trust. The engine
+read its shared-memory text (msg, helper_name, err, tier_err, pf_err) with
+%s, std::string(const char*) and "terminate the last byte, then read": a
+helper that fills a field to its full width without a NUL made the engine
+read past it, and the terminating store raced the helper's own writes.
+
+Add seabraid::bounded_text(field, cap) to the channel header: it copies at
+most cap-1 bytes, stops at the first NUL, never reads past the field, and
+drops every byte outside printable ASCII except TAB so helper text cannot
+inject terminal escape sequences into logs or error strings. Use it at
+every engine-side read of a helper-written char array (remote_experts,
+remote_prefill); the racy terminate-then-read stores go.
+
+Channel::connect_private and the private attach now return the structured
+Attach { kAttached, kNotReady, kRefused } instead of a bool the caller had
+to interpret by matching the English error text.
+
+seabraid_bounded_text_test (CPU only, registered in the root CMakeLists) fills each
+field to its full width with no NUL, on exact-width heap buffers (ASan
+aborts on any over-read) and on a real shm header, and checks NUL stop,
+cap 0/1, null and control-byte stripping.
+
+The include/strata/seabraid/channel.hpp (and expert_spec.hpp) half of this change lives in Seabraid's
+adapters/strata/wire, the wire's one owner; this patch keeps only the engine side.
+---
+ CMakeLists.txt                            |  6 ++
+ src/core/remote_experts.cpp               | 11 ++--
+ src/core/remote_prefill.cpp               |  5 +-
+ tests/core/seabraid_bounded_text_test.cpp | 76 +++++++++++++++++++++++
+ 4 files changed, 89 insertions(+), 9 deletions(-)
+ create mode 100644 tests/core/seabraid_bounded_text_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e2039604b..9580888f3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -408,6 +408,12 @@ if(STRATA_BUILD_TESTS)
+   target_include_directories(stage_reserve_test PRIVATE include)
+   add_test(NAME stage_reserve_test COMMAND stage_reserve_test)
+ 
++  # The helper-written text fields (msg, helper_name, err, tier_err, pf_err) are read only through seabraid::bounded_text: a helper
++  # that omits the NUL must not make the engine over-read, and its text must not carry terminal escapes.  Header-only, no GPU.
++  add_executable(seabraid_bounded_text_test tests/core/seabraid_bounded_text_test.cpp)
++  target_include_directories(seabraid_bounded_text_test PRIVATE include)
++  add_test(NAME seabraid_bounded_text_test COMMAND seabraid_bounded_text_test)
++
+   # SEABRAID_STRATA_HOT_SHARE: the f-paced interleave of the expert ranking between the primary and the helper (header-only;
+   # re-enacts the primary's sized-slot loop and seabraid_open's walk, checks them disjoint and on plan)
+   add_executable(seabraid_hot_share_test tests/program/seabraid_hot_share_test.cpp)
+diff --git a/src/core/remote_experts.cpp b/src/core/remote_experts.cpp
+index 30a1dcfe5..e85469d4d 100644
+--- a/src/core/remote_experts.cpp
++++ b/src/core/remote_experts.cpp
+@@ -83,7 +83,7 @@ bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
+         }
+         if (!ok) { if (err.empty()) err = "seabraid helper did not come up"; return false; }
+         free_gib = ch.header()->free_gib;
+-        std::fprintf(stderr, "seabraid: helper %s on channel %s, %.2f GiB free\n", ch.header()->helper_name,
++        std::fprintf(stderr, "seabraid: helper %s on channel %s, %.2f GiB free\n", seabraid::bounded_text(ch.header()->helper_name, sizeof ch.header()->helper_name).c_str(),
+                      name ? name : "/seabraid0", free_gib);
+         return true;
+     }
+@@ -587,12 +587,12 @@ bool RemoteExperts::seabraid_open(int slots, int64_t layers, int64_t experts,
+     hd->plan_auto = auto_size ? 1 : 0;
+     hd->state.store(seabraid::kPlanReady, std::memory_order_release);
+     std::fprintf(stderr, "seabraid: sent a plan of %lld experts (%.2f GiB) to %s; waiting for it to load\n",
+-                 (long long) count, (double) needed / 1073741824.0, hd->helper_name);
++                 (long long) count, (double) needed / 1073741824.0, seabraid::bounded_text(hd->helper_name, sizeof hd->helper_name).c_str());
+     if (!seabraid::Channel::wait([&] { const uint32_t st = hd->state.load(std::memory_order_acquire);
+                                        return st == seabraid::kLoaded || st == seabraid::kFailed; }, 1800)) {
+         err = "seabraid: the helper did not finish loading in 30 minutes"; device_ = -1; return false;
+     }
+-    if (hd->state.load() == seabraid::kFailed) { err = std::string("seabraid helper: ") + hd->msg; device_ = -1; return false; }
++    if (hd->state.load() == seabraid::kFailed) { err = "seabraid helper: " + seabraid::bounded_text(hd->msg, sizeof hd->msg); device_ = -1; return false; }
+     bl_held_.assign(ch->held(), ch->held() + (size_t) layers * (size_t) experts);
+     bl_resident_ = hd->resident;
+     bl_gib_ = hd->gib;
+@@ -690,7 +690,7 @@ bool RemoteExperts::seabraid_helper_finish(float* out, std::string& err) {
+     }
+     bl_pending_ = false;
+     ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+-    if (!hd->ok) { err = std::string("seabraid helper: ") + hd->err; return false; }
++    if (!hd->ok) { err = "seabraid helper: " + seabraid::bounded_text(hd->err, sizeof hd->err); return false; }
+     if (out == nullptr) return true;
+     if (bl_per_token_) {
+         // The helper must echo what it did.  A per-pick answer to a per-token request, or a different row count, means
+@@ -766,8 +766,7 @@ bool RemoteExperts::seabraid_retier(const seabraid::TierWireOp* ops, int32_t n,
+     }
+     if (res != nullptr) std::copy_n(hd->tier_res, n, res);
+     const bool ok = hd->tier_ok != 0;
+-    hd->tier_err[sizeof(hd->tier_err) - 1] = '\0';
+-    const std::string why = ok ? std::string() : std::string(hd->tier_err);
++    const std::string why = ok ? std::string() : seabraid::bounded_text(hd->tier_err, sizeof hd->tier_err);
+ 
+     // (4) Refresh the local view from the helper's, WHATEVER the outcome: a partly applied round still moved
+     // experts, so bailing out early would leave this engine routing to slots that no longer hold them.
+diff --git a/src/core/remote_prefill.cpp b/src/core/remote_prefill.cpp
+index 2aaa97d41..24b2dbedb 100644
+--- a/src/core/remote_prefill.cpp
++++ b/src/core/remote_prefill.cpp
+@@ -256,7 +256,7 @@ bool RemoteExperts::prefill_open(int64_t k, std::string& err) {
+     pf_open_ = true;
+     std::fprintf(stderr, "D4: prompt reading computes the experts %s holds on that card (%s): region %lld tokens/request "
+                          "(%.1f MiB), lend %.2f GB/s, wire %.2f GB/s, %.0f picks/s, %.0f us/layer\n",
+-                 h->helper_name, pf_mode_ == 2 ? "every eligible chunk" : "per-chunk byte/time model", (long long) limits.pf_tokens,
++                 seabraid::bounded_text(h->helper_name, sizeof h->helper_name).c_str(), pf_mode_ == 2 ? "every eligible chunk" : "per-chunk byte/time model", (long long) limits.pf_tokens,
+                  (double) bl_->prefill_region().bytes / 1048576.0, pf_lend_Bps_ / 1e9, pf_wire_Bps_ / 1e9, pf_rate_, pf_layer_s_ * 1e6);
+     return true;
+ }
+@@ -347,8 +347,7 @@ bool RemoteExperts::prefill_end(uint16_t* sums16, std::string& err) {
+                     return fail("the expert process (pid " + std::to_string(pid) + ") died");
+                 if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60)) return fail("no answer within 60 s");
+             }
+-            h->pf_err[sizeof(h->pf_err) - 1] = '\0';
+-            if (!h->pf_ok) return fail(std::string("the expert process: ") + h->pf_err);
++            if (!h->pf_ok) return fail("the expert process: " + seabraid::bounded_text(h->pf_err, sizeof h->pf_err));
+             // The echo: the picks it computed must be the picks asked, or a contribution would be silently missing.
+             if (h->pf_picks != (int32_t) pf_asked_)
+                 return fail("asked " + std::to_string((long long) pf_asked_) + " picks, the expert process computed " +
+diff --git a/tests/core/seabraid_bounded_text_test.cpp b/tests/core/seabraid_bounded_text_test.cpp
+new file mode 100644
+index 000000000..cd99f935b
+--- /dev/null
++++ b/tests/core/seabraid_bounded_text_test.cpp
+@@ -0,0 +1,76 @@
++// seabraid_bounded_text_test: the engine reads helper-written text only through seabraid::bounded_text, CPU only.
++//
++// The helper is a separate process the engine does not trust.  A compromised one can fill msg / helper_name / err /
++// tier_err / pf_err to the last byte without a NUL; reading that with %s or std::string(const char*) runs past the field.
++//
++//   1 unterminated : each field width filled with no NUL comes back as exactly width-1 bytes.  The input is an EXACT-width
++//                    heap buffer, so under ASan any read past it (the bug) aborts the test.
++//   2 real header  : the same, on the fields of a real shm channel header (what the engine actually reads).
++//   3 terminated   : a normal short string, an embedded NUL (stops there), an empty field, a null pointer, cap 0 and 1.
++//   4 control bytes: ESC sequences, BEL, CR/LF, DEL and bytes >= 0x80 are dropped (no terminal-escape injection); TAB is kept.
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <string>
++#include <unistd.h>
++
++#include "strata/seabraid/channel.hpp"
++
++namespace bl = seabraid;
++
++static int g_fail = 0;
++#define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); ++g_fail; } } while (0)
++
++static void check_unterminated(size_t width) {
++    std::unique_ptr<char[]> f(new char[width]);   // exact width: a read of byte `width` is a heap-buffer-overflow under ASan
++    std::memset(f.get(), 'A', width);
++    const std::string s = bl::bounded_text(f.get(), width);
++    CHECK(s.size() == width - 1);
++    CHECK(s == std::string(width - 1, 'A'));
++}
++
++static void check_header() {
++    const std::string name = "/blbt" + std::to_string(getpid());
++    bl::Channel ch;
++    std::string e;
++    if (!ch.create(name, 64, 64, 2, 4, 16, 4096, e)) { std::printf("create failed: %s\n", e.c_str()); std::exit(2); }
++    bl::Header* h = ch.header();
++    std::memset(h->msg, 'M', sizeof h->msg);
++    std::memset(h->helper_name, 'N', sizeof h->helper_name);
++    std::memset(h->err, 'E', sizeof h->err);
++    std::memset(h->tier_err, 'T', sizeof h->tier_err);
++    std::memset(h->pf_err, 'P', sizeof h->pf_err);
++    CHECK(bl::bounded_text(h->msg, sizeof h->msg) == std::string(sizeof h->msg - 1, 'M'));
++    CHECK(bl::bounded_text(h->helper_name, sizeof h->helper_name) == std::string(sizeof h->helper_name - 1, 'N'));
++    CHECK(bl::bounded_text(h->err, sizeof h->err) == std::string(sizeof h->err - 1, 'E'));
++    CHECK(bl::bounded_text(h->tier_err, sizeof h->tier_err) == std::string(sizeof h->tier_err - 1, 'T'));
++    CHECK(bl::bounded_text(h->pf_err, sizeof h->pf_err) == std::string(sizeof h->pf_err - 1, 'P'));
++}
++
++static void check_terminated() {
++    char a[16] = "boom: failed";
++    CHECK(bl::bounded_text(a, sizeof a) == "boom: failed");
++    char b[16] = {'a', 'b', '\0', 'c', 'd', 'e'};
++    CHECK(bl::bounded_text(b, sizeof b) == "ab");        // stops at the first NUL
++    char c[8] = {0};
++    CHECK(bl::bounded_text(c, sizeof c).empty());
++    CHECK(bl::bounded_text(nullptr, 8).empty());
++    CHECK(bl::bounded_text(a, 0).empty());
++    CHECK(bl::bounded_text(a, 1).empty());                // cap 1 leaves room for the NUL only
++    CHECK(bl::bounded_text(a, 5) == "boom");              // cap-1 bytes at most
++}
++
++static void check_control() {
++    const char in[] = "ok\x1b[31mred\x1b]0;title\x07 a\tb\r\nc\x7f" "d\x9b" "e\xc3\xa9";
++    CHECK(bl::bounded_text(in, sizeof in) == "ok[31mred]0;title a\tbcde");   // ESC, BEL, CR, LF, DEL, >=0x80 gone; TAB kept
++}
++
++int main() {
++    for (const size_t w : {size_t(128), size_t(256), size_t(512)}) check_unterminated(w);
++    check_header();
++    check_terminated();
++    check_control();
++    std::printf("%s\n", g_fail ? "FAILED" : "OK");
++    return g_fail ? 1 : 0;
++}

@@ -1,0 +1,12 @@
+{"ts_us":1000,"time":"t+0.001s","rec":"helper","rung":1,"event":"up","reason":"driver started","after_loss_us":0}
+{"ts_us":2000,"time":"t+1.000s","rec":"move","round":1,"epoch":2,"layer":0,"kind":"committed","up":{"expert":5,"from_rung":1,"to_rung":0},"down":{"expert":2,"from_rung":0,"to_rung":1},"src":"card","dst":"card","bytes":4096,"stage_us":100,"write_us":300,"timed":true,"verified":1}
+{"ts_us":2001,"time":"t+1.001s","rec":"move","round":1,"epoch":3,"layer":0,"kind":"committed","up":{"expert":7,"from_rung":2,"to_rung":1},"down":{"expert":3,"from_rung":1,"to_rung":2},"src":"fallback","dst":"fallback","bytes":4096,"stage_us":2000,"write_us":500,"timed":true,"verified":1}
+{"ts_us":2100,"time":"t+1.002s","rec":"round","round":1,"epoch":3,"planned":2,"committed":2,"rejected":0,"restored":0,"quarantined":0,"skipped":0,"qmask":0,"round_us":9000,"fallback":{"ram_hits":1,"file_reads":1}}
+{"ts_us":3000,"time":"t+2.000s","rec":"move","round":2,"epoch":4,"layer":0,"kind":"committed","up":{"expert":2,"from_rung":1,"to_rung":0},"down":{"expert":5,"from_rung":0,"to_rung":1},"src":"card","dst":"card","bytes":4096,"stage_us":150,"write_us":350,"timed":true,"verified":1}
+{"ts_us":3001,"time":"t+2.001s","rec":"move","round":2,"epoch":4,"layer":1,"kind":"rejected","up":{"expert":4,"from_rung":1,"to_rung":0},"down":{"expert":6,"from_rung":0,"to_rung":1},"src":"card","dst":"card","bytes":4096,"stage_us":40,"write_us":0,"timed":true,"verified":0,"issue":{"stage":"stage","result":"failed","rung":1}}
+{"ts_us":3100,"time":"t+2.002s","rec":"round","round":2,"epoch":4,"planned":2,"committed":1,"rejected":1,"restored":0,"quarantined":0,"skipped":0,"qmask":0,"round_us":3000,"fallback":{"ram_hits":0,"file_reads":2}}
+{"ts_us":4000,"time":"t+3.000s","rec":"window","rung":1,"layers":4,"rows_submitted":4,"rows_shipped":4,"failures":0,"timeouts":0,"window_us":5000,"submit_to_collect_us":{"n":4,"mean":100.0,"p50":90,"p99":200},"blocked_us":{"n":4,"mean":20.0,"p50":10,"p99":50}}
+{"ts_us":5000,"time":"t+4.000s","rec":"window","rung":1,"layers":4,"rows_submitted":4,"rows_shipped":4,"failures":0,"timeouts":0,"window_us":6000,"submit_to_collect_us":{"n":4,"mean":300.0,"p50":250,"p99":900},"blocked_us":{"n":4,"mean":40.0,"p50":30,"p99":100}}
+{"ts_us":6000,"time":"t+5.000s","rec":"helper","rung":1,"event":"closed","reason":"helper is gone","after_loss_us":0}
+{"ts_us":8500,"time":"t+7.500s","rec":"helper","rung":1,"event":"served_after_loss","reason":"next window","after_loss_us":2500}
+this line is not json and must be skipped and counted

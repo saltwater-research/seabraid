@@ -1,0 +1,358 @@
+{
+ "_doc": "Config of run.py. Protocol: scratch design DESIGN.md section 5 (arms 5.2, workloads 5.3, pass criteria 5.4). {name} placeholders come from vars (override with --var name=value) plus {rundir} (per-start output dir). Flag spellings follow compat/strata/strata-ext/src/retier_loop.cpp. Fixed setup of the 2026-11-18 S8 run: --adapt-every 64 --adapt-swaps 8 and STRATA_DISJOINT_ADAPT=1 on EVERY arm (heat exists only with the adapt flags; the matched arms must share the engine's own adaptation).",
+ "vars": {
+  "launcher": "bin/launch_engine.sh",
+  "helper": "bin/helper-cuda",
+  "shm": "/seabraid-qual",
+  "port": "8794",
+  "gpu": "UNSET: pass --var gpu=<the CUDA_VISIBLE_DEVICES value: a device index or a GPU UUID; a UUID identifies one machine, so it is never kept in the repo>",
+  "rocm": "UNSET: pass --var rocm=<the ROCm install dir>",
+  "pack": "UNSET: pass --var pack=<the model pack dir>",
+  "native": "UNSET: pass --var native=<the model GGUF (part 1)>",
+  "force_check": "bin/force_check.py",
+  "forced_set": "bin/forced-set.json",
+  "forced_cfg_M": "bin/forced-cfg-M.json",
+  "forced_cfg_P0": "bin/forced-cfg-P0.json",
+  "forced_cfg_P2": "bin/forced-cfg-P2.json"
+ },
+ "engine": {
+  "argv": [
+   "bash",
+   "{launcher}",
+   "{rundir}",
+   "--adapt-every",
+   "64",
+   "--adapt-swaps",
+   "8"
+  ],
+  "env": {
+   "QUAL_PORT": "{port}",
+   "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+   "HIP_VISIBLE_DEVICES": "0",
+   "CUDA_VISIBLE_DEVICES": "{gpu}",
+   "STRATA_DISJOINT_ADAPT": "1",
+   "LD_LIBRARY_PATH": "{rocm}/lib:{rocm}/lib/rocm_sysdeps/lib:/usr/lib64:/usr/lib"
+  },
+  "ready_s": 1800,
+  "stop_grace_s": 90,
+  "helper_match": "{helper}",
+  "stdout_name": "launcher.out",
+  "log_name": "strata.log"
+ },
+ "policy": { "every": 128, "moves": 4, "margin": 1.25, "cooldown": 8, "ceiling": 0.08 },
+ "round_marker": "placement round=",
+ "io_patterns": {
+  "os_read_mb": "file tier I/O this request: the OS read ([0-9.]+) MB",
+  "expert_read_mb": "for ([0-9.]+) MB of expert reads",
+  "fetches": "decode waited [0-9.]+ ms in ([0-9]+) fetches",
+  "decode_wait_ms": "decode waited ([0-9.]+) ms in",
+  "d4_chunks": "D4 chunk ([0-9]+) tokens \\(streamed\\): COMPUTE",
+  "file_direct_bytes": "helper file io: direct_bytes=([0-9]+)",
+  "file_buffered_bytes": "helper file io: [a-z_=0-9 ]*buffered_bytes=([0-9]+)",
+  "file_reads": "helper file io: [a-z_=0-9 ]*reads=([0-9]+)",
+  "bad_sum": "helper file io: [a-z_=0-9 ]*bad_sum=([0-9]+)"
+ },
+ "io_patterns_file_note": "PROVISIONAL (track FR-D): the four file_* / bad_sum patterns above assume ONE engine log line, `helper file io: direct_bytes=N buffered_bytes=N reads=N bad_sum=N`, carrying the helper Header counters file_direct_bytes, file_buffered_bytes, file_reads and the kTierBadSum count (cumulative). Tracks FR-E/FR-H define the real line; change these four regexes (the only place) to match, and the F1 verdict follows.",
+ "variants": {
+  "base": {},
+  "off": {},
+  "on": {
+   "env": { "STRATA_PREFILL_REMOTE_COMPUTE": "1" }
+  },
+  "cold": {},
+  "warm": {
+   "env": { "QUAL_PREWARM_PACK": "1" }
+  },
+  "ram_hi": { "args": [ "--resident-budget-gib", "10" ] },
+  "ram_mid": { "args": [ "--resident-budget-gib", "6" ] },
+  "ram_lo": { "args": [ "--resident-budget-gib", "3" ] }
+ },
+ "arms": {
+  "P0": {
+   "forced_cfg": "{forced_cfg_P0}",
+   "transport": "private",
+   "env": {
+    "SEABRAID_QWEN_HELPER": "{helper}"
+   },
+   "args": []
+  },
+  "P2": {
+   "forced_cfg": "{forced_cfg_P2}",
+   "transport": "private",
+   "env": {
+    "SEABRAID_QWEN_HELPER": "{helper}"
+   },
+   "args": [ "--retier", "on", "--retier-promote", "seabraid" ],
+   "policy": {}
+  },
+  "P2z": {
+   "transport": "private",
+   "env": {
+    "SEABRAID_QWEN_HELPER": "{helper}"
+   },
+   "args": [ "--retier", "on", "--retier-promote", "seabraid" ],
+   "policy": { "moves": 1 },
+   "note": "A/A: --retier-moves 1 makes the planner's pair budget max_moves/2 = 0 (planner.rs:276) while retier_check still accepts it (it refuses 0)"
+  },
+  "N0": {
+   "transport": "named",
+   "env": {
+    "SEABRAID_STRATA_SHM": "{shm}"
+   },
+   "helper_start": "named",
+   "args": []
+  },
+  "N1": {
+   "transport": "named",
+   "env": {
+    "SEABRAID_STRATA_SHM": "{shm}"
+   },
+   "helper_start": "named",
+   "args": [ "--retier", "on", "--retier-promote", "legacy" ],
+   "policy": {}
+  },
+  "N2": {
+   "transport": "named",
+   "env": {
+    "SEABRAID_STRATA_SHM": "{shm}"
+   },
+   "helper_start": "named",
+   "args": [ "--retier", "on", "--retier-promote", "seabraid" ],
+   "policy": {}
+  },
+  "F0": {
+   "transport": "named",
+   "env": {
+    "SEABRAID_STRATA_SHM": "{shm}"
+   },
+   "helper_start": "named_fio",
+   "args": [ "--retier", "on", "--retier-promote", "seabraid", "--retier-file-moves", "0" ],
+   "policy": {},
+   "note": "file-moves persona, reference: the ladder on, every move by bytes (blob path); identical to F1 but for --retier-file-moves"
+  },
+  "F1": {
+   "transport": "named",
+   "env": {
+    "SEABRAID_STRATA_SHM": "{shm}"
+   },
+   "helper_start": "named_fio",
+   "args": [ "--retier", "on", "--retier-promote", "seabraid", "--retier-file-moves", "1" ],
+   "policy": {},
+   "note": "file-moves persona: the ladder on, an NVMe-only expert's move is loaded by the helper straight from the model file (needs <pack>/expert-sums.v1, built by seabraid-sums)"
+  },
+  "M": {
+   "forced_cfg": "{forced_cfg_M}",
+   "transport": "none",
+   "note": "main card alone: W4 quality baseline, no helper flag",
+   "env": { "NOHELPER": "1" },
+   "args": [],
+   "no_helper": true
+  }
+ },
+ "workloads": {
+  "W0": {
+   "kind": "smoke",
+   "n": 1,
+   "arms": {
+    "P0": [ "base" ],
+    "P2": [ "base" ],
+    "P2z": [ "base" ],
+    "N0": [ "base" ],
+    "N1": [ "base" ],
+    "N2": [ "base" ]
+   },
+   "extra_args": [ "--retier-margin", "1.0" ],
+   "phases": [
+    { "name": "smoke", "prompt": "w2_code.txt", "count": 3, "max_tokens": 600 }
+   ],
+   "_doc": "3 x 600 tokens = about 300 decode windows: with --retier-every 128 a round fires in request 2 (400 tokens, one request, is under 128 windows)"
+  },
+  "W1": {
+   "kind": "decode",
+   "n": 8,
+   "arms": {
+    "P0": [ "base" ],
+    "P2": [ "base" ],
+    "P2z": [ "base" ],
+    "N0": [ "base" ],
+    "N1": [ "base" ],
+    "N2": [ "base" ]
+   },
+   "phases": [
+    { "name": "decode", "prompt": "w1_decode.txt", "count": 3, "max_tokens": 2000 }
+   ]
+  },
+  "W2": {
+   "kind": "shift",
+   "n": 3,
+   "arms": { "P0": [ "base" ], "P2": [ "base" ], "N0": [ "base" ], "N1": [ "base" ], "N2": [ "base" ] },
+   "phases": [
+    { "name": "A", "prompt": "w2_code.txt", "count": 4, "max_tokens": 1000 },
+    { "name": "B", "prompt": "w2_prose.txt", "count": 6, "max_tokens": 1000 }
+   ]
+  },
+  "W3": {
+   "kind": "prefill",
+   "n": 4,
+   "arms": { "N0": [ "off", "on" ], "N1": [ "off", "on" ], "N2": [ "off", "on" ], "P0": [ "off" ], "P2": [ "off" ] },
+   "phases": [
+    { "name": "A", "prompt": "w2_code.txt", "count": 4, "max_tokens": 1000 },
+    { "name": "p8k", "tokens": 8300, "count": 1, "max_tokens": 64 },
+    { "name": "needle32k", "tokens": 32000, "needle": true, "count": 1, "max_tokens": 64 }
+   ],
+   "env": { "STRATA_PREFILL_TIMING": "1" }
+  },
+  "W4": {
+   "kind": "kl",
+   "n": 2,
+   "arms": { "M": [ "base" ], "P2": [ "base" ] },
+   "extra_args": [ "--short-read", "1000" ],
+   "env": {
+    "STRATA_LOGPOS": "{rundir}/rows.tsv",
+    "STRATA_LOGPOS_TOPK": "32",
+    "STRATA_ROUTE_TAIL_SKIP": "0"
+   },
+   "phases": [
+    { "name": "A", "prompt": "w2_code.txt", "count": 4, "max_tokens": 1000 }
+   ],
+   "texts": [ "kl_t1.txt", "kl_t2.txt", "kl_t3.txt" ]
+  },
+  "W5": {
+   "kind": "fault",
+   "n": 3,
+   "arms": { "P2": [ "base" ] },
+   "phases": [
+    { "name": "fault", "prompt": "w2_code.txt", "count": 1, "max_tokens": 1000 }
+   ]
+  },
+  "W6": {
+   "kind": "decode",
+   "n": 4,
+   "_doc": "Host-RAM headroom (maintainer decision 1). The engine's own RAM limit is --resident-budget-gib (the tier-0 resident RAM budget; DESIGN-LOG 'RAM budget 6 vs 10 GiB', install/config.py). One variable per comparison: moves off (P0) vs on (P2) at each fixed budget, and a budget varied with the arm fixed. The three budgets are PROVISIONAL (the owner sets them from the host's real headroom); SEABRAID_STRATA_EXCLUDE_HELPER_RAM is held at the engine env's value in every cell.",
+   "arms": { "P0": [ "ram_hi", "ram_mid", "ram_lo" ], "P2": [ "ram_hi", "ram_mid", "ram_lo" ] },
+   "phases": [
+    { "name": "decode", "prompt": "w1_decode.txt", "count": 3, "max_tokens": 2000 }
+   ]
+  },
+  "W7": {
+   "kind": "forced",
+   "n": 2,
+   "_doc": "Decode-path quality (C10). W4 teacher-forces a PREFILL where the helper tier never runs (live run G1 2026-11-19: tier on and off gave byte-identical W4 rows), so W7 teacher-forces a fixed continuation through the real decode windows (Strata force_check.py score --path decode: STRATA_FOLLOW, top-32 rows) with the tier engaged. One start = one capture command; it starts its own engine from the arm's forced_cfg (an engine config: exe, args, env, lib_dirs). All arms read the SAME forced_set (force_check.py gen, from the main-card-alone engine), so the targets match and tools/kl.py refuses any pair that did not. M is the reference (lowest M start) and a second M start is the noise floor; P0 (tier engaged, moves off) and P2 (live moves) are gated against it. G1 used 6 prompts x 400 forced tokens and the interleave M C0 C1 M C1 C0.",
+   "arms": { "M": [ "base" ], "P0": [ "base" ], "P2": [ "base" ] },
+   "capture": {
+    "argv": [ "python3", "-B", "{force_check}", "score", "{forced_cfg}", "{forced_set}", "{rundir}/forced.tsv", "--path", "decode" ],
+    "timeout_s": 7200
+   }
+  },
+  "W8": {
+   "kind": "decode",
+   "n": 3,
+   "persona": "file-moves",
+   "_doc": "FR-A1 per-move cost (FR DESIGN 9): blob (F0) against file (F1) moves at the (h2, F) and (h1, h2) hops; the round lines carry ms per hop (fence_us), the helper counters carry bytes moved; main RSS and page-cache growth are read from /proc by the owner's window script. --retier-margin 1.0 so rounds fire in the first request. Bar: no hop slower by more than 10%.",
+   "arms": { "F0": [ "base" ], "F1": [ "base" ] },
+   "extra_args": [ "--retier-margin", "1.0" ],
+   "phases": [
+    { "name": "decode", "prompt": "w1_decode.txt", "count": 3, "max_tokens": 2000 }
+   ]
+  },
+  "W9": {
+   "kind": "decode",
+   "n": 3,
+   "persona": "file-moves",
+   "_doc": "FR-A2 hot cache: the same arms, once cold and once with the climbers' pages pre-warmed in main's page cache (variant warm sets QUAL_PREWARM_PACK=1, which the launcher is expected to honour by reading the pack before the engine starts: PROVISIONAL, the launcher is the owner's). Decides the mincore rule.",
+   "arms": { "F0": [ "cold", "warm" ], "F1": [ "cold", "warm" ] },
+   "extra_args": [ "--retier-margin", "1.0" ],
+   "phases": [
+    { "name": "decode", "prompt": "w1_decode.txt", "count": 3, "max_tokens": 2000 }
+   ]
+  },
+  "W10": {
+   "kind": "decode",
+   "n": 4,
+   "persona": "file-moves",
+   "_doc": "FR-A3 decode: tok/s with the ladder on, file moves on vs off, same budget, default policy margin. Bar for default-on: tok/s no worse than -1% with a measurable RAM saving. NOT covered here: the KL gate of FR-A3 (W7 is the decode-path KL; adding F0/F1 forced configs to it is a follow-up for the owner's window).",
+   "arms": { "F0": [ "base" ], "F1": [ "base" ] },
+   "phases": [
+    { "name": "decode", "prompt": "w1_decode.txt", "count": 3, "max_tokens": 2000 }
+   ]
+  }
+ },
+ "thresholds": {
+  "c1_margin_pct": 3.0,
+  "c2_margin_pct": 3.0,
+  "c4_ratio": 1.25,
+  "c4_extra_rounds": 1,
+  "c4_post_margin_pct": 3.0,
+  "c4_horizon_rounds": 12,
+  "c4_tail_rounds": 4,
+  "fence_p95_ms": 100.0,
+  "fence_p95_ms_note": "PROVISIONAL (the maintainers may change it); C1 is the real arbiter",
+  "fence_max_ms": 1000.0,
+  "n2_vs_n1_fence_ratio": 1.2,
+  "plan_p95_ms": 1.0,
+  "c6_pct": 5.0,
+  "c7_pct": 5.0,
+  "kl_max": 0.03,
+  "top1_min": 0.95,
+  "fault_fail_s": 1.0,
+  "fault_quarantine_rounds_s": 120,
+  "stall_warn_s": 2.0,
+  "stall_long_s": 10.0,
+  "fault_recover_s": 120.0
+ },
+ "limits": { "request_timeout_s": 3600, "needle_secret": "amber-7314-harbor", "chars_per_token": 4.0 },
+ "helpers": {
+  "named": {
+   "argv": [
+    "{helper}",
+    "--device",
+    "0",
+    "--shm",
+    "{shm}",
+    "--pack",
+    "{pack}",
+    "--native",
+    "{native}",
+    "--layers",
+    "48",
+    "--experts",
+    "512",
+    "--prefill-tokens",
+    "1024"
+   ],
+   "env": {
+    "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+    "CUDA_VISIBLE_DEVICES": "{gpu}",
+    "LD_LIBRARY_PATH": "/usr/lib64:/usr/lib"
+   },
+   "ready_path": "/dev/shm{shm}"
+  },
+  "named_fio": {
+   "argv": [
+    "{helper}",
+    "--device",
+    "0",
+    "--shm",
+    "{shm}",
+    "--pack",
+    "{pack}",
+    "--native",
+    "{native}",
+    "--layers",
+    "48",
+    "--experts",
+    "512",
+    "--prefill-tokens",
+    "1024",
+    "--file-io",
+    "auto"
+   ],
+   "env": {
+    "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+    "CUDA_VISIBLE_DEVICES": "{gpu}",
+    "LD_LIBRARY_PATH": "/usr/lib64:/usr/lib"
+   },
+   "ready_path": "/dev/shm{shm}"
+  }
+ }
+}

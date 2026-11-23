@@ -1,0 +1,11 @@
+# Design A/B 5 (docs/design/N-CARD-LADDER.md section 8): live promotion (--retier-promote on) vs frozen placement.  NOT RUN.
+# One variable between P and PR: --retier-promote.  Both arms start from the SAME placement (run with the expert profile
+# read-only) and the same prompts; `speed` = warm-up + three 2,000-token greedy runs, quote run 2/3 and ms/window.
+# Heat only exists with --adapt-every / --adapt-swaps > 0 (a run without them silently never re-tiers); the JQ filter sets both
+# for BOTH arms so the engine's own adaptation is identical and only the promotion differs.
+# Finish line (A/B 5): >= +3% tok/s including fence time, zero STALE / duplicate-owner events in the round lines, fence time
+# <= 1% of decode.  Read the engine log's "retier" round lines: "ownership epoch N, STALE n, held by both cards n, card 2 open".
+# PROMOTE_EXE: an engine built from the integrated series (patches/strata, 0011 onward) with -DSEABRAID_STRATA_SOURCE_DIR.
+P  | speed | 1 | -                                              | .args += ["--adapt-every","64","--adapt-swaps","8"]
+PR | speed | 1 | -                                              | .args += ["--adapt-every","64","--adapt-swaps","8","--retier","on","--retier-every","128","--retier-promote","on"]
+P2 | speed | 1 | -                                              | .args += ["--adapt-every","64","--adapt-swaps","8"]

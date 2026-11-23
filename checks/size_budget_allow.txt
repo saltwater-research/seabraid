@@ -1,0 +1,3 @@
+# Files whose own header SIZE budget is false today (owner: checks/check_size_budgets.py).  Format, TAB-separated:
+#   path<TAB>current lines<TAB>why (>= 20 chars).  The list only shrinks: split the file or correct its header, then delete the row.
+# Recorded at R8 L5; the src and bindings owners fix theirs (the gate fails on any NEW false budget and on growth).

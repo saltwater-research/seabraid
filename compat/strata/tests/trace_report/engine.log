@@ -1,0 +1,4 @@
+strata serve: file tier I/O this request: the OS read 2.4 MB from storage (3 major faults) for 2.0 MB of expert reads; io prefetch: 4 read ahead (0.0 MB by pread), 3 used, 1 unused, 0 skipped (cached), 0 dropped; decode waited 12.5 ms in 40 fetches
+strata decode timing: 10 windows, avg T 2.00, 1.80 tokens/window, 55.50 ms/window = verify 40.00 (GPU-reach wait 1.00 + per-layer host 2.00)
+strata serve: file tier I/O this request: the OS read 1.2 MB from storage (1 major faults) for 1.0 MB of expert reads; io prefetch: 2 read ahead (0.0 MB by pread), 2 used, 0 unused, 0 skipped (cached), 0 dropped; decode waited 7.5 ms in 20 fetches
+strata decode timing: 20 windows, avg T 2.00, 1.80 tokens/window, 60.50 ms/window = verify 44.00 (GPU-reach wait 1.00 + per-layer host 2.00)

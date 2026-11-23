@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Seabraid <seabraid@example.invalid>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH 03/16] dflash2: opt-in STRATA_DF2_WINDOW (the drafter attends
+ the last N context rows)
+
+Drafts never change the output (the target verifies every token), so a shorter drafter window trades acceptance for
+drafter time only.  R9700: window 512 = 1.957 vs 2.110 ms/round at equal acceptance (59.4 vs 59.9%).
+---
+ src/core/dflash2.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/core/dflash2.cpp b/src/core/dflash2.cpp
+index eb96c0437..c0e49c624 100644
+--- a/src/core/dflash2.cpp
++++ b/src/core/dflash2.cpp
+@@ -173,6 +173,16 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
+         err = "dflash2: the pack's shape is not the Flash-Next drafter this engine was written for";
+         return false;
+     }
++    // seabraid (opt-in): STRATA_DF2_WINDOW=N attends only the last N context rows instead of the pack's window.  Drafts never
++    // change the output (the target verifies every token), so this trades acceptance for drafter time and nothing else; the
++    // drafter's attention over the 2048-row ring was its largest stage on an R9700 (0.42 ms of 2.43 per round, 2026-11-06).
++    if (const char* w = std::getenv("STRATA_DF2_WINDOW"); w != nullptr && w[0] != '\0') {
++        const int v = std::atoi(w);
++        if (v >= 16 && v < window_) {
++            std::fprintf(stderr, "strata dflash2: STRATA_DF2_WINDOW=%d: the drafter attends the last %d context rows (pack: %d)\n", v, v, window_);
++            window_ = v;
++        }
++    }
+     if (cudaMalloc((void**) &blob_, total) != cudaSuccess) { err = "dflash2: the pack does not fit in VRAM (" + std::to_string(total >> 20) + " MiB)"; return false; }
+     vram_ += total;
+     uint64_t max_bytes = 0;

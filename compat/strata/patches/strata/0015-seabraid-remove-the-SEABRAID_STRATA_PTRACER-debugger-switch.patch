@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Seabraid <seabraid@example.invalid>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH 15/16] seabraid: remove the SEABRAID_STRATA_PTRACER debugger
+ switch
+
+With SEABRAID_STRATA_PTRACER=1 the engine called prctl(PR_SET_PTRACER,
+PR_SET_PTRACER_ANY), so any process of the same user could attach a
+debugger to the engine and read its memory (prompts, activations). A
+diagnostic that widens the attack surface of a network-serving process has
+no place in a release. Remove the switch and its sys/prctl.h include; the
+thread-stack tools in tools/ now need a debugger started as the engine
+parent or an administrator-set ptrace_scope.
+---
+ src/program/generate.cpp | 8 --------
+ 1 file changed, 8 deletions(-)
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 1e2f46670..c8e10b21c 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -179,9 +179,6 @@
+ #if !defined(__APPLE__)   // major() / minor(): <sys/types.h> on macOS
+ #include <sys/sysmacros.h>
+ #endif
+-#if defined(__linux__)
+-#include <sys/prctl.h>
+-#endif
+ #endif
+ 
+ #include <cuda_runtime.h>
+@@ -3549,11 +3546,6 @@ static void exit_if_gpu_fatal(const std::string& err) {
+ static int engine_main(int argc, char** argv) {   // main() is at the end of this file (#3431)
+ #else
+ int main(int argc, char** argv) {
+-#endif
+-#if defined(__linux__)
+-    // SEABRAID_STRATA_PTRACER=1 (diagnostic): let any process of this user attach a debugger (Yama ptrace_scope 1 otherwise
+-    // allows only the parent), so a stall's thread stacks can be read while the engine is still alive
+-    if (const char* pt = std::getenv("SEABRAID_STRATA_PTRACER"); pt != nullptr && pt[0] == '1') (void) prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+ #endif
+     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
+     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which

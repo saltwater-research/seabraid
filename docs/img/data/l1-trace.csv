@@ -1,0 +1,7 @@
+hop,round,direction,from,to,bytes
+1,7,up,F,helper2,2329600
+2,7,up,helper2,helper1,2329600
+3,7,up,helper1,main,2329600
+4,290,down,main,helper1,2329600
+5,333,down,helper1,helper2,2329600
+6,388,down,helper2,F,2329600

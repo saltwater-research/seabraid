@@ -1,0 +1,5 @@
+# Documented exceptions to the one-way core -> compat edge.  Format: path<TAB>why (why >= 10 characters).
+# A row whose file has no compat reference any more is an error, so each exception dies with its cause.
+src/placement/tests/parity.rs	comment only: names the add-on test that generated ladder_golden.txt (provenance of a fixture, not a dependency)
+scripts/journey/steps.toml	data only: the journey replays the CONTRIBUTING command that runs the add-on tests; nothing imports the add-on
+scripts/retire_name.py	the retirement tool names the add-on directory in its rules and globs as data; it imports nothing from it

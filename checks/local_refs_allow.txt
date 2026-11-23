@@ -1,0 +1,7 @@
+# Test fixtures that plant each shape on purpose; WHY: a checker test must contain the value it proves is caught.
+# The compat rows are obviously synthetic GPU UUIDs (0a1b2c3d-1111-..., 11111111-2222-...) that the installer's parsers need as input.
+tests/test_no_local_refs.py	
+compat/strata/tests/install/test_config.py	gpu-uuid
+compat/strata/tests/install/test_services.py	gpu-uuid
+compat/strata/tests/install/fixtures/sample-nvidia-smi.csv	gpu-uuid
+# Owned by another track (strata-ext); reword its line 14 and delete this row, the checker fails on an unused row.

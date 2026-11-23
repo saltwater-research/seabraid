@@ -1,0 +1,155 @@
+{
+ "_doc": "Config of overflow.py (capped-overflow test: experts that fit nowhere else genuinely live on the SSD). Same schema as scripts/placement-qual/arms.json for vars, engine, arms, variants, limits, so qual_cfg.load and qual_engine.Engine run it unchanged; capacity, tiers, sweep, gates, w7 and estimate are this harness's. {name} placeholders come from vars (override with --var name=value) plus {rundir}. The helper command and the KL thresholds are read from placement-qual/arms.json (one owner). Flags this file owns and the launcher's base config must NOT contain: --expert-cache, --expert-cache-device1, --expert-cache-device2, --resident-budget-gib, --max-context, --stats, --retier*, --adapt-* (the ladder arm gets its flags from install/_ladder.py). WHY each number is what it is: README.md section Design.",
+ "vars": {
+  "launcher": "bin/launch_engine.sh",
+  "helper": "bin/helper-cuda",
+  "shm": "/seabraid-ovf1",
+  "shm2": "/seabraid-ovf2",
+  "port": "8796",
+  "max_context": "32768",
+  "gpu": "UNSET: pass --var gpu=<CUDA_VISIBLE_DEVICES of the helper card: an index or a GPU UUID; a UUID identifies one machine, so it is never kept in the repo>",
+  "gpu2": "",
+  "rocm": "UNSET: pass --var rocm=<the ROCm install dir>",
+  "pack": "UNSET: pass --var pack=<the model pack dir>",
+  "native": "UNSET: pass --var native=<the model GGUF (part 1)>",
+  "force_check": "UNSET: pass --var force_check=<Strata force_check.py>",
+  "forced_set": "UNSET: pass --var forced_set=<the forced set JSON made by force_check.py gen>",
+  "forced_cfg_R": "UNSET: pass --var forced_cfg_R=<engine config JSON of the uncapped reference>",
+  "forced_cfg_O1": "UNSET: pass --var forced_cfg_O1=<engine config JSON of arm O1, with the capacity flags the dry run prints>",
+  "forced_cfg_O2": "UNSET: pass --var forced_cfg_O2=<engine config JSON of arm O2>",
+  "forced_cfg_O3": "UNSET: pass --var forced_cfg_O3=<engine config JSON of arm O3>",
+  "forced_cfg_O3L": "UNSET: pass --var forced_cfg_O3L=<engine config JSON of arm O3L, with the ladder flags and env of install/_ladder.py>",
+  "ladder_extra_args": "",
+  "unbuffered": "",
+  "disk": "auto",
+  "allow_rotational": "0"
+ },
+ "hooks_doc": {
+  "ladder_extra_args": "extra engine flags for the ladder arm (O3L) only, as one string split on spaces, for flags the installer's ladder set (install/_ladder.py, imported: one owner) does not carry. The ladder set already carries --adapt-every 64 --adapt-swaps 8; a value given here comes last and overrides. Empty = exactly the installer's set.",
+  "unbuffered": "empty = the engine chooses how the file tier reads. 1 sets STRATA_UNBUFFERED_LOAD=1 (O_DIRECT reads, which no page cache can serve) on every capped arm: the strictest variant of the same test, and a cross-check of the cgroup mechanism.",
+  "disk": "auto = the /proc/diskstats entry of the device the model file lives on. A name (for example nvme0n1p2) overrides it.",
+  "allow_rotational": "0 = refuse a model on a spinning disk (the test is about SSD). 1 = run anyway."
+ },
+ "engine": {
+  "argv": ["bash", "{launcher}", "{rundir}", "--stats", "--max-context", "{max_context}"],
+  "env": {
+   "QUAL_PORT": "{port}",
+   "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+   "HIP_VISIBLE_DEVICES": "0",
+   "CUDA_VISIBLE_DEVICES": "{gpu}",
+   "LD_LIBRARY_PATH": "{rocm}/lib:{rocm}/lib/rocm_sysdeps/lib:/usr/lib64:/usr/lib",
+   "STRATA_DECODE_TIMING": "1",
+   "HSA_USERPTR_FOR_PAGED_MEM": "0",
+   "HSA_SVM_FOR_PAGED_MEM": "0",
+   "STRATA_HIP_ARENA_NONCOHERENT": "1",
+   "GPU_PINNED_MIN_XFER_SIZE": "1048576",
+   "XDG_RUNTIME_DIR": "{xdg_runtime_dir}"
+  },
+  "ready_s": 3000,
+  "stop_grace_s": 90,
+  "helper_match": "{helper}",
+  "stdout_name": "launcher.out",
+  "log_name": "strata.log",
+  "engine_comm": "strata"
+ },
+ "variants": {"base": {}},
+ "arms": {
+  "R": {
+   "label": "uncapped reference (all experts on the cards, no file tier, no cgroup limit)",
+   "transport": "named",
+   "tiers": {"capped": false, "helpers": 1},
+   "env": {"SEABRAID_STRATA_SHM": "{shm}"},
+   "helper_start": "named",
+   "args": ["--expert-cache", "auto", "--expert-cache-device1", "auto"]
+  },
+  "O1": {
+   "label": "main card only: small cache, small RAM budget, the rest on SSD",
+   "transport": "none",
+   "tiers": {"capped": true, "helpers": 0},
+   "no_helper": true,
+   "env": {"NOHELPER": "1"},
+   "args": []
+  },
+  "O2": {
+   "label": "O1 plus the helper card (second GPU)",
+   "transport": "named",
+   "tiers": {"capped": true, "helpers": 1},
+   "env": {"SEABRAID_STRATA_SHM": "{shm}"},
+   "helper_start": "named",
+   "args": []
+  },
+  "O3": {
+   "label": "O2 plus a second helper process (static placement: two helper channels)",
+   "transport": "named",
+   "tiers": {"capped": true, "helpers": 2},
+   "env": {"SEABRAID_STRATA_SHM": "{shm},{shm2}"},
+   "helper_start": "named",
+   "args": [],
+   "note": "SEABRAID_STRATA_SHM is a comma list, one channel per helper, position = card id (adapters/strata/wire/strata/seabraid/channel_names.hpp, patch 0017); --expert-cache-device1 and --expert-cache-device2 give each helper its slots. Both helper processes run on the {gpu}/{gpu2} card (the same card unless gpu2 is set), so their slots share that card's VRAM."
+  },
+  "O3L": {
+   "label": "O3 plus the live ladder: SSD -> RAM -> helper2 -> helper1 -> main moves, flags and env from install/_ladder.py",
+   "transport": "named",
+   "tiers": {"capped": true, "helpers": 2, "ladder": true},
+   "env": {"SEABRAID_STRATA_SHM": "{shm},{shm2}"},
+   "helper_start": "named",
+   "args": [],
+   "note": "differs from O3 by the ladder flags and env only (one variable). Its data gate also needs the adapter's 'placement move' lines: a move from the fallback rung onto a helper rung, a hop onto each helper rung, and no stale-epoch refusal."
+  }
+ },
+ "workloads": {},
+ "thresholds": {},
+ "limits": {"request_timeout_s": 3600, "needle_secret": "amber-7314-harbor", "chars_per_token": 4.0},
+ "capacity": {
+  "layers": 48,
+  "experts": 512,
+  "experts_gib": 47.0,
+  "main_slots": 3000,
+  "helper_slots": [3000, 3000],
+  "ram_gib": 6.0,
+  "min_file_share": 0.40,
+  "main_card_gib": 24.0,
+  "helper_card_gib": 22.8,
+  "engine_overhead_gib": 8.0,
+  "page_cache_gib": 2.0,
+  "helper_cap_gib": 6.0,
+  "note": "ESTIMATE: experts_gib 47 is the owner's figure for Qwen3.8-Flash-Next IQ3_S (48 layers x 512 experts); the engine's own startup lines are compared with it by the data gate. main_card_gib 24.0 and helper_card_gib 22.8 are the all-VRAM split in docs/DESIGN-LOG.md. ram_gib 6 stays inside the 15.13 GiB GTT ceiling noted there. engine_overhead_gib 8 is a guess to be replaced by the first run's memory.peak."
+ },
+ "sweep": {
+  "arms": ["R", "O1", "O2", "O3"],
+  "reference_arm": "R",
+  "n_requests": 3,
+  "warmup": 1,
+  "decode_prompt": "w1_decode.txt",
+  "decode_tokens": 200,
+  "prefill_tokens": 3500,
+  "kl": true,
+  "ref_repeats": 2,
+  "note": "kept under the name 'sweep' because pay_measure reads cfg['sweep']. 3 counted rounds is enough for means and a spread, not for a significance claim: this harness proves the SSD was used and the output is right, it does not rank arms by speed."
+ },
+ "w7": {
+  "argv": ["python3", "-B", "{force_check}", "score", "{forced_cfg}", "{forced_set}", "{rundir}/forced.tsv", "--path", "decode"],
+  "timeout_s": 14400
+ },
+ "gates": {
+  "min_device_frac": 0.5,
+  "min_file_mb": 1.0,
+  "max_resident_mb": 512,
+  "complement_tol_frac": 0.10,
+  "min_file_plan_frac": 0.5,
+  "reference_max_file_mb": 50,
+  "w7_min_device_mb": 256,
+  "prefill_reuse_max_frac": 0.01,
+  "max_consecutive_failures": 2,
+  "settle_s": 1.5,
+  "settle_timeout_s": 20
+ },
+ "estimate": {
+  "note": "ESTIMATE: none of these were measured by this harness; they bound the GPU window so the owner can book it. decode 1.5..30 tok/s spans heavy SSD overflow to a mostly-cached run; prefill 40..800 tok/s (a 3,500-token prompt touches nearly every expert, so it reads much of the SSD); load 180..480 s is payoff's guess. Replace with the shakedown's chain.tsv seconds.",
+  "load_s": [180, 480],
+  "decode_tps": [1.5, 30],
+  "prefill_tps": [40, 800],
+  "w7_tokens": 2400,
+  "stop_s": 30
+ }
+}

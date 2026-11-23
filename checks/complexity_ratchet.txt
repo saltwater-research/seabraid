@@ -1,0 +1,8 @@
+# Complexity ratchet (owner: checks/check_complexity.py): functions ABOVE the allow file's hard max of 15 that predate the widened scope (R8 M1).
+# Format, TAB-separated:  path<TAB>function<TAB>ceiling<TAB>why   (ceiling = the CURRENT CCN, 16 or more; why >= 20 chars).
+# A split must lower or delete the row (the gate says so); a row never rises, and a new function above 10 is not here, so it fails.
+compat/strata/scripts/placement-qual/qual_judge.py	w0	17	R8 M1: predates the widened scope; compat owner splits it
+compat/strata/tests/channel_private_test.cpp	run_generation	18	R8 M1: predates the widened scope; compat owner splits it
+compat/strata/tests/channel_v4_race_test.cpp	main	18	R8 M1: predates the widened scope; compat owner splits it
+compat/strata/tests/retier_loop_test.cpp	t_conversion	20	R8 M1: predates the widened scope; compat owner splits it
+compat/strata/tests/retier_loop_test.cpp	t_flags	18	R8 M1: predates the widened scope; compat owner splits it

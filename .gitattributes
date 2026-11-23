@@ -1,0 +1,11 @@
+# Normalise every text file to LF in the repo and in checkouts, on every OS.
+* text=auto eol=lf
+
+# WHY -text: a patch is applied byte-for-byte by `git am`; CRLF conversion on a Windows checkout would break it.
+*.patch -text
+
+# WHY export-ignore: internal notes kept in the private dev repo only; git archive (and so the release export) leaves them out.
+docs/private/ export-ignore
+
+# WHY export-ignore: the D4 drain patch is not yet qualified; it stays in the private history only and is not exported.
+compat/strata/docs/legacy/strata-d4-drain.patch export-ignore

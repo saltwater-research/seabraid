@@ -1,0 +1,28 @@
+# Cyclomatic-complexity exceptions (owner: checks/check_complexity.py).  Default ceiling is 10; a row buys up to 15, never more.
+# Format, TAB-separated:  path<TAB>function<TAB>ceiling<TAB>why   (ceiling 11..15; why >= 20 chars).
+# The list only shrinks: a row whose function is now <= 10, missing, or above its ceiling FAILS the gate.
+
+# R8 M1 (2026-11-19): code that predates the widened SCOPES; every row is a split someone owns, the gate fails on anything new.
+bindings/python/tests/_parity_cases.py	_inject	13	R8 M1: predates the widened scope; bindings owner splits it
+bindings/python/tests/test_parity_fuzz.py	make_provider.serve	13	R8 M1: predates the widened scope; bindings owner splits it
+checks/check_abi_append.py	check	13	R8 M1: predates the widened scope; Q1 (checks/tests/scripts) splits it
+checks/check_compat_edges.py	scan	13	R8 M1: predates the widened scope; Q1 (checks/tests/scripts) splits it
+checks/check_links.py	judge	12	R8 M1: predates the widened scope; Q1 (checks/tests/scripts) splits it
+checks/check_map.py	unsafe_problems	14	R8 M1: predates the widened scope; Q1 (checks/tests/scripts) splits it
+checks/check_no_egress.py	scan	12	R8 M1: predates the widened scope; Q1 (checks/tests/scripts) splits it
+checks/check_no_local_refs.py	scan	12	R8 M1: predates the widened scope; Q1 (checks/tests/scripts) splits it
+checks/check_size.py	judge	11	R8 M1: predates the widened scope; Q1 (checks/tests/scripts) splits it
+compat/strata/scripts/placement-qual/qual_engine.py	_group	12	R8 M1: predates the widened scope; compat owner splits it
+compat/strata/scripts/placement-qual/qual_engine.py	stop	12	R8 M1: predates the widened scope; compat owner splits it
+compat/strata/scripts/placement-qual/qual_judge.py	c8	12	R8 M1: predates the widened scope; compat owner splits it
+compat/strata/scripts/placement-qual/qual_kl.py	compare	13	R8 M1: predates the widened scope; compat owner splits it
+compat/strata/tests/card_bench_test.cpp	test_lead_line_roundtrip_and_old_readers	11	R8 M1: predates the widened scope; compat owner splits it
+compat/strata/tests/channel_pingpong.cpp	main	11	R8 M1: predates the widened scope; compat owner splits it
+compat/strata/tests/channel_private_test.cpp	main	11	R8 M1: predates the widened scope; compat owner splits it
+compat/strata/tests/retier_loop_test.cpp	t_applied_on_engine_thread_only	13	R8 M1: predates the widened scope; compat owner splits it
+compat/strata/tests/tier_ladder_test.cpp	Ladder::step	12	R8 M1: predates the widened scope; compat owner splits it
+compat/strata/tests/tier_plan_test.cpp	Sim::step	12	R8 M1: predates the widened scope; compat owner splits it
+compat/strata/tests/tier_plan_test.cpp	t_note_failed	12	R8 M1: predates the widened scope; compat owner splits it
+compat/strata/tests/tier_plan_test.cpp	t_same_layer_swaps	14	R8 M1: predates the widened scope; compat owner splits it
+examples/adapter_walkthrough.c	main	12	R8 M1: predates the widened scope; examples owner splits it
+docs/paper/figures/gen_figures.py	panel	12	paper figure generator (one panel per architecture spec); docs/paper owner splits it

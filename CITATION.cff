@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using these metadata."
+title: "Seabraid: an engine-neutral runtime for same-layer mixed-vendor Mixture-of-Experts execution"
+type: software
+version: 0.5.0-alpha.8
+date-released: 2026-11-22
+license: Apache-2.0
+repository-code: "https://github.com/saltwater-research/seabraid"
+authors:
+  - name: "Saltwater Research LLC"
+    email: "dev@saltyresearch.com"
+abstract: >-
+  Seabraid lets GPUs from different vendors (NVIDIA CUDA and AMD ROCm) serve the
+  experts of one Mixture-of-Experts model at the same layer. Each card runs
+  vendor-native kernels in its own process; the processes meet in shared
+  memory once per layer. The runtime provides an engine-neutral C ABI and
+  acknowledged live expert placement.
+keywords:
+  - mixture-of-experts
+  - inference
+  - heterogeneous GPUs
+  - expert placement
+  - CUDA
+  - ROCm

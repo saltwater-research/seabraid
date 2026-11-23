@@ -1,0 +1,225 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Seabraid <seabraid@example.invalid>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH 02/16] ExpertCache: clamp fills to the slot, not to the
+ largest slot
+
+open_sized() sets blob_ to the LARGEST slot, and fill_slot / fill_slot_blocking / fill_slot_queued / verify_slot clamped
+to it, so a request larger than its slot (or bytes = 0, the default) copied past the slot into the next one's weights on
+a sized cache.  Clamp to slot_room(slot); refuse an oversized request loudly.  Uniform caches are bit-identical
+(slot_room == blob_).  Host test with the real per-layer sizes (1510400 / 1305600 / 1177600 B).
+---
+ include/strata/core/expert_cache.hpp | 27 +++++++++++
+ src/core/expert_cache.cpp            | 26 ++++++++--
+ tests/core/fill_bytes_test.cpp       | 72 ++++++++++++++++++++++++++++
+ 3 files changed, 121 insertions(+), 4 deletions(-)
+ create mode 100644 tests/core/fill_bytes_test.cpp
+
+diff --git a/include/strata/core/expert_cache.hpp b/include/strata/core/expert_cache.hpp
+index 238c85949..baeb5993a 100644
+--- a/include/strata/core/expert_cache.hpp
++++ b/include/strata/core/expert_cache.hpp
+@@ -37,6 +37,23 @@ namespace strata::core {
+ /// in the two places that use it.
+ inline constexpr int32_t kNotResident = -1;
+ 
++/// How many bytes a fill may write into a slot with `room` bytes, given a request of `bytes` and a cache whose
++/// LARGEST slot is `blob_max`.  Returns -1 when the request does not fit.
++///
++/// Free and dependency-free so the arithmetic can be tested without a GPU toolchain, because the arithmetic is
++/// what was wrong: every fill used to clamp to `blob_max`, which with `open_sized` is the biggest slot and not
++/// this one, so a caller could write a large layer's blob into a small layer's slot and overrun into the next
++/// slot's weights.  Silent corruption, surfacing much later as nondeterministic quality loss.
++///
++/// `bytes <= 0` means "a whole slot".  That used to be `blob_max`, so the DEFAULT ARGUMENT alone could overrun
++/// a smaller slot; `min(blob_max, room)` keeps the uniform case bit-identical (there `room == blob_max`) and
++/// makes the sized case this slot's own size.
++inline int64_t fill_bytes_for(int64_t room, int64_t blob_max, int64_t bytes) {
++    if (room <= 0) return -1;
++    if (bytes > room) return -1;
++    return bytes > 0 ? bytes : (blob_max < room ? blob_max : room);
++}
++
+ /// **THE STATIC RESIDENCY PLAN, READ BACK FROM THE FILE `tools/make_profile.py` WROTE.**
+ ///
+ /// `profile.bin` is `STRP`, then `version, n_layers, n_expert, slots, n_ranked`, then `n_ranked` `(layer,
+@@ -250,6 +267,16 @@ private:
+     std::size_t blocking_staging_bytes_ = 0;
+ #endif
+     int64_t slot_end(int64_t n) const { return off_.empty() ? n * blob_ : (int64_t) off_[(size_t) n]; }
++    /// How many bytes a fill may write into `slot`.  Thin wrapper over `fill_bytes_for` so the error string
++    /// can name the slot; the arithmetic lives in the free function so it is testable without a GPU toolchain.
++    /// **The clamp must be per slot, not `blob_`.** With
++    /// `open_sized`, `blob_` is the LARGEST slot (`blob_ = mx`), not this one, so clamping a copy to it lets a
++    /// caller write a big layer's blob into a small layer's slot and overrun into the next slot's weights -
++    /// silent corruption, surfacing much later as nondeterministic quality loss rather than as a failure.
++    /// `slot_room(s)` is the per-slot truth and is correct for the uniform case too (`slot_offset` falls back
++    /// to `s * blob_`), so uniform callers are bit-identical.  Call only after the slot index is known good.
++    /// Returns 0 with `err` set when the request does not fit; 0 is never a legal fill size.
++    size_t fill_bytes(int32_t slot, int64_t bytes, const char* who, std::string& err) const;
+     bool open_segmented(uint64_t want, std::string& err);
+     void release_segmented();
+     uint8_t* base_ = nullptr;
+diff --git a/src/core/expert_cache.cpp b/src/core/expert_cache.cpp
+index 9630d1c33..16d3c70be 100644
+--- a/src/core/expert_cache.cpp
++++ b/src/core/expert_cache.cpp
+@@ -815,9 +815,20 @@ const uint8_t* ExpertCache::device_slot(int32_t slot) const {
+     return base_ + (size_t) slot * (size_t) blob_;
+ }
+ 
++size_t ExpertCache::fill_bytes(int32_t slot, int64_t bytes, const char* who, std::string& err) const {
++    const int64_t room = (int64_t) slot_room(slot);
++    const int64_t n = fill_bytes_for(room, blob_, bytes);
++    if (n <= 0) {
++        err = std::string("ExpertCache::") + who + ": " + std::to_string(bytes) + " bytes into slot " +
++              std::to_string(slot) + ", which has room for " + std::to_string(room) +
++              " (sized slots are not interchangeable: each is the blob size of the layer that claimed it)";
++        return 0;
++    }
++    return (size_t) n;
++}
++
+ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes) {
+     if (sealed_) sealed_write("fill_slot", slot);
+-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+     uint8_t* dst = device_slot(slot);
+     if (dst == nullptr) {
+         err = "ExpertCache::fill_slot: slot " + std::to_string(slot) + " is outside 0.." +
+@@ -828,6 +839,8 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
+         err = "ExpertCache::fill_slot: the host blob is null";
+         return false;
+     }
++    const size_t n = fill_bytes(slot, bytes, "fill_slot", err);
++    if (n == 0) return false;
+     const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice,
+                                           (cudaStream_t) stream);
+     if (e != cudaSuccess) {
+@@ -840,7 +853,6 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
+ 
+ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
+     if (sealed_) sealed_write("fill_slot_blocking", slot);
+-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+     uint8_t* dst = device_slot(slot);
+     if (dst == nullptr) {
+         err = "ExpertCache::fill_slot_blocking: slot outside the arena";
+@@ -850,6 +862,8 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
+         err = "ExpertCache::fill_slot_blocking: the host blob is null";
+         return false;
+     }
++    const size_t n = fill_bytes(slot, bytes, "fill_slot_blocking", err);
++    if (n == 0) return false;
+ #if defined(STRATA_USE_HIP)
+     // Bound HIP's pageable-source staging to one expert instead of repeatedly
+     // registering regions of the mmap. The blocking copy completes before reuse.
+@@ -872,13 +886,14 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
+ 
+ bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
+     if (sealed_) sealed_write("fill_slot_queued", slot);
+-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+     uint8_t* dst = device_slot(slot);
+     if (dst == nullptr || host_blob == nullptr) {
+         err = dst == nullptr ? "ExpertCache::fill_slot_queued: slot outside the arena"
+                              : "ExpertCache::fill_slot_queued: the host blob is null";
+         return false;
+     }
++    const size_t n = fill_bytes(slot, bytes, "fill_slot_queued", err);
++    if (n == 0) return false;
+     const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) 0);
+     if (e != cudaSuccess) {
+         err = std::string("ExpertCache::fill_slot_queued: ") + cudaGetErrorString(e);
+@@ -923,12 +938,15 @@ bool ExpertCache::sync_queued(std::string& err) {
+ }
+ 
+ bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
+-    const int64_t nb = bytes > 0 && bytes <= blob_ ? bytes : blob_;
+     const uint8_t* src = device_slot(slot);
+     if (src == nullptr) {
+         err = "ExpertCache::verify_slot: slot outside the arena";
+         return false;
+     }
++    // Same per-slot clamp as the fills: reading `blob_` bytes out of a smaller sized slot would compare this
++    // slot's blob against the next slot's bytes and report a spurious mismatch.
++    const int64_t nb = (int64_t) fill_bytes(slot, bytes, "verify_slot", err);
++    if (nb == 0) return false;
+     // `cudaMemcpy` and not `cudaMemcpyAsync`: this is a startup check, and a check that can be read before it
+     // has happened is not a check.  It also synchronises the fills queued before it, which is what makes the
+     // comparison meaningful.
+diff --git a/tests/core/fill_bytes_test.cpp b/tests/core/fill_bytes_test.cpp
+new file mode 100644
+index 000000000..4ea58db12
+--- /dev/null
++++ b/tests/core/fill_bytes_test.cpp
+@@ -0,0 +1,72 @@
++// tests/core/fill_bytes_test.cpp - the per-slot fill clamp (ExpertCache::fill_bytes_for).
++//
++// Host-only, no GPU toolchain:
++//   g++ -std=c++17 -Wall -Wextra -O1 -Iinclude tests/core/fill_bytes_test.cpp -o /tmp/fill_bytes_test
++//
++// Why this exists.  Every fill path used to size its copy as
++//     n = (bytes > 0 && bytes <= blob_) ? bytes : blob_
++// where `blob_` is the cache's LARGEST slot, not the slot being written.  With `open_sized` - which is the
++// native path, and what the seabraid helper runs - each slot is sized to the blob of the layer that claimed
++// it, and layers differ (1510400 / 1305600 / 1177600 bytes in the current pack, because the gate/up quant
++// type differs per layer).  So a request bigger than THIS slot was accepted and `cudaMemcpyAsync` overran
++// into the next slot's weights: not a crash, silent corruption of another expert, surfacing much later as
++// nondeterministic quality loss.  Worse, `bytes` defaults to 0, and the old expression then copied `blob_` -
++// the maximum - so the default argument alone overran every slot smaller than the largest.
++//
++// The numbers below are the real pack's layer blob sizes, so a regression reproduces the real overrun.
++
++#include "strata/core/expert_cache.hpp"
++
++#include <cstdio>
++
++static int g_fail = 0;
++#define CHECK(cond, what)                                                                  \
++    do {                                                                                   \
++        if (!(cond)) { std::printf("FAIL: %s (%s:%d)\n", (what), __FILE__, __LINE__); ++g_fail; } \
++    } while (0)
++
++using strata::core::fill_bytes_for;
++
++int main() {
++    // Real per-layer blob sizes from the pack's native_experts.txt.
++    constexpr int64_t kBig = 1510400;    // IQ2_S layers
++    constexpr int64_t kMid = 1305600;    // IQ2_XXS layers
++    constexpr int64_t kSmall = 1177600;  // the smallest
++    constexpr int64_t kMax = kBig;       // open_sized sets blob_ = max(slot sizes)
++
++    // ---- the overrun that motivated this: a big layer's blob into a small layer's slot.
++    CHECK(fill_bytes_for(kSmall, kMax, kBig) == -1, "a big blob into a small slot is REFUSED");
++    CHECK(fill_bytes_for(kSmall, kMax, kMid) == -1, "a mid blob into a small slot is REFUSED");
++    CHECK(fill_bytes_for(kMid, kMax, kBig) == -1, "a big blob into a mid slot is REFUSED");
++
++    // ---- the default argument, which used to copy the MAXIMUM into whatever slot it was given.
++    CHECK(fill_bytes_for(kSmall, kMax, 0) == kSmall, "bytes=0 fills THIS slot, not the largest");
++    CHECK(fill_bytes_for(kMid, kMax, 0) == kMid, "bytes=0 on a mid slot fills the mid slot");
++    CHECK(fill_bytes_for(kSmall, kMax, -1) == kSmall, "a negative request is treated as 'whole slot' too");
++
++    // ---- what must still work: same-layer and downhill fills.
++    CHECK(fill_bytes_for(kBig, kMax, kBig) == kBig, "exact fit is allowed");
++    CHECK(fill_bytes_for(kSmall, kMax, kSmall) == kSmall, "same-layer fit is allowed");
++    CHECK(fill_bytes_for(kBig, kMax, kSmall) == kSmall, "a small blob into a big slot copies only the blob");
++    CHECK(fill_bytes_for(kBig, kMax, 1) == 1, "a one-byte request is honoured exactly");
++
++    // ---- the uniform cache must be BIT-IDENTICAL to the old behaviour: there room == blob_max, so
++    // bytes<=0 gives blob_max exactly as before, and any bytes <= blob_max is honoured exactly as before.
++    {
++        constexpr int64_t kUniform = 2048;
++        CHECK(fill_bytes_for(kUniform, kUniform, 0) == kUniform, "uniform: bytes=0 still fills the stride");
++        CHECK(fill_bytes_for(kUniform, kUniform, 1024) == 1024, "uniform: a partial fill is unchanged");
++        CHECK(fill_bytes_for(kUniform, kUniform, kUniform) == kUniform, "uniform: a full fill is unchanged");
++        // The one case that differs is the one that was already a bug: the old code clamped an oversized
++        // request down to the stride and copied anyway; it is now refused.
++        CHECK(fill_bytes_for(kUniform, kUniform, kUniform + 1) == -1, "uniform: oversized is now REFUSED");
++    }
++
++    // ---- degenerate inputs fail closed rather than returning something copyable.
++    CHECK(fill_bytes_for(0, kMax, 0) == -1, "a zero-room slot is refused");
++    CHECK(fill_bytes_for(-1, kMax, 16) == -1, "a negative-room slot is refused");
++
++    if (g_fail == 0) std::printf("fill_bytes_test: all checks passed\n");
++    else std::printf("fill_bytes_test: %d FAILED\n", g_fail);
++    return g_fail == 0 ? 0 : 1;
++}

@@ -1,0 +1,98 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -72,6 +72,13 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
+ find_package(Threads REQUIRED)
+ target_link_libraries(llama PUBLIC ggml PRIVATE Threads::Threads)
+ 
++set(LLAMA_SEABRAID_GGML_DIR "" CACHE PATH "Seabraid ggml adapter source directory (experimental Qwen3 MoE path)")
++if (LLAMA_SEABRAID_GGML_DIR)
++    add_subdirectory("${LLAMA_SEABRAID_GGML_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/seabraid-ggml")
++    target_link_libraries(llama PRIVATE seabraid_ggml)
++    target_compile_definitions(llama PRIVATE LLAMA_SEABRAID_GGML)
++endif()
++
+ if (BUILD_SHARED_LIBS)
+     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
+     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -17,6 +17,11 @@
+ #include "llama-memory-hybrid-iswa.h"
+ #include "llama-memory-recurrent.h"
+ 
++#ifdef LLAMA_SEABRAID_GGML
++#include "seabraid_ggml.h"
++#include <initializer_list>
++#endif
++
+ #include <cassert>
+ #include <cmath>
+ #include <algorithm>
+@@ -2201,6 +2206,45 @@ ggml_tensor * llm_graph_context::build_ffn(
+     return cur;
+ }
+ 
++#ifdef LLAMA_SEABRAID_GGML
++static bool seabraid_qwen3_experts(const llm_graph_context & graph, llm_ffn_op_type op, int il,
++                               std::initializer_list<ggml_tensor *> variants) {
++    // Start with one model and leave variant semantics in the stock graph.
++    if (graph.model.arch != LLM_ARCH_QWEN3MOE || op != LLM_FFN_SILU || il < 0) {
++        return false;
++    }
++    if (!graph.loras->empty() || graph.hparams.swiglu_clamp_exp[il] > 1e-6f) {
++        return false;
++    }
++    for (const auto * variant : variants) {
++        if (variant) {
++            return false;
++        }
++    }
++    return true;
++}
++
++static ggml_tensor * seabraid_qwen3_ffn(const llm_graph_context & graph, seabraid_ggml_layer layer,
++                                    ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * weights,
++                                    llm_ffn_op_type op, int il, std::initializer_list<ggml_tensor *> variants) {
++    if (!seabraid_qwen3_experts(graph, op, il, variants)) {
++        return nullptr;
++    }
++    const auto nodes = seabraid_ggml_append_swiglu(graph.ctx0, graph.gf, layer, cur, ids, weights,
++                                              graph.hparams.n_expert_used(il));
++    if (!nodes.output) {
++        return nullptr;
++    }
++    graph.cb(nodes.up, "ffn_moe_up", il);
++    graph.cb(nodes.gate, "ffn_moe_gate", il);
++    graph.cb(nodes.swiglu, "ffn_moe_swiglu", il);
++    graph.cb(nodes.down, "ffn_moe_down", il);
++    graph.cb(nodes.weighted, "ffn_moe_weighted", il);
++    graph.cb(nodes.output, "ffn_moe_out", il);
++    return nodes.output;
++}
++#endif
++
+ ggml_tensor * llm_graph_context::build_moe_ffn(
+          ggml_tensor * cur,
+          ggml_tensor * gate_inp,
+@@ -2434,6 +2478,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+ 
+     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+ 
++#ifdef LLAMA_SEABRAID_GGML
++    // Router nodes and their fusion order are already in the engine's graph. Layers
++    // served from the engine's MoE cache keep the stock graph (it owns the slot lookup).
++    if (cache.slots == nullptr && cache.cpu_ids == nullptr) {
++        if (auto * out = seabraid_qwen3_ffn(*this, {gate_exps, up_exps, down_exps},
++                cur, selected_experts, weights, type_op, il, {
++                gate_up_exps, gate_up_exps_b, up_exps_b, gate_exps_b, down_exps_b,
++                up_exps_s, gate_exps_s, down_exps_s, post_exp_norm})) {
++            return out;
++        }
++    }
++#endif
++
+     if (weight_before_ffn) {
+         // repeat cur to [n_embd, n_expert_used, n_tokens]
+         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);

@@ -1,0 +1,7 @@
+boundary,direction,moves
+main-helper1,up,520
+helper1-helper2,up,481
+helper2-F,up,538
+main-helper1,down,520
+helper1-helper2,down,481
+helper2-F,down,538

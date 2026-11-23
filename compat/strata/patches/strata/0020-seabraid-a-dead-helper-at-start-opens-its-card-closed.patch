@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Seabraid <seabraid@example.invalid>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH 20/20] seabraid: a dead helper at start opens its card closed
+
+Live run S9a (engine stopped gracefully, helpers then killed, engine restarted)
+exited with code 1 after 7.4 s: "seabraid: the helper is not ready for a plan
+(state 5); restart seabraid-helper".  A graceful engine stop writes kShutdown into
+its channels, and RemoteExperts::seabraid_open refused on that state BEFORE it
+bound the helper's identity, so the stale-channel rule of 0019 (D7: a helper dead
+at start is the same fact as one lost a second after start) never ran.  The
+SIGKILLed-engine variant (S9b) left kLoaded and passed, which is why 0019's tests
+did not see it.
+
+Fix, at the one site: seabraid_open binds the PeerWatch first and reads the state
+word after it.  A helper that is gone, or whose pid was reused, opens as a closed
+card (code 6) with the one "is gone ... starts closed" WARN, whatever the state
+word says.  A LIVE helper may be in kShutdown for a moment (helper_serve's
+plan_over puts kHelperUp back), so open waits for it through bl_wait, at most
+30 s, and a helper that dies during that wait opens closed like any dead one.
+Every other not-ready state of a live helper is refused as before.
+
+Tests (seabraid_helper_loss_test): L11, a channel left in kShutdown with a dead
+peer identity opens closed within 1 s with one WARN and no refusal; L12, a live
+helper that bounces kShutdown to kHelperUp after 400 ms is waited for and the
+card opens normally with no WARN.
+
+Failure-first (the tests built against the 0019 engine, CPU only): L11 FAIL
+"open refused: the helper is not ready for a plan (state 5)", L12 the same
+refusal; with 0020 L1-L9, L11, L12, lost_rows_test, remote_experts_seabraid_opt_test
+and remote_prefill_test all pass.
+---
+ src/core/remote_experts.cpp              | 27 +++++++-----
+ tests/core/seabraid_helper_loss_test.cpp | 56 ++++++++++++++++++++++--
+ 2 files changed, 67 insertions(+), 16 deletions(-)
+
+diff --git a/src/core/remote_experts.cpp b/src/core/remote_experts.cpp
+index 5aa14d737..41bb0e9ac 100644
+--- a/src/core/remote_experts.cpp
++++ b/src/core/remote_experts.cpp
+@@ -600,17 +600,10 @@ bool RemoteExperts::seabraid_open(int slots, int64_t layers, int64_t experts,
+         err = "seabraid: the helper on " + name + " is not ready (state 0 after 120 s); restart seabraid-helper";
+         device_ = -1; return false;
+     }
+-    uint32_t st = 0;
+-    {   // kHelperUp: fresh.  kLoaded / kFailed: an earlier engine died without kShutdown; the helper reloads on a new plan.
+-        st = hd->state.load(std::memory_order_acquire);   // the acquire: helper_pid/helper_start below are complete after it (D9)
+-        if (st != seabraid::kHelperUp && st != seabraid::kLoaded && st != seabraid::kFailed) {
+-            err = "seabraid: the helper is not ready for a plan (state " + std::to_string(st) + "); restart seabraid-helper";
+-            device_ = -1; return false;
+-        }
+-    }
+-    // D7 (a stale channel opens as a closed card, it does not refuse the start): a helper that is dead at start is the same
+-    // fact as one lost a second after start, and refusing would turn a dead helper into a dead engine - routine, because
+-    // systemd's RestartSec=5 leaves the old channel behind.  D9b: the identity is bound to a process, not trusted as a pid.
++    // D7 + D9b (liveness BEFORE state): the identity is bound to a process before the state word is read, because a helper that
++    // is dead at start is the same fact as one lost a second after start whatever state its last engine left (kShutdown after a
++    // graceful stop, kLoaded or kFailed after a SIGKILL), and refusing on the state first turned that fact into a dead engine (live run S9a).
++    auto fail = [&](const std::string& msg) { err = msg; device_ = -1; watch_.reset(); return false; };
+     {
+         auto w = std::make_unique<seabraid::PeerWatch>();
+         std::string why;
+@@ -618,7 +611,17 @@ bool RemoteExperts::seabraid_open(int slots, int64_t layers, int64_t experts,
+             return seabraid_open_closed(std::move(ch), layers, experts, why);
+         watch_ = std::move(w);
+     }
+-    auto fail = [&](const std::string& msg) { err = msg; device_ = -1; watch_.reset(); return false; };
++    uint32_t st = hd->state.load(std::memory_order_acquire);   // the acquire: helper_pid/helper_start above are complete after it (D9)
++    if (st == seabraid::kShutdown) {
++        // A LIVE helper reads kShutdown for as long as its plan_over() takes to put kHelperUp back (helper_serve.cpp), so it is
++        // waited for, bounded; a helper that dies meanwhile ends the wait through bl_wait and opens closed like any dead one.
++        bl_wait([&] { return hd->state.load(std::memory_order_acquire) != seabraid::kShutdown; }, 30);
++        if (bl_loss_code() != 0) { watch_.reset(); return seabraid_open_closed(std::move(ch), layers, experts, "it exited while the last engine's session was ending"); }
++        st = hd->state.load(std::memory_order_acquire);
++    }
++    // kHelperUp: fresh.  kLoaded / kFailed: an earlier engine died without kShutdown; the helper reloads on a new plan.
++    if (st != seabraid::kHelperUp && st != seabraid::kLoaded && st != seabraid::kFailed)
++        return fail("seabraid: the helper is not ready for a plan (state " + std::to_string(st) + "); restart seabraid-helper");
+     if (st != seabraid::kHelperUp) std::fprintf(stderr, "seabraid: the helper still held an earlier engine's plan; replacing it\n");
+     // The same selection as the in-process tier: ranked order, nothing the primary or another tier holds.
+     const auto& lay = strata::kernels::cpu::expert_layout();
+diff --git a/tests/core/seabraid_helper_loss_test.cpp b/tests/core/seabraid_helper_loss_test.cpp
+index 4f96a44b6..cdecd84ed 100644
+--- a/tests/core/seabraid_helper_loss_test.cpp
++++ b/tests/core/seabraid_helper_loss_test.cpp
+@@ -1,4 +1,4 @@
+-// seabraid_helper_loss_test (L1-L9): a helper PROCESS that exits, goes mute or answers wrongly closes its card instead of
++// seabraid_helper_loss_test (L1-L9, L11, L12): a helper PROCESS that exits, goes mute or answers wrongly closes its card instead of
+ // ending the engine, and a stale or recycled helper identity opens as a closed card (HL-FIX design, Piece B).
+ //
+ // REAL helpers: each card's helper is a forked child that runs the fake-helper serve loop on a real POSIX shm channel and dies
+@@ -45,13 +45,17 @@ static double now_s() { return std::chrono::duration<double>(std::chrono::steady
+ static float expert_val(int e, float xj) { return (float) (e + 1) * xj; }
+ 
+ // The child: the fake helper of remote_experts_seabraid_opt_test (per-pick answers) plus the ways to die.  Never returns.
+-[[noreturn]] static void child_main(bl::Channel& ch, Ctl* ctl, int announce_delay_ms, bool announce, bool exit_after_announce) {
++[[noreturn]] static void child_main(bl::Channel& ch, Ctl* ctl, int announce_delay_ms, bool announce, bool exit_after_announce, int bounce_ms) {
+     bl::Header* hd = ch.header();
+     if (announce_delay_ms > 0) usleep((useconds_t) announce_delay_ms * 1000);
+     hd->free_gib = 8.0;
+     std::strcpy(hd->helper_name, "fake-helper");
+     if (announce) {
+         bl::announce_identity(*hd);   // NEWAPI: pid + start time BEFORE kHelperUp
++        if (bounce_ms > 0) {   // a LIVE helper that has just seen a graceful engine stop: kShutdown, then back to kHelperUp (helper_serve.cpp plan_over)
++            hd->state.store(bl::kShutdown, std::memory_order_release);
++            usleep((useconds_t) bounce_ms * 1000);
++        }
+         hd->state.store(bl::kHelperUp, std::memory_order_release);
+     }
+     if (exit_after_announce) _exit(0);
+@@ -95,7 +99,7 @@ static float expert_val(int e, float xj) { return (float) (e + 1) * xj; }
+     _exit(0);
+ }
+ 
+-struct Opts { int announce_delay_ms = 0; bool announce = true, exit_after_announce = false, prefill = false; };
++struct Opts { int announce_delay_ms = 0; bool announce = true, exit_after_announce = false, prefill = false; int bounce_ms = 0; };
+ 
+ // N cards, each with a channel made here and a forked helper.  Fork happens before any engine thread exists.
+ struct Rig {
+@@ -118,7 +122,7 @@ struct Rig {
+             cd->ctl = (Ctl*) mmap(nullptr, sizeof(Ctl), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+             cd->ctl->cmd = kRun;
+             cd->pid = fork();
+-            if (cd->pid == 0) child_main(cd->ch, cd->ctl, o.announce_delay_ms, o.announce, o.exit_after_announce);
++            if (cd->pid == 0) child_main(cd->ch, cd->ctl, o.announce_delay_ms, o.announce, o.exit_after_announce, o.bounce_ms);
+             list += (c ? "," : "") + name;
+             cards.push_back(std::move(cd));
+         }
+@@ -335,6 +339,50 @@ int main(int argc, char** argv) {
+         CHECK(!r.re(0).prefill_usable());
+         alarm(0);
+     }
++    // ---- L11 (live run S9a): a graceful engine stop leaves the channel in kShutdown; the helper then dies and is reaped, and the
++    //      engine restarts.  open() is true within 1 s with ONE warning and a closed card (6), whatever the state word says.
++    //      (Before: "the helper is not ready for a plan (state 5)", open() false, and generate exited with code 1.)
++    if (want("L11")) {
++        alarm(10);
++        Opts o; o.exit_after_announce = true;
++        Rig r(1, "k", o);
++        r.wait_state(0, bl::kHelperUp);
++        r.reap(0);
++        r.cards[0]->ch.header()->state.store(bl::kShutdown, std::memory_order_release);   // what RemoteExperts::close() wrote before the engine exited
++        Capture cap;
++        const double t0 = now_s();
++        const bool ok = r.open(0, {2, 3, 5});
++        const std::string log = cap.finish();
++        if (!ok) std::printf("L11: open refused: %s\n", r.err.c_str());
++        CHECK(ok);
++        CHECK(now_s() - t0 < 1.0);
++        CHECK(r.re(0).seabraid_closed() == 6);
++        CHECK(!r.re(0).holds(LAYER, 2) && r.re(0).resident() == 0);
++        CHECK(r.cards[0]->ch.header()->state.load() != bl::kPlanReady);   // nothing was published
++        CHECK(count_of(log, "is gone") == 1);
++        CHECK(count_of(log, "starts closed") == 1);
++        alarm(0);
++    }
++    // ---- L12: the same state word with a LIVE helper: kShutdown is transient (the helper takes it back to kHelperUp), so open()
++    //      waits for it and the card opens normally, with no warning.  A live helper must never be read as a dead one.
++    if (want("L12")) {
++        alarm(20);
++        {
++            Opts o; o.bounce_ms = 400;
++            Rig r(1, "m", o);
++            Capture cap;
++            const double t0 = now_s();
++            const bool ok = r.open(0, {2, 3, 5, 7, 9});
++            const std::string log = cap.finish();
++            if (!ok) std::printf("L12: open refused: %s\n", r.err.c_str());
++            CHECK(ok);
++            CHECK(now_s() - t0 >= 0.3 && now_s() - t0 < 5.0);
++            CHECK(r.re(0).seabraid_closed() == 0 && r.re(0).holds(LAYER, 2));
++            CHECK(count_of(log, "is gone") == 0);
++            while (now_s() - t0 < 0.6) usleep(1000);   // let the helper finish its bounce even after a refused open, so ~Rig's kShutdown ends it
++        }
++        alarm(0);
++    }
+     if (g_fail == 0) { std::printf("ALL OK\n"); return 0; }
+     std::printf("FAILED: %d\n", g_fail);
+     return 1;

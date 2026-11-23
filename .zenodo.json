@@ -1,0 +1,21 @@
+{
+  "title": "Seabraid: an engine-neutral runtime for same-layer mixed-vendor Mixture-of-Experts execution",
+  "upload_type": "software",
+  "version": "0.5.0-alpha.8",
+  "creators": [
+    {"name": "Saltwater Research LLC"}
+  ],
+  "license": "Apache-2.0",
+  "access_right": "open",
+  "keywords": [
+    "mixture-of-experts",
+    "expert braiding",
+    "cross-vendor expert parallelism",
+    "inference",
+    "heterogeneous GPUs",
+    "expert placement",
+    "CUDA",
+    "ROCm"
+  ],
+  "description": "<p>Seabraid lets GPUs from different vendors (NVIDIA CUDA and AMD ROCm) serve the experts of one Mixture-of-Experts model at the same layer (expert braiding, formally cross-vendor expert parallelism). Each card runs vendor-native kernels in its own process; the processes meet in shared memory once per layer. The runtime provides an engine-neutral C ABI and acknowledged live expert placement. Developed by Saltwater Research LLC. The runtime is Apache-2.0. The source NOTICE describes the public headers and integration patch terms. Alpha software: see the repository documentation for what is measured, what is verified by tests, and what has not been run.</p>"
+}

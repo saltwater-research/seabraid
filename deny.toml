@@ -1,0 +1,42 @@
+# cargo-deny policy: what may enter the Rust build.  Checked in CI by the `deny` job.
+# The runtime has no network code and (today) no third-party crates; this file keeps it that way on purpose.
+# Copyright 2026 Saltwater Research LLC
+# SPDX-License-Identifier: Apache-2.0
+
+[graph]
+all-features = true
+
+[advisories]
+# Known-vulnerable or unmaintained crates fail the build (default severity).
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# WHY this short list: the project is Apache-2.0 and the public header is `Apache-2.0 OR MIT`; any dependency must
+# be compatible with both.  Widening this list is a deliberate, reviewed change.
+allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# The runtime must never grow a network or telemetry stack (see checks/check_no_egress.py for the source-level gate).
+deny = [
+  { name = "reqwest" },
+  { name = "hyper" },
+  { name = "ureq" },
+  { name = "openssl" },
+  { name = "native-tls" },
+  { name = "isahc" },
+  { name = "surf" },
+  { name = "curl" },
+  { name = "sentry" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

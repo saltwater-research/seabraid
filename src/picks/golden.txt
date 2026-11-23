@@ -1,0 +1,68 @@
+# Copyright 2026 Saltwater Research LLC
+# SPDX-License-Identifier: Apache-2.0
+# THE PICK RULE, as a table: what one pick, and one row of picks, may be.
+#
+# OWNER: src/picks.rs owns the rule; this file is the one place its cases are written down, so the Rust core, the
+# ggml adapter and the Python reference provider are all held to the SAME rows instead of each keeping a private
+# copy of the rule that only a fuzz test (Python) or nothing (ggml) ever compared.
+# WHY a table and not three test suites: the rule was restated in the runtime, the ggml adapter and the reference
+# provider (and again in the Strata adapter); a fourth hand-written list of cases would be a fourth place to forget.
+# CONSUMERS (each fails when one row below is altered):
+#   src/picks/tests/golden.rs                   kind AND pick index, through picks::check; also proves the wide rows
+#                                               took the sort path, and reads the two `limit` lines
+#   adapters/ggml/test_routes.c                 kind, through seabraid_ggml_routes_fault (not the partial=0 rows that use
+#                                               a skip: the adapter always advertises PARTIAL_ROUTES), plus both
+#                                               `limit` lines
+#   bindings/python/tests/test_pick_golden.py   valid or INVALID, through ReferenceSession.submit (it names no kind)
+# FORMAT: one `case` per line, fields split by " | ":
+#   case <name> | <experts> <partial 0|1> <top_k> | <ids, a whole number of rows of top_k> | <weights> | <verdict>
+#   <weights>: `-` (every weight 0.5) or `<pick>=<value>` overrides; value is nan, inf, -inf, -0 or a decimal.
+#   <verdict>: `ok`, or `<kind>@<pick>` with kind range | skip_weight | finite | repeat, and <pick> the 0-based
+#   index of the FIRST defect of any kind in pick order (at one pick: range, then finite, then repeat).
+#   `limit <name> <n>` lines: constants two layers must agree on (see the consumers).
+# Alter a row and its consumers fail; add a row and all three are held to it at once.
+
+# Rows wider than narrow_row repeat-check by sorting, narrower ones by scanning; both layers must change strategy at
+# the same width. max_picks is the ggml graph's own cap on top-k, recorded here so it cannot drift unseen.
+limit narrow_row 64
+limit max_picks 64
+
+# --- narrow rows (scan) ---
+case clean_row | 8 0 3 | 0 1 2 | - | ok
+case same_ids_in_two_rows_are_not_a_repeat | 4 0 2 | 0 1 0 1 | - | ok
+case id_equal_to_expert_count_is_range | 4 0 3 | 0 1 4 | - | range@2
+case negative_id_other_than_skip_is_range | 8 1 3 | 0 -2 1 | - | range@1
+case skip_without_partial_routes_is_range | 8 0 3 | 0 -1 2 | 1=0 | range@1
+case skip_with_zero_weight_is_ok | 8 1 3 | 0 -1 2 | 1=0 | ok
+case skip_with_negative_zero_is_ok | 8 1 3 | 0 -1 2 | 1=-0 | ok
+case skip_with_nonzero_weight | 8 1 3 | 0 -1 2 | - | skip_weight@1
+case skip_with_nan_weight | 8 1 3 | 0 -1 2 | 1=nan | skip_weight@1
+case skip_with_denormal_weight | 8 1 3 | 0 -1 2 | 1=1e-45 | skip_weight@1
+case skip_with_inf_weight | 8 1 3 | 0 -1 2 | 1=inf | skip_weight@1
+case skips_may_repeat_in_a_row | 8 1 3 | -1 -1 2 | 0=0 1=0 | ok
+case a_row_of_only_skips_is_ok | 8 1 2 | -1 -1 | 0=0 1=0 | ok
+case nan_weight | 8 0 3 | 0 1 2 | 1=nan | finite@1
+case inf_weight | 8 0 3 | 0 1 2 | 2=inf | finite@2
+case negative_inf_weight | 8 0 3 | 0 1 2 | 0=-inf | finite@0
+case repeat_in_a_row | 8 0 3 | 0 1 0 | - | repeat@2
+case lowest_pick_wins_repeat_before_range | 4 0 4 | 3 3 9 1 | - | repeat@1
+case lowest_pick_wins_range_before_repeat | 4 0 4 | 9 1 1 0 | - | range@0
+case lowest_pick_wins_weight_before_repeat | 8 0 4 | 0 1 2 1 | 1=nan | finite@1
+case one_pick_range_then_finite | 4 0 3 | 0 1 4 | 2=nan | range@2
+case one_pick_finite_then_repeat | 8 0 3 | 0 1 1 | 2=nan | finite@2
+case second_row_repeat | 4 0 2 | 0 1 2 2 | - | repeat@3
+case first_row_defect_hides_the_second | 8 0 3 | 0 1 0 2 3 4 | 4=nan | repeat@2
+case top_k_at_the_narrow_limit | 70 0 64 | 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 | - | ok
+case top_k_at_the_narrow_limit_repeat | 70 0 64 | 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 0 | - | repeat@63
+
+# --- wide rows (sort): top_k 65 is the first width above narrow_row ---
+case wide_clean | 70 0 65 | 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 | - | ok
+case wide_repeat_last_pick | 70 0 65 | 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 0 | - | repeat@64
+case wide_range_before_repeat | 70 0 65 | 0 1 2 3 4 5 6 7 8 9 70 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 3 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 | - | range@10
+case wide_repeat_before_range | 70 0 65 | 0 1 2 3 4 5 6 7 8 9 3 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 70 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 | - | repeat@10
+case wide_finite_and_repeat_at_one_pick | 70 0 65 | 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 0 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 | 20=nan | finite@20
+case wide_skips_are_not_repeats | 70 1 65 | 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 -1 -1 | 63=0 64=0 | ok
+case wide_skip_with_nonzero_weight | 70 1 65 | 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 -1 -1 | 63=0 | skip_weight@64
+case wide_skip_without_partial_is_range | 70 0 65 | 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 -1 -1 | 63=0 64=0 | range@63
+case wide_second_row_repeat | 70 0 65 | 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 0 1 2 0 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 | - | repeat@68
+case wide_first_row_defect_hides_the_second | 70 0 65 | 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 0 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 | 69=nan | repeat@64

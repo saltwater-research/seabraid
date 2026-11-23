@@ -1,0 +1,18 @@
+% Copyright 2026 Saltwater Research LLC. SPDX-License-Identifier: Apache-2.0
+% System diagram (hand-written; plain TikZ, arrows.meta only). Schematic.
+\begin{tikzpicture}[
+  box/.style={draw, rounded corners=1.5pt, align=center, font=\scriptsize, inner sep=3pt, minimum height=0.9cm, line width=0.5pt},
+  arr/.style={-{Stealth[length=4pt]}, line width=0.6pt},
+  lab/.style={font=\tiny, text=black!60, align=center}]
+\node[box, text width=2.4cm] (eng) at (0,0) {\textbf{Engine}\\router, scheduler,\\KV cache, merge};
+\node[box, text width=1.5cm] (adp) at (3.0,0) {\textbf{Adapter}\\(per engine)};
+\node[box, text width=2.9cm] (core) at (6.4,0) {\textbf{Rust core behind the C ABI}\\sessions, tickets,\\placement};
+\node[box, text width=2.2cm, draw=portc, fill=portc!10] (cb) at (10.1,1.1) {\textbf{Provider}\\AMD card\\ROCm kernels};
+\node[box, text width=2.2cm, draw=stbc, fill=stbc!10] (cc) at (10.1,-1.1) {\textbf{Provider}\\NVIDIA card\\CUDA kernels};
+\draw[arr] (eng) -- node[above, lab] {routed rows} (adp);
+\draw[arr] (adp) -- node[above, lab] {C ABI} (core);
+\draw[arr] (core) -- node[above, lab, sloped] {callbacks} (cb);
+\draw[arr] (core) -- node[below, lab, sloped] {callbacks} (cc);
+\draw[arr, black!50] ([yshift=-3pt]cb.south) -- node[right, lab] {shared memory,\\one round trip\\per layer} ([yshift=3pt]cc.north);
+\draw[arr, dashed, black!60] (core.south) -- ++(0,-1.0) -| node[below, lab, pos=0.25] {partial sums return to the engine for the merge} (eng.south);
+\end{tikzpicture}

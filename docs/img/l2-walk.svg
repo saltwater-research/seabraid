@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 390" width="780" height="390" role="img" aria-labelledby="t d">
+<title id="t">One expert through five levels</title>
+<desc id="d">Expert 16 of layer 39 goes SSD to RAM in round 28, to helper 2, helper 1 and main in round 79, back to helper 1 in round 118, to helper 2 in round 176, to RAM in round 274 and to the SSD in round 278.</desc>
+<style>
+text{font-family:'Times New Roman',Times,Georgia,serif;fill:#000;font-size:13px}
+.s{font-size:12px}.e{text-anchor:end}.c{text-anchor:middle}
+.rule{stroke:#bbb;stroke-width:.75;fill:none}.box{fill:#fff;stroke:#000;stroke-width:1}
+.up{fill:#1f3a6e;stroke:#1f3a6e}.dn{fill:#888;stroke:#888}.ref{fill:#fff;stroke:#000;stroke-width:1}
+.gate{stroke:#000;stroke-width:1;stroke-dasharray:5 4;fill:none}.ln{stroke-width:1.5;fill:none}.dash{stroke-dasharray:5 3}
+</style>
+<rect width="780" height="390" fill="#fff"/>
+<line x1="130" y1="50" x2="760" y2="50" class="rule"/>
+<text x="118" y="54" class="e">main</text>
+<line x1="130" y1="110" x2="760" y2="110" class="rule"/>
+<text x="118" y="114" class="e">helper 1</text>
+<line x1="130" y1="170" x2="760" y2="170" class="rule"/>
+<text x="118" y="174" class="e">helper 2</text>
+<line x1="130" y1="230" x2="760" y2="230" class="rule"/>
+<text x="118" y="234" class="e">RAM</text>
+<line x1="130" y1="290" x2="760" y2="290" class="rule"/>
+<text x="118" y="294" class="e">SSD (NVMe)</text>
+<line x1="130" y1="304" x2="130" y2="310" class="rule"/>
+<text x="130" y="326" class="s c">0</text>
+<line x1="235" y1="304" x2="235" y2="310" class="rule"/>
+<text x="235" y="326" class="s c">50</text>
+<line x1="340" y1="304" x2="340" y2="310" class="rule"/>
+<text x="340" y="326" class="s c">100</text>
+<line x1="445" y1="304" x2="445" y2="310" class="rule"/>
+<text x="445" y="326" class="s c">150</text>
+<line x1="550" y1="304" x2="550" y2="310" class="rule"/>
+<text x="550" y="326" class="s c">200</text>
+<line x1="655" y1="304" x2="655" y2="310" class="rule"/>
+<text x="655" y="326" class="s c">250</text>
+<line x1="760" y1="304" x2="760" y2="310" class="rule"/>
+<text x="760" y="326" class="s c">300</text>
+<text x="445" y="348" class="s c">placement round</text>
+<line x1="130" y1="290" x2="188.8" y2="290" style="stroke:#000;stroke-width:1"/>
+<line x1="188.8" y1="230" x2="295.9" y2="230" style="stroke:#000;stroke-width:1"/>
+<line x1="295.9" y1="170" x2="295.9" y2="170" style="stroke:#000;stroke-width:1"/>
+<line x1="295.9" y1="110" x2="295.9" y2="110" style="stroke:#000;stroke-width:1"/>
+<line x1="295.9" y1="50" x2="377.8" y2="50" style="stroke:#000;stroke-width:1"/>
+<line x1="377.8" y1="110" x2="499.6" y2="110" style="stroke:#000;stroke-width:1"/>
+<line x1="499.6" y1="170" x2="705.4" y2="170" style="stroke:#000;stroke-width:1"/>
+<line x1="705.4" y1="230" x2="713.8" y2="230" style="stroke:#000;stroke-width:1"/>
+<line x1="713.8" y1="290" x2="760" y2="290" style="stroke:#000;stroke-width:1"/>
+<line x1="188.8" y1="290" x2="188.8" y2="238" class="ln dn dash"/>
+<polygon points="184.8,239 192.8,239 188.8,230" class="dn"/>
+<circle cx="188.8" cy="230" r="3.5" class="dn"/>
+<line x1="295.9" y1="230" x2="295.9" y2="178" class="ln dn dash"/>
+<polygon points="291.9,179 299.9,179 295.9,170" class="dn"/>
+<circle cx="295.9" cy="170" r="3.5" class="dn"/>
+<line x1="295.9" y1="170" x2="295.9" y2="118" class="ln up"/>
+<polygon points="291.9,119 299.9,119 295.9,110" class="up"/>
+<circle cx="295.9" cy="110" r="3.5" class="up"/>
+<line x1="295.9" y1="110" x2="295.9" y2="58" class="ln up"/>
+<polygon points="291.9,59 299.9,59 295.9,50" class="up"/>
+<circle cx="295.9" cy="50" r="3.5" class="up"/>
+<line x1="377.8" y1="50" x2="377.8" y2="102" class="ln up"/>
+<polygon points="373.8,101 381.8,101 377.8,110" class="up"/>
+<circle cx="377.8" cy="110" r="3.5" class="up"/>
+<line x1="499.6" y1="110" x2="499.6" y2="162" class="ln up"/>
+<polygon points="495.6,161 503.6,161 499.6,170" class="up"/>
+<circle cx="499.6" cy="170" r="3.5" class="up"/>
+<line x1="705.4" y1="170" x2="705.4" y2="222" class="ln dn dash"/>
+<polygon points="701.4,221 709.4,221 705.4,230" class="dn"/>
+<circle cx="705.4" cy="230" r="3.5" class="dn"/>
+<line x1="713.8" y1="230" x2="713.8" y2="282" class="ln dn dash"/>
+<polygon points="709.8,281 717.8,281 713.8,290" class="dn"/>
+<circle cx="713.8" cy="290" r="3.5" class="dn"/>
+<text x="198.8" y="264" class="s">28</text>
+<text x="305.9" y="144" class="s">79</text>
+<text x="387.8" y="84" class="s">118</text>
+<text x="509.6" y="144" class="s">176</text>
+<text x="695.4" y="204" class="s e">274</text>
+<text x="723.8" y="264" class="s">278</text>
+<text x="440" y="62">Traced expert: layer 39, expert 16</text>
+<text x="440" y="80" class="s">1,971,200 bytes per hop.</text>
+<text x="440" y="96" class="s">SSD read after the page-cache drop: 2,761 us.</text>
+<line x1="150" y1="380" x2="150" y2="376" class="ln up"/>
+<polygon points="146,377 154,377 150,368" class="up"/>
+<text x="164" y="378" class="s">card to card, verified=1</text>
+<line x1="400" y1="368" x2="400" y2="372" class="ln dn dash"/>
+<polygon points="396,371 404,371 400,380" class="dn"/>
+<text x="414" y="378" class="s">touches RAM or SSD, fallback log</text>
+</svg>

@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seabraid"
+dynamic = ["version"]
+description = "Engine-neutral runtime that lets GPUs from different vendors serve one mixture-of-experts layer together."
+# WHY a short PyPI-specific file and not the repository README: the README is full of repo-relative links that would 404 on PyPI.
+readme = { file = "bindings/python/README-pypi.md", content-type = "text/markdown" }
+license = "Apache-2.0"
+# WHY these two files and not LICENSE*: the wheel carries the runtime and the Python package, both Apache-2.0 (NOTICE,
+# "Licensing"). LICENSE-MIT covers the C headers (dual Apache-2.0 OR MIT) and the upstream patches, none of which is in
+# the wheel, so shipping it would contradict the single Apache-2.0 expression above. NOTICE carries the attribution.
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Saltwater Research LLC", email = "dev@saltyresearch.com" }]
+maintainers = [{ name = "Saltwater Research LLC", email = "dev@saltyresearch.com" }]
+keywords = ["mixture-of-experts", "moe", "gpu", "inference", "heterogeneous", "ctypes"]
+requires-python = ">=3.11"
+dependencies = []
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    # WHY Linux only and not "OS Independent": the platform wheel carries a native library, and Linux is the only
+    # platform verified so far (docs/STATUS.md: the Windows build has not been run, macOS is untested). Add an OS
+    # here only when a build and the tests have run on it. The wheel's own platform tag is the exact statement;
+    # per-wheel classifiers would need scripts/build_wheel.py to pass its own list.
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# WHY a placeholder and not a URL: the repository does not exist yet; its owner and name are decided at release time.
+# scripts/release/rel_export.py replaces every http://localhost/@REPO@ in the exported copy (pyproject.toml, Cargo.toml) with
+# the real repository address and fails if one is left, so the placeholder cannot ship. WHY a loopback address: setuptools
+# refuses a project URL without a scheme and host, and checks/check_no_egress.py allows loopback and nothing else, so the
+# dev tree carries no address that could be mistaken for a real one.
+[project.urls]
+Homepage = "https://github.com/saltwater-research/seabraid"
+Source = "https://github.com/saltwater-research/seabraid"
+Issues = "https://github.com/saltwater-research/seabraid/issues"
+Changelog = "https://github.com/saltwater-research/seabraid/blob/main/CHANGELOG.md"
+
+# NO SDIST IS UPLOADED. WHY: setuptools cannot build the Rust library from an sdist (there is no cargo build hook), so
+# an sdist would install as a reference-only py3-none-any wheel on any platform without a platform wheel, which looks
+# like the engine and is not; a MANIFEST.in listing src/, include/ and Cargo.toml would not change that. Publish the
+# platform wheels (scripts/build_wheel.py); the pure wheel from `python -m build --wheel` is the only fallback, and
+# Runtime() warns loudly whenever it runs without a native library.
+[tool.setuptools]
+package-dir = { "" = "bindings/python" }
+# Only the library package ships; bindings/python/tests lives beside it, outside this list, on purpose.
+packages = ["seabraid"]
+
+[tool.setuptools.package-data]
+# WHY no "_lib/*" here: the native library is not source. scripts/build_wheel.py puts it at seabraid/_lib/ inside setuptools'
+# private build directory, so the platform wheel carries it while the source tree's _lib/ (git-ignored, normally absent)
+# is never read: a stray file there cannot ship, `pip install .` cannot package a stale binary into a py3-none-any wheel,
+# and setuptools has no undeclared package directory to warn about.
+seabraid = ["py.typed"]
+
+[tool.setuptools.dynamic]
+# VERSION at the repository root is the single owner of the version; setuptools normalises it for PyPI (for example 0.5.0-alpha.2 becomes 0.5.0a2).
+version = { file = "VERSION" }

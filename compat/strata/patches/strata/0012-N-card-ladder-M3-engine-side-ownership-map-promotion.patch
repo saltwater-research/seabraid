@@ -1,0 +1,1192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Seabraid <seabraid@example.invalid>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH 12/16] N-card ladder M3, engine side: ownership map +
+ promotion rungs behind --retier-promote, and fail-closed tier rounds
+
+OwnershipMap (one map of who executes each expert, one epoch) with prepare/commit transitions through two live rungs
+(card 1's slots, card 2 over the channel); serve loop calls it between windows only when --retier-promote is given on top of
+--retier (both opt-in).  The existing --retier path gains fail-closed behaviour: a tier round that times out, tears a slot or
+reports stale residency CLOSES the helper card for the session (its experts come from RAM / the drive), and a helper slot whose
+copy did not finish is quarantined (holds() says no, never lent, never written again).  ownership_map_test (CPU) covers the map.
+---
+ CMakeLists.txt                          |   5 +
+ cmake/strata_gpu_engine.cmake           |   1 +
+ include/strata/core/ownership_map.hpp   | 140 ++++++++++++
+ include/strata/core/ownership_rungs.hpp |  67 ++++++
+ include/strata/core/remote_experts.hpp  |  22 +-
+ src/core/ownership_map.cpp              | 186 ++++++++++++++++
+ src/core/ownership_rungs.cpp            | 127 +++++++++++
+ src/core/remote_experts.cpp             |  69 +++++-
+ src/program/generate.cpp                |  78 ++++++-
+ tests/core/ownership_map_test.cpp       | 283 ++++++++++++++++++++++++
+ 10 files changed, 965 insertions(+), 13 deletions(-)
+ create mode 100644 include/strata/core/ownership_map.hpp
+ create mode 100644 include/strata/core/ownership_rungs.hpp
+ create mode 100644 src/core/ownership_map.cpp
+ create mode 100644 src/core/ownership_rungs.cpp
+ create mode 100644 tests/core/ownership_map_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b886fe55a..e2039604b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -414,6 +414,11 @@ if(STRATA_BUILD_TESTS)
+   target_include_directories(seabraid_hot_share_test PRIVATE include)
+   add_test(NAME seabraid_hot_share_test COMMAND seabraid_hot_share_test)
+ 
++  # N-card ladder M3: the expert ownership map and its prepare/commit/abort transition on fake cards (host only, no GPU)
++  add_executable(ownership_map_test tests/core/ownership_map_test.cpp src/core/ownership_map.cpp)
++  target_include_directories(ownership_map_test PRIVATE include)
++  add_test(NAME ownership_map_test COMMAND ownership_map_test)
++
+   # the layer split's spill walk (header-only arithmetic: who is short, which step comes next)
+   add_executable(split_walk_test tests/program/split_walk_test.cpp)
+   target_include_directories(split_walk_test PRIVATE include)
+diff --git a/cmake/strata_gpu_engine.cmake b/cmake/strata_gpu_engine.cmake
+index 6929c6cf0..c676db161 100644
+--- a/cmake/strata_gpu_engine.cmake
++++ b/cmake/strata_gpu_engine.cmake
+@@ -285,6 +285,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
+   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
+   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
++    src/core/ownership_map.cpp src/core/ownership_rungs.cpp
+     src/core/remote_expert_opt.cu
+     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
+     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
+diff --git a/include/strata/core/ownership_map.hpp b/include/strata/core/ownership_map.hpp
+new file mode 100644
+index 000000000..305acc5bc
+--- /dev/null
++++ b/include/strata/core/ownership_map.hpp
+@@ -0,0 +1,140 @@
++#pragma once
++// Who EXECUTES each routed expert: one answer per (layer, expert), and the only way that answer changes, a
++// prepare -> commit | abort transition.  N-card ladder design (seabraid docs/design/N-CARD-LADDER.md), section 4
++// "One owner for who executes (layer, expert)", module M3.
++//
++// DESIGN GATE
++//   Owner    : this file + src/core/ownership_map.cpp own "which rung executes (layer, expert)" and the epoch of that
++//              answer.  A rung is an index: 0 = the card that runs the engine, then the other cards in rank order; the
++//              LAST rung is the fallback below the cards (host RAM, then the drive), which needs no slot and is never
++//              closed.  Nothing here names a card, a vendor, a process or a path.
++//   Contract : OwnershipMap::{init, adopt, snapshot, owner, executor, close} and the transition prepare -> commit|abort.
++//              The bytes of a move go through RungIO, which the caller implements once per card rung (the engine's own
++//              cache, a card behind a channel, fake cards in the host test).  A planner reads snapshots and submits
++//              Promotions; it never writes the map.  Imports: <cstdint>, <string>, <vector> only.
++//   Size     : header <= 150 lines, cpp <= 350 (split before 400).
++//   Failure  : a move refused before any slot is touched fails OPEN, loudly (kRejected: map and cards unchanged).  A
++//              timeout, or a torn slot that cannot be rewritten from its staged blob, fails CLOSED for that rung: close()
++//              sends every cell it owns to the fallback rung (executor()), and the rung stays closed until the caller
++//              builds a new map.  Both displaced blobs are staged in host memory before either slot is overwritten, so
++//              every failure boundary has a defined recovery and nothing depends on re-reading a torn slot.
++//   Checker  : tests/core/ownership_map_test.cpp injects a failure at every boundary (stage, fill on the upper rung, the
++//              lower rung's refusal / failed sync / timeout, a lost race at commit, an explicit abort) on fake cards, and
++//              after each checks: every cell has exactly one executor, no executor is a closed rung, and the bytes
++//              behind every card executor equal the source's.  Each guard sabotaged once (see the test's header).
++//   Finish   : the host test passes; live, the round line reports zero STALE cells and zero closed-card routes.
++//
++// THE INVARIANT.  "Exactly one execution owner per cell at every window boundary."  The map stores one rung per cell,
++// so "one owner" is structural; what can break is the BYTES behind an owner (a torn slot) and routing to a rung whose
++// state is unknown (a timeout).  Those are what the transition and close() guard.  A temporary second physical copy
++// during a round is allowed (the promoted expert sits on both cards between the two writes); a second owner is not.
++//
++// THREADING.  Not synchronised.  The caller drives it from ONE thread at a window boundary with layer requests
++// drained and admission closed (in the engine: the engine thread, where every RungIO write already has to happen).
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace strata::core {
++
++// The outcome of one RungIO step.  The four cases are the four recoveries the transition needs, so they stay distinct.
++enum class IoStatus : uint8_t {
++    kOk = 0,        // done (for a write: the copy completed, was checked where the rung can, and the rung's view moved)
++    kRefused = 1,   // nothing was touched (an argument the rung cannot take, an expert it does not hold)
++    kFailed = 2,    // a write started and did not complete: the slot may hold neither expert whole
++    kTimeout = 3,   // no answer in time: the rung's state is unknown
++};
++
++// One card rung's I/O, implemented by the caller.  Two operations are all a same-layer exchange needs.
++class RungIO {
++public:
++    virtual ~RungIO() = default;
++    // Copy (layer, expert)'s bytes, as this rung holds them, into `out` (resized by the callee).  Touches no slot.
++    virtual IoStatus stage(int32_t layer, int32_t expert, std::vector<uint8_t>& out, std::string& err) = 0;
++    // Overwrite the slot that holds (layer, old_e) with new_e's bytes and switch this rung's own residency view from
++    // old_e to new_e once the copy has completed.  `bytes` is new_e's staged blob; a rung that can only read its own
++    // source (a card behind a channel with no blob-load op) ignores it.  old_e == new_e rewrites the slot in place,
++    // which is how a torn slot is restored.  The view moves ONLY on kOk.
++    virtual IoStatus replace(int32_t layer, int32_t old_e, int32_t new_e, const std::vector<uint8_t>& bytes,
++                             std::string& err) = 0;
++};
++
++// A same-layer exchange across ONE rung boundary: `up` moves from rung hi + 1 to rung hi, `down` from hi to hi + 1.
++// One rung per move is the cascade rule (design section 3, rule P1); same layer because a same-layer swap is the only
++// cross-card primitive until a relocate exists, and it keeps the freed slot the right size for what drops into it.
++struct Promotion {
++    int32_t layer = -1, up = -1, down = -1;
++    int8_t hi = 0;
++};
++
++enum class MoveState : uint8_t {
++    kEmpty = 0,
++    kPrepared,     // both writes completed; commit() may publish it
++    kCommitted,    // the map says up -> hi, down -> hi + 1; the epoch moved
++    kRejected,     // refused before any slot was touched (fail open, loud)
++    kRolledBack,   // a slot was touched and restored from its staged blob; the map is unchanged
++    kClosed,       // a rung could not be restored or did not answer: it is closed (fail closed); the map is unchanged
++};
++
++struct Prepared {
++    Promotion m;
++    uint64_t epoch = 0;                         // the epoch prepare() saw; commit() refuses if the map moved since
++    MoveState state = MoveState::kEmpty;
++    bool hi_written = false, lo_written = false;
++    std::vector<uint8_t> blob_up, blob_down;    // both displaced blobs, staged BEFORE either slot is overwritten
++    std::string why;                            // the reason for any state but kPrepared / kCommitted
++};
++
++struct OwnershipSnapshot {
++    std::vector<int8_t> rung_of;   // n_layers * n_expert, layer-major
++    std::vector<uint8_t> closed;   // per rung
++    uint64_t epoch = 0;
++};
++
++class OwnershipMap {
++public:
++    // `rungs` >= 2 (at least one card and the fallback).  rung_of[cell] in [0, rungs).  False + err on a bad shape.
++    bool init(int64_t layers, int64_t experts, int rungs, const std::vector<int8_t>& rung_of, std::string& err);
++    // Fold in residency that moved by a route this map does not own (the engine's own card-1 <-> RAM adapt) at a
++    // quiet boundary.  Returns the cells that changed (-1 + err on a bad shape); `changed_by` (optional, per rung) counts
++    // the cells that left or joined each rung.  Moves the epoch when anything changed.  Never reopens a closed rung.
++    int64_t adopt(const std::vector<int8_t>& rung_of, std::string& err, std::vector<int64_t>* changed_by = nullptr);
++    OwnershipSnapshot snapshot() const;
++
++    int8_t owner(int64_t layer, int64_t expert) const;      // what the map says (-1 out of range)
++    int8_t executor(int64_t layer, int64_t expert) const;   // the owner, or the fallback when the owner is closed
++    bool closed(int rung) const { return rung >= 0 && rung < rungs_ && closed_[(size_t) rung] != 0; }
++    int rungs() const { return rungs_; }
++    int fallback() const { return rungs_ - 1; }
++    uint64_t epoch() const { return epoch_; }
++    int64_t layers() const { return layers_; }
++    int64_t experts() const { return experts_; }
++    // Fail closed: from now on executor() sends every cell this rung owns to the fallback.  The fallback cannot close.
++    void close(int rung);
++
++    // Stage both blobs, write `up` into `down`'s slot on rung hi, then `down` into `up`'s slot on rung hi + 1.  `io` is
++    // indexed by rung; io[hi] and io[hi + 1] must be non-null.  Every failure path ends in kRejected, kRolledBack or
++    // kClosed with the map unchanged; only kPrepared may be committed.
++    Prepared prepare(const Promotion& m, uint64_t expected_epoch, RungIO* const* io);
++    // Publish a prepared move: the map changes and the epoch moves.  If the epoch moved since prepare() (another
++    // transition or a close won the race), the move is aborted instead and false is returned.
++    bool commit(Prepared& p, RungIO* const* io);
++    // Undo a prepared move: each written slot gets its staged blob back.  A rung that cannot be restored is closed.
++    void abort(Prepared& p, RungIO* const* io);
++
++private:
++    size_t at(int64_t l, int64_t e) const { return (size_t) l * (size_t) experts_ + (size_t) e; }
++    bool restore(Prepared& p, RungIO* const* io, int rung, int32_t holds_now, const std::vector<uint8_t>& blob,
++                 int32_t want);
++    int64_t layers_ = 0, experts_ = 0;
++    int rungs_ = 0;
++    uint64_t epoch_ = 0;
++    std::vector<int8_t> rung_of_;
++    std::vector<uint8_t> closed_;
++};
++
++// For log lines: "card 1", "card 2", ..., "fallback".
++std::string rung_name(int rung, int rungs);
++const char* move_state_name(MoveState s);
++
++}  // namespace strata::core
+diff --git a/include/strata/core/ownership_rungs.hpp b/include/strata/core/ownership_rungs.hpp
+new file mode 100644
+index 000000000..5c6f4687f
+--- /dev/null
++++ b/include/strata/core/ownership_rungs.hpp
+@@ -0,0 +1,67 @@
++#pragma once
++// The live RungIO implementations behind the ownership map (ownership_map.hpp): the engine's own expert cache (card 1)
++// and a card reached through RemoteExperts over a seabraid channel.  The map decides the order and the recovery; these
++// only move bytes and report which of the four IoStatus cases happened.
++//
++// DESIGN GATE
++//   Owner    : "how a slot of THIS kind of rung is read, written and checked".  The residency tables stay with their
++//              owners (host_res and the device tables: the engine; held[]: RemoteExperts); these adapters only call them.
++//   Contract : PrimaryRung, RemoteRung below.  ENGINE THREAD ONLY, at a quiet window boundary: no layer request in flight
++//              (RemoteExperts' fence drains its own), no adapt copy in flight (the caller checks), no other writer.
++//   Size     : header <= 100, cpp <= 200.
++//   Failure  : never throws, never aborts.  A write that started and did not complete is kFailed with the rung's view
++//              unchanged (the map then rewrites the staged blob or closes the rung); a channel timeout is kTimeout (the
++//              card is already closed by RemoteExperts).
++//   Checker  : the map's own test drives fake rungs through every status (tests/core/ownership_map_test.cpp); these two
++//              need a GPU and are exercised by the live A/B (round line, card-closed line).  NOT host-tested.
++//   Finish   : a live --retier-promote round line with committed pairs and zero STALE.
++#include "strata/core/ownership_map.hpp"
++
++#include <cstdint>
++#include <functional>
++#include <string>
++#include <vector>
++
++namespace strata::core {
++class ExpertCache;
++class RemoteExperts;
++
++// Card 1: the engine's own cache.  `host_res` is the table the engine routes from (slot index or kNotResident per cell,
++// layer-major); `publish(err)` pushes it to the device tables (the engine's res_upload).  Each write drains the device
++// first and verifies the slot by read-back, so kOk means the bytes behind the new owner are the staged blob's.
++class PrimaryRung : public RungIO {
++public:
++    PrimaryRung(ExpertCache& cache, std::vector<int32_t>& host_res, int64_t n_expert, std::function<bool(std::string&)> publish)
++        : cache_(cache), res_(host_res), n_expert_(n_expert), publish_(std::move(publish)) {}
++    IoStatus stage(int32_t layer, int32_t expert, std::vector<uint8_t>& out, std::string& err) override;
++    IoStatus replace(int32_t layer, int32_t old_e, int32_t new_e, const std::vector<uint8_t>& bytes, std::string& err) override;
++
++private:
++    ExpertCache& cache_;
++    std::vector<int32_t>& res_;
++    int64_t n_expert_;
++    std::function<bool(std::string&)> publish_;
++};
++
++// A card behind a seabraid channel.  stage() borrows the blob through the prompt path's cache read (copy_cached_blobs);
++// replace() is ONE same-layer kTierSwap through seabraid_retier (drain, fence, ack, held[] adopted and checked).  The
++// staged bytes are not sent: the channel has no blob-load op yet (channel v7's kTierLoadFromBlob, design M4), so the
++// card reads the new expert from its own copy of the same pack.
++class RemoteRung : public RungIO {
++public:
++    explicit RemoteRung(RemoteExperts& re) : re_(re) {}
++    IoStatus stage(int32_t layer, int32_t expert, std::vector<uint8_t>& out, std::string& err) override;
++    IoStatus replace(int32_t layer, int32_t old_e, int32_t new_e, const std::vector<uint8_t>& bytes, std::string& err) override;
++
++private:
++    RemoteExperts& re_;
++};
++
++// The ownership snapshot of a two-card engine as routing really resolves it today: card 1 (rung 0) if the engine's own
++// table has the cell (seabraid_helper_begin skips anything card 1 holds, so card 1 wins a duplicate), else card 2 (rung 1) if
++// the channel card holds it, else the fallback (rung 2).  `both` (optional) counts cells held by both cards: a wasted
++// slot, not a second owner.  Engine thread (it reads the card's held[] view).
++std::vector<int8_t> derive_rungs(const std::vector<int32_t>& host_res, const RemoteExperts& card2, int64_t layers, int64_t experts,
++                                 int64_t* both);
++
++}  // namespace strata::core
+diff --git a/include/strata/core/remote_experts.hpp b/include/strata/core/remote_experts.hpp
+index 2cfee6383..2a64ed720 100644
+--- a/include/strata/core/remote_experts.hpp
++++ b/include/strata/core/remote_experts.hpp
+@@ -46,11 +46,24 @@ public:
+     bool owns(int64_t index) const { return owned_[(size_t) index] != 0; }
+     /// This helper's cache holds (layer, expert): begin() will take its rows unless the plan gave them away.
+     bool holds(int64_t layer, int32_t expert) const {
+-        if (bl_) return layer >= 0 && expert >= 0 && expert < n_expert_ &&
++        // A CLOSED card (fail closed: a tier round timed out or tore a slot) holds nothing as far as routing goes.
++        if (bl_) return bl_closed_.load(std::memory_order_relaxed) == 0 && layer >= 0 && expert >= 0 && expert < n_expert_ &&
+                         (size_t) layer * (size_t) n_expert_ + (size_t) expert < bl_held_.size() &&
+                         bl_held_[(size_t) layer * (size_t) n_expert_ + (size_t) expert] != 0;
+-        return cache_.slot_of(layer, expert) >= 0;
++        // Helper side: a quarantined slot (its tier copy started and did not finish) is published as holding nothing.
++        return cache_.slot_of(layer, expert) >= 0 && !tier_suspect(layer, expert);
+     }
++    /// HELPER SIDE: (layer, expert)'s slot was written by a tier round whose copy did not complete, so it may hold
++    /// neither expert whole.  ExpertCache has no eviction, so the slot stays mapped and is QUARANTINED instead:
++    /// holds() and the cache reads say no, held[] publishes 0, and no tier op may write it again.
++    bool tier_suspect(int64_t layer, int64_t expert) const {
++        const size_t i = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
++        return layer >= 0 && expert >= 0 && expert < n_expert_ && i < tier_suspect_.size() && tier_suspect_[i] != 0;
++    }
++    /// MAIN SIDE: 0 = open; 1 = closed after a tier round timed out; 2 = closed after a torn slot or a stale
++    /// residency report.  Closed is for the rest of the session: nothing is routed to the card and its experts come
++    /// from RAM / the drive (N-card ladder, fail closed on unknown residency).
++    int seabraid_closed() const { return bl_closed_.load(std::memory_order_relaxed); }
+     /// seabraid: this tier is served by a helper process of another GPU vendor over shared memory.
+     bool seabraid() const { return bl_ != nullptr; }
+     bool optimized_decode() const { return remote_opt_ != nullptr; }
+@@ -145,8 +158,13 @@ private:
+     bool seabraid_helper_begin(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k,
+                        const int32_t* kind, const int32_t* primary_res, std::string& err);
+     bool seabraid_helper_finish(float* out, std::string& err);
++    void seabraid_close(int why, const std::string& msg);
++    void tier_quarantine(int64_t layer, int64_t expert);
+     std::unique_ptr<seabraid::Channel> bl_;
+     std::vector<uint8_t> bl_held_;
++    std::atomic<int> bl_closed_{0};        ///< see seabraid_closed(); atomic: the prompt path's stager reads holds() off-thread
++    std::vector<uint8_t> tier_suspect_;    ///< HELPER SIDE: quarantined cells, see tier_suspect()
++    std::vector<std::pair<int32_t, int32_t>> tier_written_;   ///< HELPER SIDE: cells this round's fills wrote
+     /// Swaps whose replace() is waiting on tier_sync().  Residency must not move until the copy
+     /// lands, or a lookup in between reads the slot while it still holds the old expert's bytes.
+     std::vector<seabraid::TierWireOp> tier_queued_;
+diff --git a/src/core/ownership_map.cpp b/src/core/ownership_map.cpp
+new file mode 100644
+index 000000000..a3b12799b
+--- /dev/null
++++ b/src/core/ownership_map.cpp
+@@ -0,0 +1,186 @@
++// The ownership map and its transition: see include/strata/core/ownership_map.hpp for the contract and the design gate.
++//
++// ORDER OF A PROMOTION (prepare), and why each failure ends where it does:
++//   0. checks           : shape, epoch, both rungs open cards, up owned by hi + 1, down by hi     -> kRejected, untouched
++//   1. stage up, down   : both blobs into host memory before ANY slot is written                 -> kRejected (a timeout: kClosed)
++//   2. hi <- up         : the upper card first.  If it tears, down's staged blob rewrites it      -> kRolledBack, or kClosed
++//   3. lo <- down       : then the lower card.  Refused: hi gets down back                        -> kRolledBack
++//                         Failed sync / timeout: lo is closed, hi gets down back                  -> kClosed
++//   4. commit           : the map flips both cells and the epoch moves (abort instead if it moved since step 0)
++// Upper card first because the moving-up expert is then whole on the upper card before the lower card's slot is touched:
++// whatever the lower card does next, the bytes `up` needs exist on a card AND in blob_up, and `down` exists in blob_down.
++#include "strata/core/ownership_map.hpp"
++
++namespace strata::core {
++
++std::string rung_name(int rung, int rungs) {
++    if (rung < 0 || rung >= rungs) return "rung " + std::to_string(rung) + "?";
++    return rung == rungs - 1 ? std::string("fallback") : "card " + std::to_string(rung + 1);
++}
++
++const char* move_state_name(MoveState s) {
++    switch (s) {
++        case MoveState::kEmpty: return "empty";
++        case MoveState::kPrepared: return "prepared";
++        case MoveState::kCommitted: return "committed";
++        case MoveState::kRejected: return "rejected";
++        case MoveState::kRolledBack: return "rolled back";
++        case MoveState::kClosed: return "CLOSED";
++    }
++    return "?";
++}
++
++static const char* io_name(IoStatus s) {
++    switch (s) {
++        case IoStatus::kOk: return "ok";
++        case IoStatus::kRefused: return "refused";
++        case IoStatus::kFailed: return "FAILED (slot may be torn)";
++        case IoStatus::kTimeout: return "TIMEOUT (state unknown)";
++    }
++    return "?";
++}
++
++bool OwnershipMap::init(int64_t layers, int64_t experts, int rungs, const std::vector<int8_t>& rung_of, std::string& err) {
++    // int8_t rungs and the cascade's one-rung moves: more than 64 rungs is not a machine, it is a bug in the caller.
++    if (layers <= 0 || experts <= 0 || rungs < 2 || rungs > 64 || layers > (int64_t(1) << 26) / experts) {
++        err = "ownership map: bad shape (" + std::to_string(layers) + " layers, " + std::to_string(experts) +
++              " experts, " + std::to_string(rungs) + " rungs)";
++        return false;
++    }
++    if (rung_of.size() != (size_t) (layers * experts)) { err = "ownership map: rung_of has the wrong size"; return false; }
++    for (int8_t r : rung_of)
++        if (r < 0 || r >= rungs) { err = "ownership map: a cell names rung " + std::to_string(r); return false; }
++    layers_ = layers; experts_ = experts; rungs_ = rungs;
++    rung_of_ = rung_of;
++    closed_.assign((size_t) rungs, 0);
++    ++epoch_;   // a new map is a new placement: a plan made against the old one must not commit
++    return true;
++}
++
++int64_t OwnershipMap::adopt(const std::vector<int8_t>& rung_of, std::string& err, std::vector<int64_t>* changed_by) {
++    if (rungs_ < 2) { err = "ownership map: adopt before init"; return -1; }
++    if (rung_of.size() != rung_of_.size()) { err = "ownership map: adopt with the wrong size"; return -1; }
++    for (int8_t r : rung_of)
++        if (r < 0 || r >= rungs_) { err = "ownership map: adopt names rung " + std::to_string(r); return -1; }
++    if (changed_by) changed_by->assign((size_t) rungs_, 0);
++    int64_t n = 0;
++    for (size_t i = 0; i < rung_of.size(); ++i) {
++        if (rung_of[i] == rung_of_[i]) continue;
++        ++n;
++        if (changed_by) { ++(*changed_by)[(size_t) rung_of_[i]]; ++(*changed_by)[(size_t) rung_of[i]]; }
++        rung_of_[i] = rung_of[i];
++    }
++    if (n > 0) ++epoch_;   // closed_ is untouched: only a new init() reopens a rung
++    return n;
++}
++
++OwnershipSnapshot OwnershipMap::snapshot() const { return OwnershipSnapshot{rung_of_, closed_, epoch_}; }
++
++int8_t OwnershipMap::owner(int64_t layer, int64_t expert) const {
++    if (layer < 0 || expert < 0 || layer >= layers_ || expert >= experts_) return -1;
++    return rung_of_[at(layer, expert)];
++}
++
++int8_t OwnershipMap::executor(int64_t layer, int64_t expert) const {
++    const int8_t o = owner(layer, expert);
++    if (o < 0) return o;
++    // Fail closed: a closed rung's state is unknown or torn, so its cells go to the one rung that is always whole.
++    return closed(o) ? (int8_t) fallback() : o;
++}
++
++void OwnershipMap::close(int rung) {
++    if (rung < 0 || rung >= fallback() || closed_[(size_t) rung]) return;   // the fallback has no slots to tear
++    closed_[(size_t) rung] = 1;
++    ++epoch_;   // routing changed for every cell this rung owned
++}
++
++bool OwnershipMap::restore(Prepared& p, RungIO* const* io, int rung, int32_t holds_now, const std::vector<uint8_t>& blob,
++                           int32_t want) {
++    if (closed(rung)) return false;
++    std::string err;
++    const IoStatus s = io[rung]->replace(p.m.layer, holds_now, want, blob, err);
++    if (s == IoStatus::kOk) return true;
++    // A slot that cannot be rewritten from a blob we hold is a slot nobody can vouch for: close the whole rung.
++    close(rung);
++    p.why += "; restoring " + rung_name(rung, rungs_) + " " + io_name(s) + (err.empty() ? "" : ": " + err) + ", rung closed";
++    return false;
++}
++
++Prepared OwnershipMap::prepare(const Promotion& m, uint64_t expected_epoch, RungIO* const* io) {
++    Prepared p;
++    p.m = m;
++    p.epoch = epoch_;
++    auto end = [&](MoveState s, const std::string& why) { p.state = s; p.why = why + p.why; return p; };
++    const int hi = m.hi, lo = m.hi + 1;
++    if (rungs_ < 2) return end(MoveState::kRejected, "the map is not initialised");
++    if (hi < 0 || lo >= fallback()) return end(MoveState::kRejected, "both rungs of a move must be cards (hi " + std::to_string(hi) + ")");
++    if (m.layer < 0 || m.layer >= layers_ || m.up < 0 || m.up >= experts_ || m.down < 0 || m.down >= experts_ || m.up == m.down)
++        return end(MoveState::kRejected, "layer or expert out of range");
++    // The epoch guards against a second TRANSITION (or a close) since the caller looked; the two owner checks below
++    // guard the cells themselves, so a plan made before the engine's own adapt moved other cells still applies.
++    if (expected_epoch != epoch_)
++        return end(MoveState::kRejected, "planned against epoch " + std::to_string(expected_epoch) + ", the map is at " + std::to_string(epoch_));
++    if (io == nullptr || io[hi] == nullptr || io[lo] == nullptr) return end(MoveState::kRejected, "no I/O for one of the rungs");
++    if (closed(hi) || closed(lo)) return end(MoveState::kRejected, "a rung of the move is closed");
++    if (owner(m.layer, m.up) != lo) return end(MoveState::kRejected, "the expert to promote is not on " + rung_name(lo, rungs_));
++    if (owner(m.layer, m.down) != hi) return end(MoveState::kRejected, "the expert to drop is not on " + rung_name(hi, rungs_));
++
++    std::string err;
++    // (1) Both displaced blobs, before either slot is overwritten.
++    IoStatus s = io[lo]->stage(m.layer, m.up, p.blob_up, err);
++    if (s == IoStatus::kTimeout) { close(lo); return end(MoveState::kClosed, "staging the promoted expert: " + std::string(io_name(s)) + " " + err); }
++    if (s != IoStatus::kOk) return end(MoveState::kRejected, "staging the promoted expert: " + std::string(io_name(s)) + " " + err);
++    s = io[hi]->stage(m.layer, m.down, p.blob_down, err);
++    if (s == IoStatus::kTimeout) { close(hi); return end(MoveState::kClosed, "staging the dropped expert: " + std::string(io_name(s)) + " " + err); }
++    if (s != IoStatus::kOk) return end(MoveState::kRejected, "staging the dropped expert: " + std::string(io_name(s)) + " " + err);
++    if (p.blob_up.empty() || p.blob_down.empty()) return end(MoveState::kRejected, "a staged blob is empty");
++
++    // (2) The upper card takes `up` into `down`'s slot.
++    s = io[hi]->replace(m.layer, m.down, m.up, p.blob_up, err);
++    if (s == IoStatus::kRefused) return end(MoveState::kRejected, "upper card refused: " + err);
++    if (s == IoStatus::kTimeout) {   // unknown state: never written to again, not even to restore
++        close(hi);
++        return end(MoveState::kClosed, "upper card " + std::string(io_name(s)) + ": " + err);
++    }
++    if (s == IoStatus::kFailed) {    // torn: its view still says `down`, so rewrite down's bytes in place
++        const std::string why = "upper card " + std::string(io_name(s)) + ": " + err;
++        return end(restore(p, io, hi, m.down, p.blob_down, m.down) ? MoveState::kRolledBack : MoveState::kClosed, why);
++    }
++    p.hi_written = true;
++
++    // (3) The lower card takes `down` into `up`'s slot.
++    s = io[lo]->replace(m.layer, m.up, m.down, p.blob_down, err);
++    if (s == IoStatus::kOk) { p.lo_written = true; p.state = MoveState::kPrepared; return p; }
++    const std::string why = "lower card " + std::string(io_name(s)) + ": " + err;
++    // A failed sync or a timeout leaves the lower slot torn or unknown: close the lower card (its cells, `up` among them,
++    // now execute on the fallback).  Either way the upper card gets `down` back, so down's owner stays whole.
++    if (s != IoStatus::kRefused) close(lo);
++    const bool back = restore(p, io, hi, m.up, p.blob_down, m.down);
++    return end(s == IoStatus::kRefused && back ? MoveState::kRolledBack : MoveState::kClosed, why);
++}
++
++bool OwnershipMap::commit(Prepared& p, RungIO* const* io) {
++    if (p.state != MoveState::kPrepared) { p.why = "commit of a move that is not prepared; " + p.why; return false; }
++    if (p.epoch != epoch_) {   // something else changed routing between prepare and commit: do not publish over it
++        p.why = "the map moved from epoch " + std::to_string(p.epoch) + " to " + std::to_string(epoch_) + " before commit";
++        abort(p, io);
++        return false;
++    }
++    rung_of_[at(p.m.layer, p.m.up)] = (int8_t) p.m.hi;
++    rung_of_[at(p.m.layer, p.m.down)] = (int8_t) (p.m.hi + 1);
++    ++epoch_;
++    p.state = MoveState::kCommitted;
++    return true;
++}
++
++void OwnershipMap::abort(Prepared& p, RungIO* const* io) {
++    if (p.state != MoveState::kPrepared) return;
++    bool whole = true;
++    // Reverse order of the writes: the lower card gets `up` back first, then the upper card `down`.
++    if (p.lo_written) whole &= restore(p, io, p.m.hi + 1, p.m.down, p.blob_up, p.m.up);
++    if (p.hi_written) whole &= restore(p, io, p.m.hi, p.m.up, p.blob_down, p.m.down);
++    p.lo_written = p.hi_written = false;
++    p.state = whole ? MoveState::kRolledBack : MoveState::kClosed;
++}
++
++}  // namespace strata::core
+diff --git a/src/core/ownership_rungs.cpp b/src/core/ownership_rungs.cpp
+new file mode 100644
+index 000000000..d48438b14
+--- /dev/null
++++ b/src/core/ownership_rungs.cpp
+@@ -0,0 +1,127 @@
++// Live RungIO adapters for the ownership map: see include/strata/core/ownership_rungs.hpp for the contract and gate.
++#include "strata/core/ownership_rungs.hpp"
++
++#include "strata/core/expert_cache.hpp"
++#include "strata/core/expert_nibble.hpp"
++#include "strata/core/remote_experts.hpp"
++#include "strata/kernels/cpu/expert_layout.hpp"
++
++#include <cuda_runtime.h>
++
++namespace strata::core {
++
++namespace {
++bool cuda_ok(cudaError_t e, const char* what, std::string& err) {
++    if (e == cudaSuccess) return true;
++    err = std::string(what) + ": " + cudaGetErrorString(e);
++    return false;
++}
++}  // namespace
++
++IoStatus PrimaryRung::stage(int32_t layer, int32_t expert, std::vector<uint8_t>& out, std::string& err) {
++    const size_t i = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
++    if (layer < 0 || expert < 0 || expert >= n_expert_ || i >= res_.size() || res_[i] < 0) {
++        err = "card 1 does not hold layer " + std::to_string(layer) + " expert " + std::to_string(expert);
++        return IoStatus::kRefused;
++    }
++    const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
++    out.resize(bytes);
++    // A read: blocking on the legacy stream is enough, nothing at a quiet boundary writes this slot.
++    if (!cuda_ok(cudaMemcpy(out.data(), cache_.device_slot(res_[i]), bytes, cudaMemcpyDeviceToHost), "card 1 slot read", err)) {
++        out.clear();
++        return IoStatus::kRefused;   // nothing was written: the map rejects the move and nothing moves
++    }
++    return IoStatus::kOk;
++}
++
++IoStatus PrimaryRung::replace(int32_t layer, int32_t old_e, int32_t new_e, const std::vector<uint8_t>& bytes, std::string& err) {
++    const size_t io = (size_t) layer * (size_t) n_expert_ + (size_t) old_e;
++    const size_t in = (size_t) layer * (size_t) n_expert_ + (size_t) new_e;
++    if (layer < 0 || old_e < 0 || new_e < 0 || old_e >= n_expert_ || new_e >= n_expert_ || io >= res_.size() || in >= res_.size()) {
++        err = "card 1: layer or expert out of range"; return IoStatus::kRefused;
++    }
++    const int32_t slot = res_[io];
++    if (slot < 0) { err = "card 1 does not hold the expert whose slot was named"; return IoStatus::kRefused; }
++    if (old_e != new_e && res_[in] >= 0) { err = "card 1 already holds the incoming expert"; return IoStatus::kRefused; }
++    // A 4-bit (STRATA_EXPERT_NIBBLE) layer's slots are not GGUF blobs: a raw copy would be silently wrong.  Refused here
++    // rather than through nibble::guard_raw, which aborts: a refused promotion is a skipped move, not a dead engine.
++    if (nibble::layer(layer).on) { err = "card 1: layer " + std::to_string(layer) + " has 4-bit slots; raw copies refused"; return IoStatus::kRefused; }
++    const int64_t need = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
++    if ((int64_t) bytes.size() < need || (int64_t) cache_.slot_room(slot) < need) {
++        err = "card 1: the staged blob or the slot is smaller than layer " + std::to_string(layer) + "'s blob";
++        return IoStatus::kRefused;
++    }
++    // Every stream that may read this slot (the verifier, the adapt and prefetch streams) goes idle first.  A round is
++    // rare (every --retier-every windows) and a device-wide drain is the one ordering that holds against all of them.
++    if (!cuda_ok(cudaDeviceSynchronize(), "card 1 drain before a slot write", err)) return IoStatus::kRefused;
++    auto undo = [&] { res_[io] = slot; if (old_e != new_e) res_[in] = kNotResident; };
++    // The old expert stops being card 1's before its slot changes, so nothing can route to a half-written slot.
++    res_[io] = kNotResident;
++    if (!cuda_ok(cudaMemcpy(cache_.device_slot(slot), bytes.data(), (size_t) need, cudaMemcpyHostToDevice), "card 1 slot write", err)) {
++        undo();   // the view stays the old expert's (the IoStatus contract); the map rewrites the slot or closes the rung
++        return IoStatus::kFailed;
++    }
++    // THE ONLY THING THAT SAYS THE CACHE HOLDS THE EXPERT IT CLAIMS TO (expert_cache.hpp): read it back, byte for byte.
++    if (!cache_.verify_slot(slot, bytes.data(), err, need)) { undo(); return IoStatus::kFailed; }
++    res_[in] = slot;
++    if (!publish_ || !publish_(err)) {   // the device tables could not follow: they may be half-updated
++        undo();
++        std::string e2;
++        if (publish_) publish_(e2);      // best effort to put the old view back on the device
++        err = "card 1: residency table upload failed: " + err;
++        return IoStatus::kFailed;
++    }
++    return IoStatus::kOk;
++}
++
++IoStatus RemoteRung::stage(int32_t layer, int32_t expert, std::vector<uint8_t>& out, std::string& err) {
++    if (re_.seabraid_closed() != 0) { err = "the card is closed"; return IoStatus::kRefused; }
++    out.resize((size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer));
++    uint8_t* dst = out.data();
++    uint8_t hit = 0;
++    const bool ok = re_.copy_cached_blobs(&layer, &expert, &dst, 1, &hit, err);
++    if (!ok || !hit) {   // a read touches no slot: refused either way (a hung card fails its next layer request loudly)
++        if (err.empty()) err = "the card does not hold layer " + std::to_string(layer) + " expert " + std::to_string(expert);
++        out.clear();
++        return IoStatus::kRefused;
++    }
++    return IoStatus::kOk;
++}
++
++IoStatus RemoteRung::replace(int32_t layer, int32_t old_e, int32_t new_e, const std::vector<uint8_t>& bytes, std::string& err) {
++    (void) bytes;   // no blob-load op on the wire yet: the card reads new_e from its own source (same pack, same bytes)
++    // An in-place rewrite would be SWAP(old, old), which ExpertCache::replace turns into "not resident"; the map never
++    // asks a channel card for one (it closes a torn channel card instead), and this refuses it in case that changes.
++    if (old_e == new_e) { err = "an in-place slot rewrite has no wire form"; return IoStatus::kRefused; }
++    seabraid::TierWireOp op{};
++    op.kind = seabraid::kTierSwap;
++    op.helper = 0;
++    op.layer_old = layer; op.expert_old = old_e;
++    op.layer_new = layer; op.expert_new = new_e;
++    uint8_t res = (uint8_t) seabraid::kTierPending;
++    const bool ok = re_.seabraid_retier(&op, 1, &res, nullptr, err);
++    switch (re_.seabraid_closed()) {   // seabraid_retier closes the card itself on a timeout or a torn slot
++        case 1: return IoStatus::kTimeout;
++        case 2: return IoStatus::kFailed;
++        default: break;
++    }
++    if (ok && res == (uint8_t) seabraid::kTierApplied) return IoStatus::kOk;
++    return IoStatus::kRefused;   // kTierRejected: the helper refused before touching the slot
++}
++
++std::vector<int8_t> derive_rungs(const std::vector<int32_t>& host_res, const RemoteExperts& card2, int64_t layers, int64_t experts,
++                                 int64_t* both) {
++    std::vector<int8_t> r((size_t) (layers * experts), 2);
++    int64_t dup = 0;
++    for (int64_t l = 0; l < layers; ++l)
++        for (int64_t e = 0; e < experts; ++e) {
++            const size_t i = (size_t) (l * experts + e);
++            const bool c1 = i < host_res.size() && host_res[i] >= 0, c2 = card2.holds(l, (int32_t) e);
++            r[i] = c1 ? 0 : c2 ? 1 : 2;
++            dup += c1 && c2;
++        }
++    if (both) *both = dup;
++    return r;
++}
++
++}  // namespace strata::core
+diff --git a/src/core/remote_experts.cpp b/src/core/remote_experts.cpp
+index f269ab007..e2dcd0c62 100644
+--- a/src/core/remote_experts.cpp
++++ b/src/core/remote_experts.cpp
+@@ -468,6 +468,7 @@ bool RemoteExperts::tier_apply(const seabraid::TierWireOp& op, ExpertSource& sou
+         }
+         slot = cache_.slot_of(op.layer_old, op.expert_old);
+         if (slot < 0) { err = "tier_apply: SWAP but the displaced expert is not resident here"; return false; }
++        if (tier_suspect(op.layer_old, op.expert_old)) { err = "tier_apply: SWAP into a quarantined slot (an earlier copy into it failed)"; return false; }
+     } else {
+         err = "tier_apply: unknown op kind " + std::to_string((int) op.kind);
+         return false;
+@@ -489,7 +490,15 @@ bool RemoteExperts::tier_apply(const seabraid::TierWireOp& op, ExpertSource& sou
+               std::to_string(op.expert_new);
+         return false;
+     }
+-    if (!cache_.fill_slot(slot, blob, stream_, err, need)) return false;
++    // The cell whose slot this op writes: a SWAP writes the displaced expert's slot, a LOAD the one admit() just mapped.
++    const int32_t wl = op.kind == seabraid::kTierSwap ? op.layer_old : op.layer_new;
++    const int32_t we = op.kind == seabraid::kTierSwap ? op.expert_old : op.expert_new;
++    if (!cache_.fill_slot(slot, blob, stream_, err, need)) {
++        // The copy may have started: from here the slot is torn until proven otherwise (N-card ladder, fail closed).
++        tier_quarantine(wl, we);
++        return false;
++    }
++    tier_written_.emplace_back(wl, we);
+     source.note_async_read(blob, stream_);   // #1237: the source must not free the host buffer mid-DMA
+     // A LOAD's residency is already published by admit().  A SWAP's is not, and must not be until the bytes
+     // have landed: a lookup in between would find the slot still holding the displaced expert's data.
+@@ -497,19 +506,33 @@ bool RemoteExperts::tier_apply(const seabraid::TierWireOp& op, ExpertSource& sou
+     return true;
+ }
+ 
++void RemoteExperts::tier_quarantine(int64_t layer, int64_t expert) {
++    if (layer < 0 || expert < 0 || expert >= n_expert_ || cache_.slot_of(layer, expert) < 0) return;
++    const size_t cells = layers_present_.size() * (size_t) n_expert_;
++    if (tier_suspect_.size() != cells) tier_suspect_.assign(cells, 0);
++    const size_t i = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
++    if (i < tier_suspect_.size()) tier_suspect_[i] = 1;
++}
++
+ bool RemoteExperts::tier_sync(std::string& err) {
+     DeviceScope scope(device_);
+-    if (!scope.ok) { err = scope.error(device_); tier_queued_.clear(); return false; }
+-    // Always drain, even with nothing queued: a LOAD leaves a fill in flight with no deferred replace, and
+-    // acking before it lands lets the main engine route to an expert whose bytes have not arrived.
+-    if (!check(cudaStreamSynchronize(stream_), "cudaStreamSynchronize", err, device_)) {
+-        // The copies did not complete, so publishing would point residency at bytes that may never arrive.
+-        // Leaving the displaced experts resident is the safe side: their data is still there.
++    // The copies did not complete (or could not be waited for), so every slot this round wrote may hold neither expert
++    // whole.  The old code left the displaced experts published as resident on the ground that their data was still
++    // there -- but a SWAP's fill writes into THAT slot (tier_apply), so after a failed copy it was not.  Quarantine each
++    // written slot instead: published as holding nothing, never written again (N-card ladder, fail closed).
++    auto fail = [&] {
++        for (const auto& c : tier_written_) tier_quarantine(c.first, c.second);
++        tier_written_.clear();
+         tier_queued_.clear();
+         return false;
+-    }
++    };
++    if (!scope.ok) { err = scope.error(device_); return fail(); }
++    // Always drain, even with nothing queued: a LOAD leaves a fill in flight with no deferred replace, and
++    // acking before it lands lets the main engine route to an expert whose bytes have not arrived.
++    if (!check(cudaStreamSynchronize(stream_), "cudaStreamSynchronize", err, device_)) return fail();
+     for (const auto& op : tier_queued_) cache_.replace(op.layer_old, op.expert_old, op.expert_new);
+     tier_queued_.clear();
++    tier_written_.clear();
+     return true;
+ }
+ 
+@@ -708,6 +731,7 @@ bool RemoteExperts::seabraid_retier(const seabraid::TierWireOp* ops, int32_t n,
+         return false;
+     }
+     if (bl_fenced_) { err = "seabraid retier: re-entered while a tier round was already open"; return false; }
++    if (bl_closed_.load(std::memory_order_relaxed) != 0) { err = "seabraid retier: this card is CLOSED (an earlier round timed out or tore a slot)"; return false; }
+ 
+     // (1) Drain.  A request still in flight would be answered out of a slot that is about to move, and that
+     // reply is well-formed and numerically wrong -- nothing in the protocol can detect it.
+@@ -722,6 +746,10 @@ bool RemoteExperts::seabraid_retier(const seabraid::TierWireOp* ops, int32_t n,
+     if (!seabraid::Channel::wait([&] { return bl_->tier_done(seq); }, 60)) {
+         err = "seabraid retier: the helper did not finish tier round " +
+               std::to_string((unsigned long long) seq) + " within 60 s";
++        // FAIL CLOSED.  The Reopen above reopens admission on this return, and before this line it did so with
++        // bl_held_ unchanged while the helper might still be applying the round: the next request routed from a
++        // stale view and a well-formed wrong row was the result (N-card ladder review).  Now the card routes nothing.
++        seabraid_close(1, err);
+         return false;
+     }
+ 
+@@ -765,10 +793,19 @@ bool RemoteExperts::seabraid_retier(const seabraid::TierWireOp* ops, int32_t n,
+         for (int32_t i = 0; i < n; ++i) rr[i] = i < got ? hd->tier_res[i] : (uint8_t) seabraid::kTierPending;
+         std::string why2;
+         if (!seabraid::tier_residency_consistent(bl_held_.data(), (int64_t) layers_present_.size(), n_expert_, ops, rr, n, why2)) {
+-            bl_->bump_epoch();
+             err = "seabraid retier: helper residency is STALE after an applied round (" + why2 + ")";
++            seabraid_close(2, err);   // fail closed: routing from a view known to be wrong is the bug this check exists for
+             return false;
+         }
++        // A FAILED op (as opposed to REJECTED) started a copy into a slot that did not complete: the helper has
++        // quarantined it and published it as holding nothing, but which other rows it may have shared a sync with is
++        // not known here, so the card closes (N-card ladder contract: a failed sync fails CLOSED).
++        for (int32_t i = 0; i < got; ++i)
++            if (hd->tier_res[i] == (uint8_t) seabraid::kTierFailed) {
++                err = "seabraid retier: op " + std::to_string(i) + " FAILED after its copy started" + (why.empty() ? std::string() : ": " + why);
++                seabraid_close(2, err);
++                return false;
++            }
+     }
+ 
+     // (5) Only now move the epoch.  It advertises a placement this engine has already adopted, so a request
+@@ -783,6 +820,17 @@ bool RemoteExperts::seabraid_retier(const seabraid::TierWireOp* ops, int32_t n,
+     return true;
+ }
+ 
++void RemoteExperts::seabraid_close(int why, const std::string& msg) {
++    if (bl_closed_.exchange(why) != 0) return;
++    // Nothing is routed to this card from here on: holds() says no, no layer is present, the prompt path lends
++    // nothing, seabraid_retier refuses.  Its experts are served from RAM / the drive -- slower, never wrong.
++    std::fill(bl_held_.begin(), bl_held_.end(), 0);
++    std::fill(layers_present_.begin(), layers_present_.end(), 0);
++    if (bl_) bl_->bump_epoch();
++    std::fprintf(stderr, "seabraid: card CLOSED (%s): %s; its experts now come from RAM / the drive for the rest of this session\n",
++                 why == 1 ? "tier round timed out" : "torn slot or stale residency", msg.c_str());
++}
++
+ int64_t RemoteExperts::seabraid_free_slots() const {
+     int64_t held = 0;
+     for (const uint8_t v : bl_held_) held += v != 0;
+@@ -793,6 +841,7 @@ bool RemoteExperts::copy_cached_blobs(const int32_t* layers, const int32_t* expe
+                                       size_t n, uint8_t* hit, std::string& err) {
+     std::fill(hit, hit + n, 0);
+     if (bl_) {   // seabraid: ask the helper process to copy them from its VRAM into the channel, 16 at a time
++        if (bl_closed_.load(std::memory_order_relaxed) != 0) return true;   // a closed card lends nothing: all misses
+         std::lock_guard<std::mutex> lock(read_mu_);
+         seabraid::Header* hd = bl_->header();
+         const auto& lay = strata::kernels::cpu::expert_layout();
+@@ -831,7 +880,7 @@ bool RemoteExperts::copy_cached_blobs(const int32_t* layers, const int32_t* expe
+     for (size_t i = 0; i < n; ++i) {
+         if (dst[i] == nullptr) continue;
+         const int32_t slot = cache_.slot_of(layers[i], experts[i]);
+-        if (slot < 0) continue;
++        if (slot < 0 || tier_suspect(layers[i], experts[i])) continue;   // a quarantined slot is never lent
+         const size_t bytes = (size_t) lay.blob_bytes(layers[i]);
+         if (!check(cudaMemcpyAsync(dst[i], cache_.device_slot(slot), bytes, cudaMemcpyDeviceToHost, read_stream_),
+                    "cache read", err, device_)) {
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 508c5a08f..5b36a06d5 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -59,6 +59,7 @@
+ #include "strata/core/remote_experts.hpp"
+ #if defined(STRATA_HAVE_SEABRAID_RETIER)   // seabraid D7 live re-tiering: only when built with -DSEABRAID_STRATA_SOURCE_DIR
+ #include "strata/seabraid/retier_loop.hpp"
++#include "strata/core/ownership_rungs.hpp"   // N-card ladder M3: --retier-promote's ownership map and its live rungs
+ #endif
+ #include "strata/core/on_device.hpp"
+ #include "strata/core/peer_experts.hpp"
+@@ -9700,6 +9701,14 @@ int main(int argc, char** argv) {
+ #if defined(STRATA_HAVE_SEABRAID_RETIER)
+     std::unique_ptr<seabraid::RetierLoop> retier_loop;     // seabraid D7: stays null unless --retier is on and checked
+     strata::core::RemoteExperts* retier_re = nullptr;     // the helper tier the loop drives
++    // --retier-promote (N-card ladder M3): ONE map of who executes each expert (card 1, card 2, fallback) and the two
++    // live rungs every promotion goes through.  Built at the first window boundary (it needs the serve loop's res_upload).
++    std::unique_ptr<strata::core::OwnershipMap> ladder_map;
++    std::unique_ptr<strata::core::PrimaryRung> ladder_card1;
++    std::unique_ptr<strata::core::RemoteRung> ladder_card2;
++    std::vector<int8_t> ladder_rungs;                     // the last snapshot handed to the planner
++    int64_t ladder_stale = 0, ladder_both = 0;
++    bool ladder_fatal = false, ladder_closed_said = false;
+ #endif
+     // #731 (opt-in, STRATA_DISJOINT_ADAPT=1): the adaptive tiers leave an expert a helper GPU holds out of the primary's
+     // promotion candidates (it would sit in both caches).  Asked live, from the helper's own cache (RemoteExperts::holds,
+@@ -14039,6 +14048,12 @@ int main(int argc, char** argv) {
+                 std::fprintf(stderr, "strata serve: %s\n", rerr.c_str());
+                 return 2;
+             }
++            // --retier-promote writes card 1's slots between windows: a layer split (another card's copy of the residency
++            // table) or the peer tier (its own adapt copies) would need writes this first build does not make.  Refuse.
++            if (o.retier.promote && (!stages.empty() || peer.valid())) {
++                std::fprintf(stderr, "strata serve: --retier-promote: not with a layer split or --peer-device (card 1's slots only)\n");
++                return 2;
++            }
+             retier_loop = std::make_unique<seabraid::RetierLoop>(o.retier, g.n_layers, g.n_expert);   // built on the engine thread: the only one that may tick it
+             std::fprintf(stderr, "strata serve: seabraid re-tiering %s: a round every %d windows, %d moves, margin %.2f, cooldown %d rounds, layer ceiling %.3f\n",
+                          o.retier.mode == seabraid::RetierMode::kZeroOp ? "ZERO-OP (no ops are sent)" : "ON", o.retier.every_windows,
+@@ -20793,9 +20808,70 @@ int main(int argc, char** argv) {
+                 // seabraid D7: the one window-boundary hook.  Engine thread; this window's adapt thread was joined at the end of the
+                 // last one and the next is not started yet, so nothing else touches usage or the helper's residency here.  tick()
+                 // applies a finished plan through seabraid_retier (which drains and fences) and snapshots heat for the next round.
+-                if (retier_loop)
++                if (retier_loop && !o.retier.promote)
+                     retier_loop->tick(drive.d.usage.data(), drive.d.usage.size(), retier_re->seabraid_held(), retier_re->seabraid_free_slots(), !ajob,
+                                       [&](const seabraid::TierWireOp* ops, int32_t n, uint8_t* res, std::string& e) { return retier_re->seabraid_retier(ops, n, res, nullptr, e); });
++                // N-card ladder, the first live move (--retier-promote): card 2's hot experts up to card 1, card 1's coldest of
++                // the same layer down to card 2, each pair through the ownership map's prepare/commit.  Quiet = no adapt job AND
++                // no adapt copy in flight: a promotion writes card 1's own slots, which those copies also write.
++                if (retier_loop && o.retier.promote && retier_re->seabraid_closed() != 0 && !ladder_closed_said) {
++                    ladder_closed_said = true;   // fail closed: no further rounds; the card's experts come from RAM / the drive
++                    std::fprintf(stderr, "strata serve: retier promote: card 2 is CLOSED; no further rounds this session\n");
++                }
++                if (retier_loop && o.retier.promote && retier_re->seabraid_closed() == 0) {
++                    const bool quiet = !ajob && pending.empty();
++                    if (!ladder_map) {
++                        ladder_card1 = std::make_unique<strata::core::PrimaryRung>(xcache, host_res, g.n_expert, [&](std::string& e) {
++                            const cudaError_t r = res_upload();
++                            if (r != cudaSuccess) e = cudaGetErrorString(r);
++                            return r == cudaSuccess;
++                        });
++                        ladder_card2 = std::make_unique<strata::core::RemoteRung>(*retier_re);
++                        ladder_map = std::make_unique<strata::core::OwnershipMap>();
++                        std::string e;
++                        if (!ladder_map->init(g.n_layers, g.n_expert, 3, strata::core::derive_rungs(host_res, *retier_re, g.n_layers, g.n_expert, &ladder_both), e)) {
++                            std::printf("ERR retier promote: %s\n", e.c_str());
++                            return 1;
++                        }
++                        ladder_rungs = ladder_map->snapshot().rung_of;
++                    }
++                    // Adopt what moved by routes the map does not own (card 1 <-> RAM: Strata's own adapt) before planning and
++                    // before applying.  Card 2's residency changes ONLY through these transitions here, so any change on rung 1
++                    // is STALE: counted, printed, and the A/B's finish line is that it stays zero.
++                    auto adopt = [&]() {
++                        std::string e;
++                        std::vector<int64_t> by;
++                        if (ladder_map->adopt(strata::core::derive_rungs(host_res, *retier_re, g.n_layers, g.n_expert, &ladder_both), e, &by) > 0)
++                            ladder_stale += by[1];
++                        ladder_rungs = ladder_map->snapshot().rung_of;
++                    };
++                    if (quiet && retier_loop->snapshot_due()) adopt();
++                    const std::vector<int64_t> rung_free{0, retier_re->seabraid_free_slots(), 0};   // card 1 never grows: pairs only
++                    retier_loop->tick_ladder(drive.d.usage.data(), drive.d.usage.size(), ladder_rungs, rung_free, quiet,
++                        [&](const std::vector<seabraid::LadderPair>& pairs, std::vector<uint8_t>& ok, std::string& note) -> bool {
++                            adopt();
++                            strata::core::RungIO* io[3] = {ladder_card1.get(), ladder_card2.get(), nullptr};
++                            int committed = 0;
++                            for (size_t k = 0; k < pairs.size(); ++k) {
++                                const strata::core::Promotion m{pairs[k].layer, pairs[k].up, pairs[k].down, pairs[k].hi};
++                                strata::core::Prepared p = ladder_map->prepare(m, ladder_map->epoch(), io);
++                                if (p.state == strata::core::MoveState::kPrepared) ladder_map->commit(p, io);
++                                ok[k] = p.state == strata::core::MoveState::kCommitted;
++                                committed += ok[k];
++                                if (!ok[k] && note.size() < 600)
++                                    note += "L" + std::to_string(m.layer) + "/E" + std::to_string(m.up) + " " + strata::core::move_state_name(p.state) + " (" + p.why + "); ";
++                                if (ladder_map->closed(0)) { ladder_fatal = true; break; }   // card 1 could not be restored: stop the engine
++                                if (ladder_map->closed(1)) break;                            // card 2 closed: the rest is moot
++                            }
++                            note += "ownership epoch " + std::to_string(ladder_map->epoch()) + ", STALE " + std::to_string(ladder_stale) +
++                                    ", held by both cards " + std::to_string(ladder_both) + ", card 2 " + (ladder_map->closed(1) ? "CLOSED" : "open");
++                            return committed == (int) pairs.size();
++                        });
++                    if (ladder_fatal) {
++                        std::printf("ERR retier promote: a card-1 slot could not be restored after a failed promotion\n");
++                        return 1;
++                    }
++                }
+ #endif
+                 if (!adapt_tick(false)) {   // --adapt-async: the round in flight moves on a step when it can
+                     std::printf("ERR an adaptive refill failed\n");
+diff --git a/tests/core/ownership_map_test.cpp b/tests/core/ownership_map_test.cpp
+new file mode 100644
+index 000000000..9f6d84f88
+--- /dev/null
++++ b/tests/core/ownership_map_test.cpp
+@@ -0,0 +1,283 @@
++// M3: the ownership map and its transition (include/strata/core/ownership_map.hpp) on FAKE cards.  Host only, no GPU:
++//   g++ -std=c++17 -O1 -Wall -Wextra -Iinclude tests/core/ownership_map_test.cpp src/core/ownership_map.cpp -o ownership_map_test
++//
++// A fake card has slots of real bytes and its own residency view, and can be told to refuse, tear (kFailed) or time
++// out on its next stage/replace.  The source is a deterministic blob per (layer, expert).  After EVERY scenario
++// world_ok() checks the three things M3's gate names, on every cell:
++//   - exactly one executor, and it is never a closed rung;
++//   - the bytes behind every card executor equal the source's (a torn slot routed to fails here);
++//   - an open card's view and the map agree (no cell held by an open card that the map gives to someone else).
++// Sabotage runs (each edited into a copy of src/core/ownership_map.cpp, rebuilt, the named check seen to FAIL, restored)
++// are recorded in seabraid tests/SABOTAGE.md under "ownership_map_test".
++#include "strata/core/ownership_map.hpp"
++
++#include <cstdio>
++#include <deque>
++#include <map>
++#include <string>
++#include <utility>
++#include <vector>
++
++using namespace strata::core;
++
++static int g_fail = 0;
++static const char* g_test = "?";
++#define CHECK(c) do { if (!(c)) { ++g_fail; std::printf("  FAIL [%s] %s:%d  %s\n", g_test, __FILE__, __LINE__, #c); } } while (0)
++
++static constexpr int L = 3, E = 8, kBlob = 48;
++
++static std::vector<uint8_t> source(int l, int e) {
++    std::vector<uint8_t> b(kBlob);
++    for (int i = 0; i < kBlob; ++i) b[(size_t) i] = (uint8_t) (l * 131 + e * 29 + i * 7 + 1);
++    return b;
++}
++
++struct FakeCard : RungIO {
++    bool takes_blob = true;                          // false = a card behind a channel: reads its own source
++    std::vector<std::vector<uint8_t>> slot;          // the bytes
++    std::map<std::pair<int, int>, int> view;         // its own residency: (layer, expert) -> slot
++    std::deque<IoStatus> stage_faults, replace_faults;
++    int replaces = 0;
++
++    void put(int l, int e) { view[{l, e}] = (int) slot.size(); slot.push_back(source(l, e)); }
++    bool holds(int l, int e) const { return view.count({l, e}) != 0; }
++    static IoStatus pop(std::deque<IoStatus>& q) { if (q.empty()) return IoStatus::kOk; IoStatus s = q.front(); q.pop_front(); return s; }
++
++    IoStatus stage(int32_t l, int32_t e, std::vector<uint8_t>& out, std::string& err) override {
++        const IoStatus f = pop(stage_faults);
++        if (f != IoStatus::kOk) { err = "injected"; return f; }
++        auto it = view.find({l, e});
++        if (it == view.end()) { err = "not held"; return IoStatus::kRefused; }
++        out = slot[(size_t) it->second];
++        return IoStatus::kOk;
++    }
++    IoStatus replace(int32_t l, int32_t old_e, int32_t new_e, const std::vector<uint8_t>& bytes, std::string& err) override {
++        ++replaces;
++        auto it = view.find({l, old_e});
++        if (it == view.end()) { err = "old not held"; return IoStatus::kRefused; }
++        const IoStatus f = pop(replace_faults);
++        if (f == IoStatus::kRefused) { err = "injected refusal"; return f; }
++        const int s = it->second;
++        const std::vector<uint8_t> want = takes_blob ? bytes : source(l, new_e);
++        if (f != IoStatus::kOk) {                    // a copy that started and did not finish: the slot is torn, the view stays
++            for (size_t i = 0; i < want.size() / 2; ++i) slot[(size_t) s][i] = want[i];
++            err = "injected tear";
++            return f;
++        }
++        slot[(size_t) s] = want;
++        view.erase(it);
++        view[{l, new_e}] = s;
++        return IoStatus::kOk;
++    }
++};
++
++// cards[0..n-1] + the fallback.  Layout per layer: card 1 holds experts 0,1; card 2 holds 2,3; card 3 (if any) 4,5;
++// the rest are on the fallback.
++struct World {
++    int n_cards;
++    std::vector<FakeCard> card;
++    std::vector<RungIO*> io;
++    OwnershipMap map;
++    explicit World(int cards, bool channel_lower = true) : n_cards(cards), card((size_t) cards) {
++        std::vector<int8_t> rung((size_t) (L * E), (int8_t) cards);
++        for (int l = 0; l < L; ++l)
++            for (int c = 0; c < cards; ++c)
++                for (int e = 2 * c; e < 2 * c + 2; ++e) { card[(size_t) c].put(l, e); rung[(size_t) (l * E + e)] = (int8_t) c; }
++        for (int c = 1; c < cards; ++c) card[(size_t) c].takes_blob = !channel_lower;
++        for (auto& c : card) io.push_back(&c);
++        io.push_back(nullptr);                       // the fallback has no I/O
++        std::string err;
++        if (!map.init(L, E, cards + 1, rung, err)) std::printf("init: %s\n", err.c_str());
++    }
++    // The gate's three checks over every cell.
++    bool world_ok() {
++        bool ok = true;
++        for (int l = 0; l < L; ++l)
++            for (int e = 0; e < E; ++e) {
++                const int ex = map.executor(l, e);
++                if (ex < 0 || ex >= map.rungs() || map.closed(ex)) { ok = false; std::printf("    cell (%d,%d): executor %d is closed or invalid\n", l, e, ex); continue; }
++                if (ex == map.fallback()) continue;   // the fallback reads the source: always whole
++                const FakeCard& c = card[(size_t) ex];
++                auto it = c.view.find({l, e});
++                if (it == c.view.end()) { ok = false; std::printf("    cell (%d,%d): executor card %d does not hold it\n", l, e, ex + 1); continue; }
++                if (c.slot[(size_t) it->second] != source(l, e)) { ok = false; std::printf("    cell (%d,%d): card %d's bytes are not the source's\n", l, e, ex + 1); }
++            }
++        for (int r = 0; r < n_cards; ++r) {
++            if (map.closed(r)) continue;
++            for (const auto& kv : card[(size_t) r].view)
++                if (map.owner(kv.first.first, kv.first.second) != r) {
++                    ok = false; std::printf("    card %d holds (%d,%d) but the map gives it to rung %d\n", r + 1, kv.first.first, kv.first.second,
++                                            map.owner(kv.first.first, kv.first.second));
++                }
++        }
++        return ok;
++    }
++    Prepared promote(int layer, int up, int down, int hi = 0) { return map.prepare(Promotion{layer, up, down, (int8_t) hi}, map.epoch(), io.data()); }
++};
++
++static void t_commit() {
++    g_test = "prepare + commit";
++    World w(2);
++    const uint64_t e0 = w.map.epoch();
++    Prepared p = w.promote(1, 2, 0);                 // card 2's expert 2 up, card 1's expert 0 down, layer 1
++    CHECK(p.state == MoveState::kPrepared);
++    CHECK(w.map.owner(1, 2) == 1 && w.map.owner(1, 0) == 0);   // nothing published before commit
++    CHECK(w.map.commit(p, w.io.data()) && p.state == MoveState::kCommitted);
++    CHECK(w.map.owner(1, 2) == 0 && w.map.owner(1, 0) == 1 && w.map.epoch() > e0);
++    CHECK(w.card[0].holds(1, 2) && w.card[1].holds(1, 0) && !w.card[0].holds(1, 0) && !w.card[1].holds(1, 2));
++    CHECK(w.world_ok());
++}
++
++static void t_rejected_untouched() {
++    g_test = "rejected before any write";
++    World w(2);
++    w.card[1].stage_faults.push_back(IoStatus::kRefused);
++    Prepared p = w.promote(0, 3, 1);
++    CHECK(p.state == MoveState::kRejected && w.card[0].replaces == 0 && w.card[1].replaces == 0);
++    Prepared q = w.promote(0, 0, 1);                 // up is not on the lower rung
++    CHECK(q.state == MoveState::kRejected);
++    Prepared r = w.map.prepare(Promotion{0, 3, 1, 0}, w.map.epoch() - 1, w.io.data());   // a stale snapshot
++    CHECK(r.state == MoveState::kRejected && r.why.find("epoch") != std::string::npos);
++    Prepared s = w.promote(0, 3, 1, 1);              // hi + 1 would be the fallback: no slot to write
++    CHECK(s.state == MoveState::kRejected);
++    CHECK(!w.map.commit(q, w.io.data()));            // only a prepared move commits
++    CHECK(w.world_ok());
++}
++
++static void t_upper_tears_then_restored() {
++    g_test = "upper card tears, restored";
++    World w(2);
++    w.card[0].replace_faults.push_back(IoStatus::kFailed);
++    Prepared p = w.promote(2, 3, 1);
++    CHECK(p.state == MoveState::kRolledBack && !w.map.closed(0));
++    CHECK(w.map.owner(2, 1) == 0 && w.card[0].holds(2, 1));
++    CHECK(p.blob_up == source(2, 3) && p.blob_down == source(2, 1));   // both blobs recoverable
++    CHECK(w.world_ok());
++}
++
++static void t_upper_tears_unrestorable() {
++    g_test = "upper card tears, restore fails";
++    World w(2);
++    w.card[0].replace_faults = {IoStatus::kFailed, IoStatus::kFailed};
++    Prepared p = w.promote(2, 3, 1);
++    CHECK(p.state == MoveState::kClosed && w.map.closed(0));
++    CHECK(w.map.executor(2, 1) == w.map.fallback());
++    CHECK(w.world_ok());
++}
++
++static void t_upper_timeout() {
++    g_test = "upper card times out";
++    World w(2);
++    w.card[0].replace_faults.push_back(IoStatus::kTimeout);
++    Prepared p = w.promote(0, 2, 0);
++    CHECK(p.state == MoveState::kClosed && w.map.closed(0) && w.card[0].replaces == 1);   // never written to again
++    CHECK(w.world_ok());
++}
++
++static void t_lower_refused() {
++    g_test = "lower card refuses";
++    World w(2);
++    w.card[1].replace_faults.push_back(IoStatus::kRefused);
++    Prepared p = w.promote(1, 3, 0);
++    CHECK(p.state == MoveState::kRolledBack && !w.map.closed(0) && !w.map.closed(1));
++    CHECK(w.card[0].holds(1, 0) && !w.card[0].holds(1, 3) && w.card[1].holds(1, 3));
++    CHECK(w.world_ok());
++}
++
++static void t_lower_failed_sync() {
++    g_test = "lower card's sync fails";
++    World w(2);
++    w.card[1].replace_faults.push_back(IoStatus::kFailed);
++    Prepared p = w.promote(1, 3, 0);
++    CHECK(p.state == MoveState::kClosed && w.map.closed(1) && !w.map.closed(0));
++    CHECK(w.map.owner(1, 3) == 1 && w.map.owner(1, 0) == 0);           // the old owners are intact
++    CHECK(w.map.executor(1, 3) == w.map.fallback());                    // ... and the closed one is not routed to
++    CHECK(w.card[0].holds(1, 0) && w.card[0].slot[(size_t) w.card[0].view[std::make_pair(1, 0)]] == source(1, 0));
++    CHECK(p.blob_up == source(1, 3) && p.blob_down == source(1, 0));   // both blobs recoverable
++    CHECK(w.world_ok());
++}
++
++static void t_lower_timeout_fails_closed() {
++    g_test = "lower card times out: fail closed";
++    World w(2);
++    w.card[1].replace_faults.push_back(IoStatus::kTimeout);
++    const uint64_t e0 = w.map.epoch();
++    Prepared p = w.promote(0, 2, 1);
++    CHECK(p.state == MoveState::kClosed && w.map.closed(1) && w.map.epoch() > e0);
++    for (int l = 0; l < L; ++l)
++        for (int e = 0; e < E; ++e) CHECK(w.map.executor(l, e) != 1);  // no cell is routed to the closed card
++    CHECK(w.world_ok());
++    Prepared q = w.promote(1, 2, 0);                                     // and nothing new is planned onto it
++    CHECK(q.state == MoveState::kRejected);
++}
++
++static void t_commit_lost_race() {
++    g_test = "the map moved before commit";
++    World w(3);
++    Prepared p = w.promote(0, 2, 0);
++    CHECK(p.state == MoveState::kPrepared);
++    w.map.close(2);                                  // a close elsewhere moves the epoch
++    CHECK(!w.map.commit(p, w.io.data()) && p.state == MoveState::kRolledBack);
++    CHECK(w.map.owner(0, 2) == 1 && w.card[1].holds(0, 2) && w.card[0].holds(0, 0));
++    CHECK(w.world_ok());
++}
++
++static void t_abort() {
++    g_test = "abort after prepare";
++    World w(2);
++    Prepared p = w.promote(2, 2, 1);
++    CHECK(p.state == MoveState::kPrepared);
++    w.map.abort(p, w.io.data());
++    CHECK(p.state == MoveState::kRolledBack && w.card[0].holds(2, 1) && w.card[1].holds(2, 2));
++    CHECK(w.world_ok());
++    Prepared q = w.promote(2, 2, 1);
++    w.card[1].replace_faults.push_back(IoStatus::kFailed);              // the lower card cannot take `up` back
++    w.map.abort(q, w.io.data());
++    CHECK(q.state == MoveState::kClosed && w.map.closed(1) && !w.map.closed(0));
++    CHECK(w.world_ok());
++}
++
++static void t_three_cards_one_rung() {
++    g_test = "three cards: card 3 -> card 2";
++    World w(3);
++    Prepared p = w.promote(1, 4, 2, 1);
++    CHECK(p.state == MoveState::kPrepared && w.map.commit(p, w.io.data()));
++    CHECK(w.map.owner(1, 4) == 1 && w.map.owner(1, 2) == 2 && w.card[0].replaces == 0);
++    Prepared q = w.promote(1, 4, 0, 0);              // and on up to card 1 in a later move, one rung at a time
++    CHECK(q.state == MoveState::kPrepared && w.map.commit(q, w.io.data()) && w.map.owner(1, 4) == 0);
++    CHECK(w.world_ok());
++}
++
++static void t_adopt() {
++    g_test = "adopt";
++    World w(2);
++    std::vector<int8_t> r = w.map.snapshot().rung_of;
++    std::string err;
++    std::vector<int64_t> by;
++    const uint64_t e0 = w.map.epoch();
++    CHECK(w.map.adopt(r, err, &by) == 0 && w.map.epoch() == e0);
++    r[(size_t) (0 * E + 6)] = 0; r[(size_t) (0 * E + 1)] = 2;            // the engine's own adapt swapped a card-1 expert with RAM
++    CHECK(w.map.adopt(r, err, &by) == 2 && by[0] == 2 && by[1] == 0 && by[2] == 2 && w.map.epoch() > e0);
++    r.pop_back();
++    CHECK(w.map.adopt(r, err) == -1 && !err.empty());
++    w.map.close(1);
++    std::vector<int8_t> s = w.map.snapshot().rung_of;
++    CHECK(w.map.adopt(s, err) == 0 && w.map.closed(1));                 // adopt never reopens a closed rung
++}
++
++int main() {
++    t_commit();
++    t_rejected_untouched();
++    t_upper_tears_then_restored();
++    t_upper_tears_unrestorable();
++    t_upper_timeout();
++    t_lower_refused();
++    t_lower_failed_sync();
++    t_lower_timeout_fails_closed();
++    t_commit_lost_race();
++    t_abort();
++    t_three_cards_one_rung();
++    t_adopt();
++    std::printf("ownership_map_test: %s (%d failures)\n", g_fail ? "FAIL" : "all checks passed", g_fail);
++    return g_fail ? 1 : 0;
++}

@@ -1,0 +1,213 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Seabraid <seabraid@example.invalid>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH 17/17] seabraid: one channel per helper process, and a blob
+ swap the helper writes and reads back
+
+SEABRAID_STRATA_SHM is a comma-separated list, one channel per helper process; the
+position is the card (remote_dev - kDeviceBase), fixed for the session.
+seabraid::channel_name(card) is the one reader, used by preflight and
+seabraid_open; an unset variable still means /seabraid0 for card 0.
+
+RemoteExperts::seabraid_retier_blob sends the new expert's bytes through
+channel blob slot 0 as one kTierSwapBlob op (wire v8), under read_mu_ so the
+prompt path cannot reuse the slot, through the same fenced round as
+seabraid_retier (now seabraid_round, which judges residency on the plain-swap
+view of the ops). RemoteExperts::tier_verify reads a slot back with
+ExpertCache::verify_slot and quarantines it on a mismatch; the helper calls it
+after tier_sync and before the ack.
+
+Failure: a refused op is untouched (kTierRejected), a torn or unread-back slot
+is kTierFailed and closes the card, exactly as for a plain swap.
+---
+ include/strata/core/remote_experts.hpp | 19 +++++++
+ src/core/remote_experts.cpp            | 77 ++++++++++++++++++++++++--
+ 2 files changed, 90 insertions(+), 6 deletions(-)
+
+diff --git a/include/strata/core/remote_experts.hpp b/include/strata/core/remote_experts.hpp
+index dc323f8dc..65bf4437f 100644
+--- a/include/strata/core/remote_experts.hpp
++++ b/include/strata/core/remote_experts.hpp
+@@ -122,6 +122,9 @@ public:
+     bool tier_apply(const seabraid::TierWireOp& op, ExpertSource& source, std::string& err);
+     /// Drain the queued fills, then publish the residency changes.  Once per round, before the ack.
+     bool tier_sync(std::string& err);
++    /// HELPER SIDE: read the slot of (layer, expert) back and compare it with `blob` (blob_bytes(layer) bytes), byte for byte.
++    /// Call after tier_sync.  A mismatch quarantines the cell (holds() says no, no op may write it) and returns false.
++    bool tier_verify(int layer, int expert, const uint8_t* blob, std::string& err);
+ 
+     // ---- v4 live re-tiering (D7).  MAIN SIDE: the engine drives a batch of tier ops at the helper and does
+     // not let a layer request cross them.
+@@ -141,6 +144,11 @@ public:
+     // the caller's own array keeps one owner for that state instead of caching a second copy here.
+     bool seabraid_retier(const seabraid::TierWireOp* ops, int32_t n, uint8_t* res,
+                         std::vector<uint8_t>* claimed, std::string& err);
++    /// seabraid_retier for ONE same-layer swap whose new bytes the CALLER holds (wire v8 kTierSwapBlob): `bytes` (`n` =
++    /// blob_bytes(layer_new)) go through channel blob slot 0 and the helper writes them into the displaced expert's slot and
++    /// reads them back before it acks, so "from RAM / the pack to a card" is literally true.  `op` is a kTierSwap (or
++    /// kTierSwapBlob) shape; same fence, same residency adoption, same fail-closed rules as seabraid_retier.  ENGINE THREAD ONLY.
++    bool seabraid_retier_blob(const seabraid::TierWireOp& op, const uint8_t* bytes, size_t n, uint8_t& res, std::string& err);
+ 
+     // ---- D4 (STRATA_PREFILL_REMOTE_COMPUTE): while a prompt is read, the expert process computes the experts it holds
+     // (remote_prefill.cpp).  CARD 1 SIDE (a seabraid tier):
+@@ -183,6 +191,10 @@ private:
+                        const int32_t* kind, const int32_t* primary_res, std::string& err);
+     bool seabraid_helper_finish(float* out, std::string& err);
+     void seabraid_close(int why, const std::string& msg);
++    /// The round both seabraid_retier entry points run.  `wire` goes to the helper; `plain` is the same ops as plain swaps/loads, which is
++    /// what the residency checks (tier_residency_consistent) judge.
++    bool seabraid_round(const seabraid::TierWireOp* wire, const seabraid::TierWireOp* plain, int32_t n, uint8_t* res,
++                       std::vector<uint8_t>* claimed, std::string& err);
+     void tier_quarantine(int64_t layer, int64_t expert);
+     std::unique_ptr<seabraid::Channel> bl_;
+     std::vector<uint8_t> bl_held_;
+@@ -331,3 +343,10 @@ private:
+     std::atomic<bool> warned_{false};
+ };
+ } // namespace strata::core
++
++namespace seabraid {
++/// The channel of helper `card` (0-based: remote_dev - kDeviceBase).  SEABRAID_STRATA_SHM is a comma-separated list, one channel per
++/// helper process, and the position IS the card (fixed for the session; the installer writes the list and the units together).
++/// Unset: card 0 is "/seabraid0" (the one-helper default).  False with `err` naming the entry or the missing position.
++bool channel_name(int card, std::string& name, std::string& err);
++}  // namespace seabraid
+diff --git a/src/core/remote_experts.cpp b/src/core/remote_experts.cpp
+index e85469d4d..3f83654ae 100644
+--- a/src/core/remote_experts.cpp
++++ b/src/core/remote_experts.cpp
+@@ -1,4 +1,5 @@
+ #include "strata/core/remote_experts.hpp"
++#include "strata/seabraid/channel_names.hpp"
+ #include "strata/core/device.hpp"   // primary_device() (STRATA_PRIMARY_DEVICE)
+ #include "strata/core/remote_expert_opt.hpp"
+ #include "strata/core/route_hist.hpp"
+@@ -16,6 +17,25 @@
+ #include <cstdlib>
+ #include <cstring>
+ 
++namespace seabraid {
++bool channel_name(int card, std::string& name, std::string& err) {
++    const char* env = std::getenv("SEABRAID_STRATA_SHM");
++    if (env == nullptr) {   // the one-helper default
++        if (card != 0) { err = "seabraid: helper " + std::to_string(card) + " needs SEABRAID_STRATA_SHM to list its channel; it is unset"; return false; }
++        name = "/seabraid0";
++        return true;
++    }
++    std::vector<std::string> list;
++    if (!parse_channel_list(env, list, err)) return false;
++    if (card < 0 || (size_t) card >= list.size()) {
++        err = "seabraid: helper " + std::to_string(card) + " has no channel; SEABRAID_STRATA_SHM lists " + std::to_string(list.size());
++        return false;
++    }
++    name = list[(size_t) card];
++    return true;
++}
++}  // namespace seabraid
++
+ namespace strata::core {
+ namespace {
+ constexpr int64_t H = strata::kernels::cpu::H;
+@@ -71,11 +91,12 @@ RemoteExperts::~RemoteExperts() { close(); }
+ 
+ bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
+     if (device >= seabraid::kDeviceBase) {   // seabraid: a helper process of another GPU vendor; ask it, touch no GPU here
+-        const char* name = std::getenv("SEABRAID_STRATA_SHM");
++        std::string name;
++        if (!seabraid::channel_name(device - seabraid::kDeviceBase, name, err)) return false;
+         seabraid::Channel ch;
+         bool ok = false;
+         for (int tries = 0; tries < 600 && !ok; ++tries) {   // up to ~60 s for the helper to come up
+-            ok = ch.connect(name ? name : "/seabraid0", H, CAP, 0, 0, (uint32_t) strata::kernels::kWindowMaxT, err);
++            ok = ch.connect(name, H, CAP, 0, 0, (uint32_t) strata::kernels::kWindowMaxT, err);
+             if (!ok) { if (err.find("geometry") != std::string::npos || err.find("magic") != std::string::npos) return false;
+                        usleep(100000); continue; }
+             ok = seabraid::Channel::wait([&] { return ch.header()->state.load(std::memory_order_acquire) >= seabraid::kHelperUp; }, 60);
+@@ -84,7 +105,7 @@ bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
+         if (!ok) { if (err.empty()) err = "seabraid helper did not come up"; return false; }
+         free_gib = ch.header()->free_gib;
+         std::fprintf(stderr, "seabraid: helper %s on channel %s, %.2f GiB free\n", seabraid::bounded_text(ch.header()->helper_name, sizeof ch.header()->helper_name).c_str(),
+-                     name ? name : "/seabraid0", free_gib);
++                     name.c_str(), free_gib);
+         return true;
+     }
+     int count = 0;
+@@ -539,6 +560,18 @@ bool RemoteExperts::tier_sync(std::string& err) {
+     return true;
+ }
+ 
++bool RemoteExperts::tier_verify(int layer, int expert, const uint8_t* blob, std::string& err) {
++    if (bl_ != nullptr || blob == nullptr) { err = "tier_verify: the HELPER side reads its own slot, with the bytes to compare"; return false; }
++    DeviceScope scope(device_);
++    if (!scope.ok) { err = scope.error(device_); return false; }
++    const int32_t slot = cache_.slot_of(layer, expert);
++    if (slot < 0) { err = "tier_verify: layer " + std::to_string(layer) + " expert " + std::to_string(expert) + " is not resident"; return false; }
++    const int64_t need = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
++    if (cache_.verify_slot(slot, blob, err, need)) return true;
++    tier_quarantine(layer, expert);   // the slot is torn: published as holding nothing, never written again (fail closed)
++    return false;
++}
++
+ // ---- seabraid: the tier lives in a helper process (another GPU vendor), reached over shared memory -------------
+ bool RemoteExperts::seabraid_open(int slots, int64_t layers, int64_t experts,
+                                  const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
+@@ -547,9 +580,10 @@ bool RemoteExperts::seabraid_open(int slots, int64_t layers, int64_t experts,
+         claimed.size() != (size_t) layers * (size_t) experts) {
+         err = "seabraid: need ranked experts and a positive slot count"; device_ = -1; return false;
+     }
+-    const char* name = std::getenv("SEABRAID_STRATA_SHM");
++    std::string name;
++    if (!seabraid::channel_name(device_ - seabraid::kDeviceBase, name, err)) { device_ = -1; return false; }
+     auto ch = std::make_unique<seabraid::Channel>();
+-    if (!ch->connect(name ? name : "/seabraid0", H, CAP, layers, experts, (uint32_t) strata::kernels::kWindowMaxT, err)) {
++    if (!ch->connect(name, H, CAP, layers, experts, (uint32_t) strata::kernels::kWindowMaxT, err)) {
+         device_ = -1; return false;
+     }
+     seabraid::Header* hd = ch->header();
+@@ -721,6 +755,37 @@ bool RemoteExperts::seabraid_helper_finish(float* out, std::string& err) {
+ 
+ bool RemoteExperts::seabraid_retier(const seabraid::TierWireOp* ops, int32_t n, uint8_t* res,
+                                    std::vector<uint8_t>* claimed, std::string& err) {
++    return seabraid_round(ops, ops, n, res, claimed, err);
++}
++
++bool RemoteExperts::seabraid_retier_blob(const seabraid::TierWireOp& op, const uint8_t* bytes, size_t n, uint8_t& res, std::string& err) {
++    if (!bl_) { err = "seabraid retier: no helper channel is open"; return false; }
++    if (op.kind != seabraid::kTierSwap && op.kind != seabraid::kTierSwapBlob) { err = "seabraid retier: a blob round carries one swap"; return false; }
++    if (op.layer_old != op.layer_new || op.layer_new < 0 || (size_t) op.layer_new >= layers_present_.size()) {
++        err = "seabraid retier: a blob swap is same-layer and inside the model"; return false;
++    }
++    const size_t need = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(op.layer_new);
++    if (bytes == nullptr || n != need || (int64_t) need > bl_->limits().blob_max) {
++        err = "seabraid retier: the blob is " + std::to_string((unsigned long long) n) + " bytes; layer " + std::to_string(op.layer_new) +
++              " needs " + std::to_string((unsigned long long) need) + " and a channel slot holds " + std::to_string((long long) bl_->limits().blob_max);
++        return false;
++    }
++    // Slot 0 is also the prompt path's (copy_cached_blobs): read_mu_ keeps a stager from overwriting it until the round is acked.
++    std::lock_guard<std::mutex> lock(read_mu_);
++    seabraid::TierWireOp wire = op, plain = op;
++    wire.kind = seabraid::kTierSwapBlob; wire.blob_slot = 0; wire.helper = 0;
++    plain.kind = seabraid::kTierSwap; plain.blob_slot = 0;
++    uint8_t r = seabraid::kTierPending;
++    // A closed card is refused before the slot is written (seabraid_round refuses it too, after the write, so this one saves the copy).
++    if (bl_closed_.load(std::memory_order_relaxed) != 0) { err = "seabraid retier: this card is CLOSED (an earlier round timed out or tore a slot)"; return false; }
++    std::memcpy(bl_->blob(0), bytes, need);
++    const bool ok = seabraid_round(&wire, &plain, 1, &r, nullptr, err);
++    res = r;
++    return ok;
++}
++
++bool RemoteExperts::seabraid_round(const seabraid::TierWireOp* ops, const seabraid::TierWireOp* plain, int32_t n, uint8_t* res,
++                                  std::vector<uint8_t>* claimed, std::string& err) {
+     if (!bl_) { err = "seabraid retier: no helper channel is open"; return false; }
+     if (ops == nullptr || n <= 0 || n > seabraid::kTierMaxOps) {
+         err = "seabraid retier: " + std::to_string((long long) n) + " ops, but a round carries 1.." +
+@@ -796,7 +861,7 @@ bool RemoteExperts::seabraid_retier(const seabraid::TierWireOp* ops, int32_t n,
+         uint8_t rr[seabraid::kTierMaxOps];
+         for (int32_t i = 0; i < n; ++i) rr[i] = hd->tier_res[i];
+         std::string why2;
+-        if (!seabraid::tier_residency_consistent(bl_held_.data(), (int64_t) layers_present_.size(), n_expert_, ops, rr, n, why2)) {
++        if (!seabraid::tier_residency_consistent(bl_held_.data(), (int64_t) layers_present_.size(), n_expert_, plain, rr, n, why2)) {
+             err = "seabraid retier: helper residency is STALE after an applied round (" + why2 + ")";
+             seabraid_close(2, err);   // fail closed: routing from a view known to be wrong is the bug this check exists for
+             return false;

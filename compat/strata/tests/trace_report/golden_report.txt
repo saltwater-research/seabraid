@@ -1,0 +1,34 @@
+SEABRAID TRACE REPORT
+records: 11 (1 unreadable lines skipped)
+
+EXPERT JOURNEYS (one row per expert hop; stage_us and write_us are the whole swap's, shared by its two rows)
+layer  expert  hop  round  direction  status     from_rung  to_rung  src_or_dst  bytes  stage_us  write_us  time      issue
+0      2       1    1      down       committed  0          1        card        4096   100       300       t+1.000s
+0      2       2    2      up         committed  1          0        card        4096   150       350       t+2.000s
+0      3       1    1      down       committed  1          2        fallback    4096   2000      500       t+1.001s
+0      5       1    1      up         committed  1          0        card        4096   100       300       t+1.000s
+0      5       2    2      down       committed  0          1        card        4096   150       350       t+2.000s
+0      7       1    1      up         committed  2          1        fallback    4096   2000      500       t+1.001s
+1      4       1    2      up         rejected   1          0        card        4096   40        0         t+2.001s  issue stage/failed@rung1
+
+ROUTES (committed hops, rung>rung)
+layer 0 expert 2: 0>1>0
+layer 0 expert 3: 1>2
+layer 0 expert 5: 1>0>1
+layer 0 expert 7: 2>1
+
+LATENCY (microseconds)
+phase                      source      n  mean_us  p50_us  p99_us  note
+helper submit->collect     helper 1    8  200.0    90      900     window summaries
+helper blocked in collect  helper 1    8  30.0     10      100     window summaries
+round (fence to publish)   trace       2  6000.0   3000    9000
+move stage                 trace       3  750.0    150     2000    per swap
+move write                 trace       3  383.3    350     500     per swap
+SSD wait (decode waited)   engine log  2  10000.0  7500    12500   per request
+engine decode window       engine log  2  58000.0  55500   60500   ms/window x 1000
+
+FALLBACK STAGES: RAM 1, NVMe 3 over 2 rounds
+
+HELPER EVENTS
+rung 1 closed (helper is gone) after_loss_us=0
+rung 1 served_after_loss (next window) after_loss_us=2500

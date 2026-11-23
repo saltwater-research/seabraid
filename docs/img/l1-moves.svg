@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 336" width="760" height="336" role="img" aria-labelledby="t d">
+<title id="t">Placement moves per boundary and source of fallback promotions</title>
+<desc id="d">Bars: 520, 481 and 538 moves up and the same counts down across the three boundaries. Of 538 promotions from rung F, 413 came from RAM and 125 from the SSD pack file.</desc>
+<style>
+text{font-family:'Times New Roman',Times,Georgia,serif;fill:#000;font-size:13px}
+.s{font-size:12px}.e{text-anchor:end}.c{text-anchor:middle}
+.rule{stroke:#bbb;stroke-width:.75;fill:none}.box{fill:#fff;stroke:#000;stroke-width:1}
+.up{fill:#1f3a6e;stroke:#1f3a6e}.dn{fill:#888;stroke:#888}.ref{fill:#fff;stroke:#000;stroke-width:1}
+.gate{stroke:#000;stroke-width:1;stroke-dasharray:5 4;fill:none}.ln{stroke-width:1.5;fill:none}.dash{stroke-dasharray:5 3}
+</style>
+<rect width="760" height="336" fill="#fff"/>
+<rect x="174" y="10" width="10" height="10" class="up"/>
+<text x="190" y="20" class="s">moves up (promoted)</text>
+<rect x="364" y="10" width="10" height="10" class="dn"/>
+<text x="380" y="20" class="s">moves down (displaced)</text>
+<line x1="190" y1="34" x2="190" y2="198" class="rule"/>
+<text x="190" y="214" class="s c">0</text>
+<line x1="334" y1="34" x2="334" y2="198" class="rule"/>
+<text x="334" y="214" class="s c">200</text>
+<line x1="478" y1="34" x2="478" y2="198" class="rule"/>
+<text x="478" y="214" class="s c">400</text>
+<line x1="622" y1="34" x2="622" y2="198" class="rule"/>
+<text x="622" y="214" class="s c">600</text>
+<text x="406" y="232" class="s c">moves (count over the run)</text>
+<text x="178" y="68" class="e">main  &lt;-&gt;  helper1</text>
+<rect x="190" y="44" width="374.4" height="20" class="up"/>
+<text x="572.4" y="59">520</text>
+<rect x="190" y="68" width="374.4" height="20" class="dn"/>
+<text x="572.4" y="83">520</text>
+<text x="178" y="120" class="e">helper1  &lt;-&gt;  helper2</text>
+<rect x="190" y="96" width="346.32" height="20" class="up"/>
+<text x="544.32" y="111">481</text>
+<rect x="190" y="120" width="346.32" height="20" class="dn"/>
+<text x="544.32" y="135">481</text>
+<text x="178" y="172" class="e">helper2  &lt;-&gt;  rung F</text>
+<rect x="190" y="148" width="387.36" height="20" class="up"/>
+<text x="585.36" y="163">538</text>
+<rect x="190" y="172" width="387.36" height="20" class="dn"/>
+<text x="585.36" y="187">538</text>
+<text x="20" y="264">Source of the 538 experts promoted from rung F</text>
+<rect x="20" y="274" width="370.7" height="24" class="dn"/>
+<rect x="392.7" y="274" width="111.5" height="24" class="ref"/>
+<text x="20" y="318">413 from the engine's RAM</text>
+<text x="392.7" y="318">125 read from the SSD pack file</text>
+</svg>

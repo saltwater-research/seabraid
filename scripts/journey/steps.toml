@@ -1,0 +1,259 @@
+# Copyright 2026 Saltwater Research LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# The first-time-user journey as data: the README Quickstart and the CONTRIBUTING "Build and test" commands, in the
+# order a newcomer runs them in one terminal.  scripts/journey/run.py replays it; tests/test_journey_steps.py fails when
+# a command here stops appearing, character for character, in the document named by `doc` (so this file cannot drift
+# from the docs), or when a field is malformed.
+#
+# Fields (all strings unless noted):
+#   id           unique, kebab-case
+#   doc          README.md or CONTRIBUTING.md: where `command` (and `env_prefix`) must appear
+#   command      the documented command, copied verbatim (a `\` line continuation in the doc is one space here)
+#   state        list of [state] names run first in the same shell: what a person's terminal still holds from earlier steps
+#   when         always (default) | online | offline: the documented recipe differs offline, so each runs in one mode only
+#   status       pass (default) | skip-needs-network (runs online, recorded SKIP with --offline) | warn-expected
+#                (a documented failure is acceptable: a nonzero exit whose output matches `warn_output` is a WARN)
+#   output       regex, or list of regexes, that must all match the output of a passing run
+#   warn_output  regex for the documented failure (required with status = warn-expected)
+#   env_prefix   documented `NAME=value` that the doc puts before the command in prose; run as `<env_prefix> <command>`
+#   substitute   table: a doc placeholder -> the value used here (the placeholder must occur in `command`)
+#   harness      reason string for a step the docs do NOT list; the only way a command may be absent from the docs
+
+[state]
+venv = ". .venv/bin/activate"
+cargo = 'export PATH="$HOME/.cargo/bin:$PATH"'
+
+# ---- README Quickstart: Python ----------------------------------------------------------------------------------
+
+[[step]]
+id = "venv-create"
+doc = "README.md"
+command = "python3 -m venv .venv && . .venv/bin/activate"
+when = "online"
+
+[[step]]
+id = "pip-install"
+doc = "README.md"
+command = "pip install ."
+state = ["venv"]
+status = "skip-needs-network"
+output = "Successfully installed seabraid"
+
+[[step]]
+id = "venv-system-site"
+doc = "README.md"
+command = "python3 -m venv --system-site-packages .venv"
+when = "offline"
+
+[[step]]
+id = "pip-install-no-build-isolation"
+doc = "README.md"
+command = "pip install --no-build-isolation ."
+state = ["venv"]
+when = "offline"
+output = "Successfully installed seabraid"
+
+[[step]]
+id = "quickstart-pure"
+doc = "README.md"
+command = "python examples/quickstart.py"
+state = ["venv"]
+output = ['provider=reference result=\[2\.5, 5\.0\]', 'stale epoch refused: status 2']
+
+[[step]]
+id = "cargo-build"
+doc = "README.md"
+command = "cargo build --offline"
+state = ["venv", "cargo"]
+
+[[step]]
+id = "quickstart-native"
+doc = "README.md"
+command = 'SEABRAID_LIBRARY="$PWD/target/debug/libseabraid.so" python examples/quickstart.py'
+state = ["venv", "cargo"]
+output = ['provider=native result=\[2\.5, 5\.0\]', 'placement_epoch 1 is stale']
+
+# ---- README Quickstart: platform wheel ---------------------------------------------------------------------------
+
+[[step]]
+id = "setuptools"
+doc = "README.md"
+command = 'pip install "setuptools>=77"'
+state = ["venv"]
+status = "skip-needs-network"
+
+[[step]]
+id = "wheel-build"
+doc = "README.md"
+command = "python scripts/build_wheel.py"
+state = ["venv", "cargo"]
+output = 'manylinux_2_\d+_x86_64\.whl'
+
+[[step]]
+id = "wheel-venv"
+doc = "README.md"
+command = "python3 -m venv .venv-wheel"
+state = ["venv", "cargo"]
+
+[[step]]
+id = "wheel-install"
+doc = "README.md"
+command = ".venv-wheel/bin/pip install --no-index dist/seabraid-*.whl"
+state = ["venv", "cargo"]
+output = "Successfully installed seabraid"
+
+[[step]]
+id = "wheel-quickstart"
+doc = "README.md"
+command = '''SEABRAID_LIBRARY="$(.venv-wheel/bin/python -c 'import seabraid;print(seabraid.bundled_library())')" .venv-wheel/bin/python examples/quickstart.py'''
+state = ["venv", "cargo"]
+output = 'provider=native result=\[2\.5, 5\.0\]'
+
+# ---- README Quickstart: Rust and C -------------------------------------------------------------------------------
+
+[[step]]
+id = "cargo-test"
+doc = "README.md"
+command = "cargo build --offline && cargo test --offline"
+state = ["venv", "cargo"]
+output = 'test result: ok\. \d+ passed; 0 failed'
+
+[[step]]
+id = "cmake-configure"
+doc = "README.md"
+command = "cmake -S . -B build/seabraid -DSEABRAID_BUILD_NATIVE_TESTS=ON"
+state = ["venv", "cargo"]
+
+[[step]]
+id = "cmake-build"
+doc = "README.md"
+command = "cmake --build build/seabraid"
+state = ["venv", "cargo"]
+
+[[step]]
+id = "ctest"
+doc = "README.md"
+command = "ctest --test-dir build/seabraid --output-on-failure"
+state = ["venv", "cargo"]
+output = '100% tests passed, 0 tests failed'
+
+[[step]]
+id = "cmake-install"
+doc = "README.md"
+command = "cmake --install build/seabraid --prefix /path/to/seabraid-sdk"
+state = ["venv", "cargo"]
+substitute = { "/path/to/seabraid-sdk" = "$JOURNEY_WORK/sdk" }
+output = 'Installing: \S+/lib/libseabraid\.so'
+
+[[step]]
+id = "gcc-plain-sdk"
+doc = "README.md"
+command = "mkdir -p build"
+state = ["venv", "cargo"]
+
+[[step]]
+id = "gcc-plain-sdk-compile"
+doc = "README.md"
+command = "gcc -std=c11 -I<sdk>/include examples/minimal_provider.c -L<sdk>/lib -Wl,-rpath,<sdk>/lib -lseabraid -o build/minimal_provider"
+state = ["venv", "cargo"]
+substitute = { "<sdk>" = "$JOURNEY_WORK/sdk" }
+
+[[step]]
+id = "minimal-provider"
+doc = "README.md"
+command = "./build/minimal_provider"
+state = ["venv", "cargo"]
+output = 'output = \[2\.5, 5\]'
+
+# ---- README Quickstart: load simulator ---------------------------------------------------------------------------
+
+[[step]]
+id = "sim-configure"
+doc = "README.md"
+command = "cmake -S . -B build/seabraid -DSEABRAID_BUILD_TOOLS=ON"
+state = ["venv", "cargo"]
+
+[[step]]
+id = "sim-build"
+doc = "README.md"
+command = "cmake --build build/seabraid --target seabraid_sim"
+state = ["venv", "cargo"]
+
+[[step]]
+id = "sim-run"
+doc = "README.md"
+command = "build/seabraid/tools/sim/seabraid_sim"
+state = ["venv", "cargo"]
+output = '"ok":true'
+
+[[step]]
+id = "sim-matrix-quick"
+doc = "README.md"
+command = "bash tools/sim/matrix.sh --quick"
+state = ["venv", "cargo"]
+output = '"ok":true'
+
+# ---- CONTRIBUTING: Build and test --------------------------------------------------------------------------------
+
+[[step]]
+id = "pip-install-test-tools"
+doc = "CONTRIBUTING.md"
+command = "pip install pytest PyYAML==6.0.3 numpy==2.4.6 lizard==1.26.1"
+state = ["venv"]
+status = "skip-needs-network"
+
+[[step]]
+id = "unittest-pure"
+doc = "CONTRIBUTING.md"
+command = "python -B -m unittest discover -s bindings/python"
+state = ["venv", "cargo"]
+output = '(?m)^OK'
+
+[[step]]
+id = "cargo-build-release"
+doc = "CONTRIBUTING.md"
+command = "cargo build --release"
+state = ["venv", "cargo"]
+
+[[step]]
+id = "unittest-native"
+doc = "CONTRIBUTING.md"
+command = "python -B -m unittest discover -s bindings/python"
+env_prefix = 'SEABRAID_LIBRARY="$PWD/target/release/libseabraid.so"'
+state = ["venv", "cargo"]
+output = '(?m)^OK'
+
+[[step]]
+id = "pytest-tests"
+doc = "CONTRIBUTING.md"
+command = "python -m pytest tests -q"
+state = ["venv", "cargo"]
+status = "warn-expected"
+output = '\d+ passed'
+warn_output = 'Interrupted: 1 error during collection'
+
+[[step]]
+id = "run-all-checkers"
+doc = "CONTRIBUTING.md"
+command = "python checks/run_all.py"
+state = ["venv", "cargo"]
+status = "warn-expected"
+output = '\d+ checkers, 0 failed'
+warn_output = '(?s)check_complexity.*\d+ checkers, 1 failed'
+
+[[step]]
+id = "check-names"
+doc = "CONTRIBUTING.md"
+command = "python checks/check_names.py --forbid <word>"
+state = ["venv", "cargo"]
+# WHY quote pairs inside the word: bash joins the pieces into the probe word, and this file (which check_names scans too) never contains it.
+substitute = { "<word>" = "no''such''word" }
+output = 'check_names: ok'
+
+[[step]]
+id = "addon-tests"
+doc = "CONTRIBUTING.md"
+command = "cd compat/strata && python -m pytest tests"
+state = ["venv", "cargo"]
+output = ' passed'

@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Seabraid <seabraid@example.invalid>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH 14/16] seabraid: validate channel geometry and private handoff
+
+Check shared region sizes before use and retain the validated bounds for
+request handling. Keep the v7 layout and named transport. Provide a
+Linux descriptor transport that seals the mapping extent before publish.
+
+The include/strata/seabraid/channel.hpp (and expert_spec.hpp) half of this change lives in Seabraid's
+adapters/strata/wire, the wire's one owner; this patch keeps only the engine side.
+---
+ include/strata/seabraid/prefill_wire.hpp | 16 ++++++++++------
+ src/core/remote_experts.cpp              | 17 ++++++++++-------
+ src/core/remote_prefill.cpp              | 18 ++++++++++--------
+ 3 files changed, 30 insertions(+), 21 deletions(-)
+
+diff --git a/include/strata/seabraid/prefill_wire.hpp b/include/strata/seabraid/prefill_wire.hpp
+index c33052104..dd6c62000 100644
+--- a/include/strata/seabraid/prefill_wire.hpp
++++ b/include/strata/seabraid/prefill_wire.hpp
+@@ -31,7 +31,9 @@ inline int64_t pack_prefill_request(const Channel& ch, int32_t layer, int64_t t0
+                                     const void* rows, int32_t row_bytes, const float* w, const int32_t* ids,
+                                     const uint8_t* remote_e, int64_t n_expert) {
+     Header* h = ch.header();
+-    if (n <= 0 || n > h->pf_tokens || k != h->pf_k || hidden != h->hidden || (row_bytes != kPfRowsF16 && row_bytes != kPfRowsF32)) return -1;
++    const auto& limits = ch.limits();
++    if (n <= 0 || n > limits.pf_tokens || k != limits.pf_k || hidden != limits.hidden ||
++        (row_bytes != kPfRowsF16 && row_bytes != kPfRowsF32)) return -1;
+     std::memcpy(ch.pf_rows(), (const uint8_t*) rows + (size_t) (t0 * hidden) * (size_t) row_bytes, (size_t) (n * hidden) * (size_t) row_bytes);
+     h->pf_row_bytes = row_bytes;
+     int32_t* pick = ch.pf_pick();
+@@ -139,11 +141,13 @@ inline bool serve_prefill(const Channel& ch, Backend& be, int64_t n_expert, int6
+     Header* h = ch.header();
+     const auto t_start = std::chrono::steady_clock::now();
+     const int32_t layer = h->pf_layer;
+-    const int64_t n = h->pf_ntok, k = h->pf_k;
+-    bool ok = n >= 1 && n <= h->pf_tokens && layer >= 0 && layer < h->n_layers && h->pf_format == kPfFp16 &&
+-              (h->pf_row_bytes == kPfRowsF16 || h->pf_row_bytes == kPfRowsF32);
++    const auto& limits = ch.limits();
++    const int64_t n = h->pf_ntok, k = limits.pf_k;
++    const int32_t row_bytes = h->pf_row_bytes;
++    bool ok = n >= 1 && n <= limits.pf_tokens && layer >= 0 && layer < limits.layers && h->pf_format == kPfFp16 &&
++              (row_bytes == kPfRowsF16 || row_bytes == kPfRowsF32);
+     if (!ok) err = "prefill request: layer " + std::to_string(layer) + ", " + std::to_string((long long) n) + " tokens (region holds " +
+-                   std::to_string((long long) h->pf_tokens) + ")";
++                   std::to_string((long long) limits.pf_tokens) + ")";
+     int64_t picks = 0;
+     std::vector<PrefillBatch> plan;
+     if (ok) {
+@@ -158,7 +162,7 @@ inline bool serve_prefill(const Channel& ch, Backend& be, int64_t n_expert, int6
+         }
+         ok = ok && plan_prefill_batches(pick, n, k, n_expert, max_entries, plan, err);
+     }
+-    ok = ok && be.begin(layer, ch.pf_rows(), h->pf_row_bytes, n, err);
++    ok = ok && be.begin(layer, ch.pf_rows(), row_bytes, n, err);
+     for (size_t i = 0; ok && i < plan.size(); ++i) ok = be.batch(layer, plan[i], ch.pf_wt(), err);
+     ok = ok && be.end(ch.pf_out16(), n, err);
+     h->pf_picks = ok ? (int32_t) picks : -1;
+diff --git a/src/core/remote_experts.cpp b/src/core/remote_experts.cpp
+index eea6bce25..30a1dcfe5 100644
+--- a/src/core/remote_experts.cpp
++++ b/src/core/remote_experts.cpp
+@@ -79,6 +79,7 @@ bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
+             if (!ok) { if (err.find("geometry") != std::string::npos || err.find("magic") != std::string::npos) return false;
+                        usleep(100000); continue; }
+             ok = seabraid::Channel::wait([&] { return ch.header()->state.load(std::memory_order_acquire) >= seabraid::kHelperUp; }, 60);
++            if (!ok) { err = "seabraid helper did not publish readiness within 60 s"; return false; }
+         }
+         if (!ok) { if (err.empty()) err = "seabraid helper did not come up"; return false; }
+         free_gib = ch.header()->free_gib;
+@@ -611,7 +612,7 @@ bool RemoteExperts::seabraid_open(int slots, int64_t layers, int64_t experts,
+     {   // the channel's blob slots must hold this engine's largest blob
+         int64_t need = 0;
+         for (int64_t l = 0; l < layers; ++l) need = std::max<int64_t>(need, (int64_t) lay.blob_bytes(l));
+-        if (hd->blob_max < need) { err = "seabraid: the helper's blob slots are smaller than this model's blobs"; device_ = -1; return false; }
++        if (ch->limits().blob_max < need) { err = "seabraid: the helper's blob slots are smaller than this model's blobs"; device_ = -1; return false; }
+     }
+     bl_thread_ = std::this_thread::get_id();   // the fence asserts against this
+     bl_ = std::move(ch);
+@@ -757,11 +758,13 @@ bool RemoteExperts::seabraid_retier(const seabraid::TierWireOp* ops, int32_t n,
+ 
+     // (3) Per-op results first, before anything is believed about residency.
+     seabraid::Header* hd = bl_->header();
+-    const int32_t got = hd->tier_n < n ? hd->tier_n : n;
+-    if (res != nullptr) {
+-        for (int32_t i = 0; i < got; ++i) res[i] = hd->tier_res[i];
+-        for (int32_t i = got; i < n; ++i) res[i] = (uint8_t) seabraid::kTierPending;
++    if (hd->tier_n != n) {
++        if (res != nullptr) std::fill_n(res, n, (uint8_t) seabraid::kTierPending);
++        err = "seabraid retier: helper echoed a different operation count";
++        seabraid_close(1, err);
++        return false;
+     }
++    if (res != nullptr) std::copy_n(hd->tier_res, n, res);
+     const bool ok = hd->tier_ok != 0;
+     hd->tier_err[sizeof(hd->tier_err) - 1] = '\0';
+     const std::string why = ok ? std::string() : std::string(hd->tier_err);
+@@ -792,7 +795,7 @@ bool RemoteExperts::seabraid_retier(const seabraid::TierWireOp* ops, int32_t n,
+     // is stale and this engine is now routing experts to slots that no longer hold them -- say so loudly.
+     if (cells > 0 && bl_held_.size() == cells) {
+         uint8_t rr[seabraid::kTierMaxOps];
+-        for (int32_t i = 0; i < n; ++i) rr[i] = i < got ? hd->tier_res[i] : (uint8_t) seabraid::kTierPending;
++        for (int32_t i = 0; i < n; ++i) rr[i] = hd->tier_res[i];
+         std::string why2;
+         if (!seabraid::tier_residency_consistent(bl_held_.data(), (int64_t) layers_present_.size(), n_expert_, ops, rr, n, why2)) {
+             err = "seabraid retier: helper residency is STALE after an applied round (" + why2 + ")";
+@@ -802,7 +805,7 @@ bool RemoteExperts::seabraid_retier(const seabraid::TierWireOp* ops, int32_t n,
+         // A FAILED op (as opposed to REJECTED) started a copy into a slot that did not complete: the helper has
+         // quarantined it and published it as holding nothing, but which other rows it may have shared a sync with is
+         // not known here, so the card closes (N-card ladder contract: a failed sync fails CLOSED).
+-        for (int32_t i = 0; i < got; ++i)
++        for (int32_t i = 0; i < n; ++i)
+             if (hd->tier_res[i] == (uint8_t) seabraid::kTierFailed) {
+                 err = "seabraid retier: op " + std::to_string(i) + " FAILED after its copy started" + (why.empty() ? std::string() : ": " + why);
+                 seabraid_close(2, err);
+diff --git a/src/core/remote_prefill.cpp b/src/core/remote_prefill.cpp
+index 79fef0a59..2aaa97d41 100644
+--- a/src/core/remote_prefill.cpp
++++ b/src/core/remote_prefill.cpp
+@@ -207,15 +207,16 @@ struct GpuBackend {
+ } // namespace
+ 
+ bool RemoteExperts::prefill_serve(const seabraid::Channel& ch, std::string& err) {
+-    const seabraid::Header* h = ch.header();
++    const auto& limits = ch.limits();
++    if (limits.pf_tokens == 0) { err = "D4: this channel has no prefill region"; return false; }
+     if (bl_ || device_ < 0) { err = "D4: prefill_serve runs in the expert process, on its own cache"; return false; }
+     int prev = -1;
+     if (!ok_cuda(cudaGetDevice(&prev), "cudaGetDevice", err) || !ok_cuda(cudaSetDevice(device_), "cudaSetDevice", err)) return false;
+     struct Back { int d; ~Back() { cudaSetDevice(d); } } back{prev};
+-    if (!pf_gpu_ || pf_gpu_->tokens < h->pf_tokens || pf_gpu_->k != h->pf_k) {   // first request: size by the region's TOKENS
++    if (!pf_gpu_ || pf_gpu_->tokens < limits.pf_tokens || pf_gpu_->k != limits.pf_k) {   // first request: size by the region's TOKENS
+         pf_gpu_.reset(new PrefillGpu);
+         PrefillGpu& g = *pf_gpu_;
+-        g.tokens = h->pf_tokens; g.k = h->pf_k;
++        g.tokens = limits.pf_tokens; g.k = limits.pf_k;
+         const size_t T = (size_t) g.tokens, K = (size_t) g.k;
+         if (!ok_cuda(cudaMalloc((void**) &g.x16, T * H * 2), "rows", err) || !ok_cuda(cudaMalloc((void**) &g.out16, T * H * 2), "sums", err) ||
+             !ok_cuda(cudaMalloc((void**) &g.x, T * H * 4), "rows f32", err) ||
+@@ -232,15 +233,16 @@ bool RemoteExperts::prefill_open(int64_t k, std::string& err) {
+     pf_open_ = pf_dead_ = pf_pending_ = false;
+     if (!bl_) { err = "D4: the expert tier is not a seabraid expert process"; return false; }
+     const seabraid::Header* h = bl_->header();
++    const auto& limits = bl_->limits();
+     // Open-time mismatch fails fast, naming both sides: a region of another width or format would be read as shifted
+     // picks or as the wrong number type - wrong sums, never a crash.
+-    if (h->pf_tokens <= 0) {
++    if (limits.pf_tokens <= 0) {
+         err = "D4: the expert process offers no prefill region (pf_tokens 0, channel v" + std::to_string(h->version) +
+               "); card 1 wants k " + std::to_string((long long) k) + " fp16 rows: start seabraid-helper with --prefill-tokens N";
+         return false;
+     }
+-    if (h->pf_k != k || h->pf_format != seabraid::kPfFp16) {
+-        err = "D4: prefill region mismatch: expert process k " + std::to_string(h->pf_k) + " format " + std::to_string(h->pf_format) +
++    if (limits.pf_k != k || h->pf_format != seabraid::kPfFp16) {
++        err = "D4: prefill region mismatch: expert process k " + std::to_string(limits.pf_k) + " format " + std::to_string(h->pf_format) +
+               ", card 1 k " + std::to_string((long long) k) + " format " + std::to_string((int) seabraid::kPfFp16) + " (fp16)";
+         return false;
+     }
+@@ -254,7 +256,7 @@ bool RemoteExperts::prefill_open(int64_t k, std::string& err) {
+     pf_open_ = true;
+     std::fprintf(stderr, "D4: prompt reading computes the experts %s holds on that card (%s): region %lld tokens/request "
+                          "(%.1f MiB), lend %.2f GB/s, wire %.2f GB/s, %.0f picks/s, %.0f us/layer\n",
+-                 h->helper_name, pf_mode_ == 2 ? "every eligible chunk" : "per-chunk byte/time model", (long long) h->pf_tokens,
++                 h->helper_name, pf_mode_ == 2 ? "every eligible chunk" : "per-chunk byte/time model", (long long) limits.pf_tokens,
+                  (double) bl_->prefill_region().bytes / 1048576.0, pf_lend_Bps_ / 1e9, pf_wire_Bps_ / 1e9, pf_rate_, pf_layer_s_ * 1e6);
+     return true;
+ }
+@@ -302,7 +304,7 @@ PrefillChoice RemoteExperts::prefill_choose(int64_t tokens, bool stream_all, int
+ }
+ 
+ bool RemoteExperts::pf_range(std::string& err) {
+-    pf_tn_ = std::min<int64_t>(pf_ntok_ - pf_t0_, bl_->header()->pf_tokens);
++    pf_tn_ = std::min<int64_t>(pf_ntok_ - pf_t0_, bl_->limits().pf_tokens);
+     pf_asked_ = seabraid::pack_prefill_request(*bl_, (int32_t) pf_layer_, pf_t0_, pf_tn_, H, pf_k_, pf_rows_, pf_row_bytes_, pf_w_, pf_ids_,
+                                               pf_mask_, n_expert_);
+     if (pf_asked_ < 0) { err = "D4: the request does not fit the prefill region"; return false; }

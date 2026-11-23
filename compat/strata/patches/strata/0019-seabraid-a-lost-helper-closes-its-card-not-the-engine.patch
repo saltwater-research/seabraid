@@ -1,0 +1,1371 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Seabraid <seabraid@example.invalid>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH 19/19] seabraid: a lost helper closes its card, not the engine
+
+A helper process that exited, went mute or answered wrongly used to end the
+engine: RemoteExperts::seabraid_helper_finish waited 30 s, returned false without
+closing the card, and the serve loop returned 1 (503 and a restart).  A restarted
+engine then waited 1800 s on a stale kLoaded channel, and the prompt path probed
+the helper with kill(pid, 0), which a recycled pid answers.
+
+Detection: the engine binds a PeerWatch (pidfd opened first, then the /proc
+starttime compared; one thread, one atomic, no signal ever sent) to the identity
+the helper wrote before kHelperUp (wire v10 helper_start).  seabraid_closed() folds
+the watch in, so every reader (EngineHost::helper_alive, RungIO::closed, the
+retier loop, the ladder) sees a loss with no second predicate.  Close codes: 3
+helper exited, 4 layer deadline, 5 helper error or bad echo, 6 gone at start.
+
+Behaviour: every seabraid wait goes through bl_wait (pred or lost).  seabraid_helper_finish
+on a loss, the 30 s deadline, ok == 0, a bad shape or non-finite reply calls seabraid_lose: the card is
+closed and finish returns true with rows_lost() set.  The two dispatch sites
+(expert_pool_dispatch, expert_pool_dispatch_multi) then compute the rows the
+helper owed on the CPU (redo_lost_rows_single / _multi; the pure plan, with the
+MAXT split, is include/strata/core/lost_rows.hpp; the window's activation
+quantisation is one function used by both).  copy_cached_blobs closes and returns
+all misses; a loss seen on a stager thread is only recorded (bl_note_loss) because
+only the engine thread may rewrite the held bitmaps.  seabraid_open waits (120 s)
+for kNone, binds the watch, and opens a stale or recycled channel as a closed
+card (code 6) with one WARN instead of refusing.  The two ::kill(pid, 0) probes
+in remote_prefill.cpp become seabraid_closed().
+
+Tests: seabraid_helper_loss_test (L1-L9: real forked helpers killed by
+raise(SIGKILL), parent never signals), lost_rows_test (L10); the opt and prefill
+fixtures call announce_identity and the opt test's bad-echo cases now expect a
+loss (closed 5, rows returned) instead of an error.
+
+Failure-first (the tests built against the pre-0019 engine sources with the
+new-API lines removed by sed, one scenario per run, CPU only): L1 Alarm clock
+at 20 s (finish waits 30 s and returns false), L2 segfault at 4 s, L3 Alarm
+clock at 20 s, L4 Alarm clock at 10 s, L5 FAIL closed==6 and "pid reused", L6
+Alarm clock at 30 s, L7 Alarm clock at 20 s, L8 timeout at 60 s, L9 Alarm clock
+at 20 s; lost_rows_test does not compile (no lost_rows.hpp).  With 0019 all
+pass.  Sabotage (each fails its test): SB1 no "|| lost" in bl_wait: L1, L6;
+SB2 no starttime compare: L5; SB3 deadline returns false: L3; SB4
+seabraid_closed() without the watch: L2; SB5 no MAXT split: lost_rows_test; SB6
+stale start refuses: L4.
+---
+ cmake/strata_gpu_engine.cmake                   |  10 +
+ include/strata/core/lost_rows.hpp               |  47 ++++
+ include/strata/core/remote_experts.hpp          |  52 +++-
+ src/core/expert_source.cpp                      |  97 ++++++-
+ src/core/remote_experts.cpp                     | 202 ++++++++++----
+ src/core/remote_prefill.cpp                     |  18 +-
+ tests/core/lost_rows_test.cpp                   |  64 +++++
+ tests/core/remote_experts_seabraid_opt_test.cpp |  50 +++-
+ tests/core/remote_prefill_test.cpp              |   3 +-
+ tests/core/seabraid_helper_loss_test.cpp        | 341 ++++++++++++++++++++++++
+ 10 files changed, 805 insertions(+), 79 deletions(-)
+ create mode 100644 include/strata/core/lost_rows.hpp
+ create mode 100644 tests/core/lost_rows_test.cpp
+ create mode 100644 tests/core/seabraid_helper_loss_test.cpp
+
+diff --git a/cmake/strata_gpu_engine.cmake b/cmake/strata_gpu_engine.cmake
+index be30093..fe44a3c 100644
+--- a/cmake/strata_gpu_engine.cmake
++++ b/cmake/strata_gpu_engine.cmake
+@@ -362,6 +362,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     target_link_libraries(remote_prefill_test PRIVATE strata_engine)
+     add_test(NAME remote_prefill_test COMMAND remote_prefill_test)
+     set_tests_properties(remote_prefill_test PROPERTIES TIMEOUT 120)
++    # HL-FIX: a helper that exits, goes mute or answers wrongly closes its card instead of ending the engine (real forked helpers
++    # killed with raise(SIGKILL); CPU only) and the pure plan of the rows the engine then computes itself (L1-L10).
++    add_executable(seabraid_helper_loss_test tests/core/seabraid_helper_loss_test.cpp)
++    target_link_libraries(seabraid_helper_loss_test PRIVATE strata_engine)
++    add_test(NAME seabraid_helper_loss_test COMMAND seabraid_helper_loss_test)
++    set_tests_properties(seabraid_helper_loss_test PROPERTIES TIMEOUT 120)
++    add_executable(lost_rows_test tests/core/lost_rows_test.cpp)
++    target_include_directories(lost_rows_test PRIVATE include)
++    add_test(NAME lost_rows_test COMMAND lost_rows_test)
++    set_tests_properties(lost_rows_test PROPERTIES TIMEOUT 120)
+     # D4's host-side layer plan (include/strata/prefill/d4_plan.hpp): D4 never changes card 1's own expert path; the split of a
+     # layer's picks.  CPU only.
+     add_executable(d4_plan_test tests/prefill/d4_plan_test.cpp)
+diff --git a/include/strata/core/lost_rows.hpp b/include/strata/core/lost_rows.hpp
+new file mode 100644
+index 0000000..e21a7c2
+--- /dev/null
++++ b/include/strata/core/lost_rows.hpp
+@@ -0,0 +1,47 @@
++#pragma once
++// lost_rows.hpp: the pure plan for computing, on the CPU, the rows an expert helper owned and then lost (its process exited,
++// missed the layer deadline or answered wrongly: RemoteExperts::rows_lost()).  No source, no pool, no kernels: only WHICH
++// (expert, token) pairs to compute and which tokens then need a quantised activation.
++//
++// OWNER: the dispatch in expert_source.cpp owns computing an expert on the CPU (source, pool, kernels); this header owns only
++// the grouping, so it can be tested without any of them (tests/core/lost_rows_test.cpp).
++// DEFENCE (D5): the plan lives beside the dispatch and not inside RemoteExperts because RemoteExperts has no source, pool or
++// kernel selection - computing there would be a second owner of CPU expert computation.
++#include <cstdint>
++#include <vector>
++
++namespace strata::core {
++
++struct LostRowsPlan {
++    /// One CPU job: `expert` over the picks in `entries` (entry = token * k + slot), at most `max_t` of them - the kernels and
++    /// the pool's scratch take that many tokens a job, so a longer run of one expert is a further job over the same blob.
++    struct Job { int32_t expert = -1; std::vector<int32_t> entries; };
++    std::vector<Job> jobs;
++    /// Per token: it has a lost pick, so its activation must be quantised (a token whose picks all ran on GPUs may have had
++    /// none quantised: the optimised decode skips it).
++    std::vector<uint8_t> need_act;
++};
++
++/// `lost[i]` (entry i = token * k + slot) marks a pick the helper owned and did not deliver.  Jobs come in first-seen expert
++/// order and entries in ascending order, so the plan is deterministic.  An id outside 0..n_expert-1 is skipped: the caller
++/// has already refused such a window.
++inline void plan_lost_rows(const int32_t* ids, const uint8_t* lost, int64_t n_tok, int64_t k, int64_t n_expert, int max_t,
++                           LostRowsPlan& plan) {
++    plan.jobs.clear();
++    plan.need_act.assign((size_t) n_tok, 0);
++    std::vector<int32_t> open((size_t) n_expert, -1);   // expert -> the job still taking tokens
++    for (int64_t i = 0; i < n_tok * k; ++i) {
++        const int32_t e = ids[i];
++        if (!lost[i] || e < 0 || e >= n_expert) continue;
++        plan.need_act[(size_t) (i / k)] = 1;
++        int32_t& j = open[(size_t) e];
++        if (j < 0 || (int) plan.jobs[(size_t) j].entries.size() >= max_t) {   // the MAXT split (SB5 removes it)
++            j = (int32_t) plan.jobs.size();
++            plan.jobs.emplace_back();
++            plan.jobs.back().expert = e;
++        }
++        plan.jobs[(size_t) j].entries.push_back((int32_t) i);
++    }
++}
++
++}  // namespace strata::core
+diff --git a/include/strata/core/remote_experts.hpp b/include/strata/core/remote_experts.hpp
+index 738b264..bf312b0 100644
+--- a/include/strata/core/remote_experts.hpp
++++ b/include/strata/core/remote_experts.hpp
+@@ -18,6 +18,8 @@
+ #include <utility>
+ #include <vector>
+ 
++namespace seabraid { class PeerWatch; }   // wire/strata/seabraid/peer_watch.hpp; complete only in remote_experts.cpp
++
+ namespace strata::core {
+ class RemoteExpertOpt;
+ 
+@@ -25,7 +27,7 @@ class RemoteExpertOpt;
+ /// dense weights and state; results return through the existing pinned CPU rows.
+ class RemoteExperts {
+ public:
+-    RemoteExperts() = default;
++    RemoteExperts();   // out of line: watch_ holds a PeerWatch, complete only in remote_experts.cpp
+     ~RemoteExperts();
+     RemoteExperts(const RemoteExperts&) = delete;
+     RemoteExperts& operator=(const RemoteExperts&) = delete;
+@@ -62,9 +64,21 @@ public:
+         return layer >= 0 && expert >= 0 && expert < n_expert_ && i < tier_suspect_.size() && tier_suspect_[i] != 0;
+     }
+     /// MAIN SIDE: 0 = open; 1 = closed after a tier round timed out; 2 = closed after a torn slot or a stale
+-    /// residency report.  Closed is for the rest of the session: nothing is routed to the card and its experts come
+-    /// from RAM / the drive (N-card ladder, fail closed on unknown residency).
+-    int seabraid_closed() const { return bl_closed_.load(std::memory_order_relaxed); }
++    /// residency report; 3 = the helper process exited; 4 = it missed the layer deadline; 5 = it answered with an error or a
++    /// bad echo; 6 = it was already gone when this engine started.  Closed is for the rest of the session: nothing is routed
++    /// to the card and its experts come from RAM / the drive (N-card ladder, fail closed on unknown residency).
++    /// D4 (one "closed" predicate for every reader): the exit watch is folded in, so a helper that died while idle reads 3
++    /// here at once, before any request has had to find out - EngineHost::helper_alive, RungIO::closed, the retier loop and
++    /// the ladder all see it without a second predicate to forget (the check_helper_tier lesson).
++    int seabraid_closed() const {
++        const int c = bl_closed_.load(std::memory_order_relaxed);
++        return c != 0 ? c : bl_loss_code();
++    }
++    /// The last finish() did not deliver the rows this helper owned (it was lost during the request): owns(i) still names
++    /// them and the caller computes them itself (expert_source.cpp redo_lost_rows_*).  The next begin() clears it.
++    bool rows_lost() const { return bl_rows_lost_; }
++    /// Tests only: the layer deadline (default 30 s) a helper may take to answer one request.
++    void set_seabraid_deadline_for_test(double seconds) { bl_deadline_s_ = seconds; }
+     /// seabraid: this tier is served by a helper process of another GPU vendor over shared memory.
+     bool seabraid() const { return bl_ != nullptr; }
+     bool optimized_decode() const { return remote_opt_ != nullptr; }
+@@ -164,7 +178,7 @@ public:
+     /// Checks the expert process offers a prefill region this engine can use (fp16 rows, `k` picks per token) and sets the
+     /// cost model's rates.  False with an error naming both sides' values; the caller then reads prompts as before.
+     bool prefill_open(int64_t k, std::string& err);
+-    bool prefill_usable() const { return bl_ != nullptr && pf_open_ && !pf_dead_; }
++    bool prefill_usable() const { return bl_ != nullptr && pf_open_ && !pf_dead_ && seabraid_closed() == 0; }
+     /// The per-chunk choice (byte/time model, remote_prefill.hpp), logged once per prompt.  Never compute when unusable.
+     /// `row_bytes`: the row element size the chunk's layers will send (4 on a fused-path engine, else 2).
+     PrefillChoice prefill_choose(int64_t tokens, bool stream_all, int64_t layers, int64_t hidden, int64_t k, int row_bytes = 2);
+@@ -196,18 +210,45 @@ private:
+     bool seabraid_open(int slots, int64_t layers, int64_t experts,
+                       const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
+                       std::vector<uint8_t>& claimed, std::string& err, bool auto_size);
++    /// D7: open() for a channel whose helper is already gone: a closed card (code 6) with the channel mapped, nothing published.
++    bool seabraid_open_closed(std::unique_ptr<seabraid::Channel> ch, int64_t layers, int64_t experts, const std::string& why);
+     bool seabraid_helper_begin(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k,
+                        const int32_t* kind, const int32_t* primary_res, std::string& err);
+     bool seabraid_helper_finish(float* out, std::string& err);
++    void seabraid_copy_reply();
++    void seabraid_accept_rows(float* out);
+     void seabraid_close(int why, const std::string& msg);
++    /// A request's helper is gone, late or wrong: close the card and give the request's rows back to the caller (rows_lost()).
++    /// WHY a function of its own: close alone leaves bl_pending_ set and says nothing about the rows; every loss site needs
++    /// both, and one function is how they stay the same (D6: every unusable answer is treated one way).
++    void seabraid_lose(int why, const std::string& msg);
++    /// The one wait every seabraid wait goes through: returns pred() once pred() holds OR the helper is lost.  WHY here and not
++    /// at each call site: a wait that forgets the loss test is the 30 s hang of the L1 run (checker: check_pid_probes).
++    template <class P> bool bl_wait(P pred, double timeout_s) {
++        seabraid::Channel::wait([&] { return pred() || bl_loss_code() != 0; }, timeout_s);
++        return pred();
++    }
++    /// 0 = no loss seen; else the close code: a loss recorded off the engine thread (bl_off_), else 3 when the exit watch fired.
++    /// Defined in remote_experts.cpp, where PeerWatch is complete.
++    int bl_loss_code() const;
++    /// A loss met by the prompt path's threaded stager.  WHY it only records: seabraid_close rewrites bl_held_ and
++    /// layers_present_, which the engine thread reads without locks (D3), so only the engine thread runs it; the next
++    /// begin() sees this code in seabraid_closed() and does.
++    void bl_note_loss(int why, const std::string& msg);
+     /// The round both seabraid_retier entry points run.  `wire` goes to the helper; `plain` is the same ops as plain swaps/loads, which is
+     /// what the residency checks (tier_residency_consistent) judge.
+     bool seabraid_round(const seabraid::TierWireOp* wire, const seabraid::TierWireOp* plain, int32_t n, uint8_t* res,
+                        std::vector<uint8_t>* claimed, std::string& err);
+     void tier_quarantine(int64_t layer, int64_t expert);
+     std::unique_ptr<seabraid::Channel> bl_;
++    /// Watches the helper's pid + start time (pidfd + /proc stat, no signal ever sent): sets one atomic when it exits (D1/D2).
++    std::unique_ptr<seabraid::PeerWatch> watch_;
++    std::string bl_name_;                  ///< the channel's name, for the log lines that name the helper
+     std::vector<uint8_t> bl_held_;
+     std::atomic<int> bl_closed_{0};        ///< see seabraid_closed(); atomic: the prompt path's stager reads holds() off-thread
++    std::atomic<int> bl_off_{0};           ///< a loss code recorded off the engine thread, see bl_note_loss()
++    bool bl_rows_lost_ = false;            ///< see rows_lost()
++    double bl_deadline_s_ = 30;            ///< how long one layer request may take before the helper counts as lost
+     std::vector<uint8_t> tier_suspect_;    ///< HELPER SIDE: quarantined cells, see tier_suspect()
+     std::vector<std::pair<int32_t, int32_t>> tier_written_;   ///< HELPER SIDE: cells this round's fills wrote
+     /// Swaps whose replace() is waiting on tier_sync().  Residency must not move until the copy
+@@ -222,6 +263,7 @@ private:
+     bool bl_per_token_ = false;            ///< the request in flight asked for kOutPerToken (--remote-expert-opt): finish() checks the echo
+     int64_t bl_ntok_ = 0;                  ///< its n_tok: the rows the helper must report
+     int64_t bl_npick_ = 0;                 ///< n_tok * k: the rows a per-pick answer must report
++    std::vector<float> bl_reply_;           ///< Engine-owned scratch; reused across layers, packed by original_row_ in per-pick mode.
+     uint64_t bl_seq_ = 0;
+     uint64_t bl_blob_seq_ = 0;
+     RemoteExpertOpt* remote_opt_ = nullptr;
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index 3a5309d..4be1d93 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -1,5 +1,6 @@
+ // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
+ #include "strata/core/expert_source.hpp"
++#include "strata/core/lost_rows.hpp"
+ #include "strata/core/expert_nibble.hpp"
+ #include "strata/core/conversation_memory.hpp"
+ #include "strata/core/foresight_swap.hpp"
+@@ -4795,6 +4796,39 @@ bool ExpertDispatch::fetch_can(int64_t layer) const {
+            src != nullptr && src->pcie_layer(layer);
+ }
+ 
++namespace {
++// A helper that was lost while it held this layer's request (RemoteExperts::rows_lost()) delivered none of the rows it owned.
++// DEFENCE (D5): computed HERE, not inside RemoteExperts, because this dispatch already owns how an expert runs on the CPU
++// (source, pool, kernels) and a second owner of that would drift; D4 prefill does the same ("card 1 computes the handed-over
++// picks itself").  The rows are the plain per-pick expert outputs, exactly what a CPU pick yields, so the combine weights them
++// with the router's own weights whether or not --remote-expert-opt was on (h_mask_ stays 0 for these picks).
++// A null blob fails like the main loop's "could not produce a blob" path.
++bool lost_blob_missing(ExpertDispatch& d, int64_t expert) {
++    d.failed = true;
++    d.fail = "the expert source could not produce a blob";
++    d.fail_layer = d.layers;
++    d.fail_expert = expert;
++    ++d.missing;
++    return false;
++}
++
++bool redo_lost_rows_single(ExpertDispatch& d, const int32_t* ids, int64_t k, float* out, int64_t n_embd, int r) {
++    using namespace strata::kernels::cpu;
++    int64_t njobs = 0;
++    for (int64_t i = 0; i < k; ++i) {
++        if (!d.remote[r]->owns(i)) continue;
++        const uint8_t* b = d.src->blob(d.layers, ids[i]);
++        if (b == nullptr) return lost_blob_missing(d, ids[i]);
++        ExpertJob& j = d.jobs[(size_t) njobs++];   // d.jobs holds k entries (resized at the top of the dispatch)
++        j.blob = b; j.act = &d.act; j.out = out + (size_t) i * (size_t) n_embd; j.weight = 1.0f; j.slot = (int) i;
++    }
++    if (njobs == 0) return true;
++    if (d.split_rows) d.pool->run_split(d.jobs.data(), (int) njobs);
++    else d.pool->run(d.jobs.data(), (int) njobs);
++    return true;
++}
++}  // namespace
++
+ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd,
+                           int64_t k, float* out) {
+     (void) weights;   // clause 2: `moe_combine` applies it on the device.  Not an oversight.
+@@ -4912,6 +4946,8 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
+             if (!d.remote[r]->finish(out, remote_error)) {
+                 d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+             }
++        for (int r = 0; r < d.remote_count; ++r)   // a helper lost mid-request: its picks are computed here, the engine goes on
++            if (d.remote[r]->rows_lost() && !redo_lost_rows_single(d, ids, k, out, n_embd, r)) return;
+     }
+     ++d.layers;
+     d.experts += k;
+@@ -4942,6 +4978,58 @@ int tail_skip_rank() {
+ }
+ void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
+ 
++namespace {
++// One token's activation, quantised the way this pack's kernels read it.  WHY a function: the window loop and the lost-rows
++// redo below both need the same three-way choice, and a copy of it is how the two would one day disagree (a lost helper's rows
++// would then be computed from a different activation than the CPU rows beside them).
++void quantize_window_act(ExpertDispatch& d, const strata::kernels::cpu::ExpertLayout& lay, bool native, const float* x_f, int64_t t) {
++    using namespace strata::kernels::cpu;
++    if (native && q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // a native Q2_0 pack: the Q2_0 kernels' activations
++        act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
++    else if (native)
++        native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
++    else
++        act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
++}
++
++// The window's twin of redo_lost_rows_single (see its note for why this is computed here).  Same job type, kernels, pool call
++// and MAXT split as the main loop; the plan (which expert over which token rows) is lost_rows.hpp's.
++bool redo_lost_rows_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out, int r,
++                          strata::kernels::cpu::NativeArithmetic arithmetic) {
++    using namespace strata::kernels::cpu;
++    const ExpertLayout& lay = expert_layout();
++    const bool native = lay.native;
++    static thread_local std::vector<uint8_t> lost;
++    static thread_local LostRowsPlan plan;
++    static thread_local std::vector<ExpertJobMulti> jobs;
++    lost.assign((size_t) (n_tok * k), 0);
++    for (int64_t i = 0; i < n_tok * k; ++i) lost[(size_t) i] = d.remote[r]->owns(i) ? 1 : 0;
++    plan_lost_rows(ids, lost.data(), n_tok, k, d.n_expert, MAXT, plan);
++    for (int64_t t = 0; t < n_tok; ++t)
++        if (plan.need_act[(size_t) t]) quantize_window_act(d, lay, native, x_f, t);   // the optimised decode may have skipped it
++    jobs.assign(plan.jobs.size(), ExpertJobMulti{});
++    for (size_t q = 0; q < plan.jobs.size(); ++q) {
++        const uint8_t* b = d.src->blob(d.layers, plan.jobs[q].expert);
++        if (b == nullptr) return lost_blob_missing(d, plan.jobs[q].expert);
++        ExpertJobMulti& jb = jobs[q];
++        jb.blob = b;
++        for (const int32_t i : plan.jobs[q].entries) {
++            const size_t t = (size_t) (i / k);
++            jb.act[jb.nt] = &d.act_multi[t];
++            jb.nact[jb.nt] = native ? d.nact_multi.data() + t * kNativeActBytes : nullptr;
++            jb.out[jb.nt] = out + (size_t) i * H;
++            ++jb.nt;
++            ++d.multi_entries;
++        }
++    }
++    if (jobs.empty()) return true;
++    if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], jobs.data(), (int) jobs.size(), arithmetic);
++    else d.pool->run_split_multi(jobs.data(), (int) jobs.size());
++    if (d.plan != nullptr) d.plan->cpu_jobs += (int) jobs.size();   // a statistic only (verify.cpp reads it for the trace)
++    return true;
++}
++}  // namespace
++
+ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
+                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic) {
+     using namespace strata::kernels::cpu;
+@@ -5255,12 +5343,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+         const bool ep = d.remote_count > 0 && d.remote[0]->optimized_decode();
+         for (int64_t t = 0; t < n_tok; ++t) {
+             if (ep && std::all_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v >= 0; })) continue;
+-            if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // a native Q2_0 pack: the Q2_0 kernels' activations
+-                act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+-            else if (native)
+-                native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
+-            else
+-                act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
++            quantize_window_act(d, lay, native, x_f, t);
+         }
+     }
+     const auto c2 = std::chrono::steady_clock::now();
+@@ -5443,6 +5526,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+             if (!d.remote[r]->finish(out, remote_error)) {
+                 d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+             }
++        for (int r = 0; r < d.remote_count; ++r)   // a helper lost mid-request: its picks are computed here, the engine goes on
++            if (d.remote[r]->rows_lost() && !redo_lost_rows_multi(d, x_f, ids, n_tok, k, out, r, arithmetic)) return;
+     }
+     if (d.peer != nullptr) {                 // multi-GPU: the second GPU's rows, into the same mapped rows
+         std::string perr;
+diff --git a/src/core/remote_experts.cpp b/src/core/remote_experts.cpp
+index 171acd7..44706e7 100644
+--- a/src/core/remote_experts.cpp
++++ b/src/core/remote_experts.cpp
+@@ -1,6 +1,8 @@
+ #include "strata/core/remote_experts.hpp"
+ #include "strata/seabraid/channel_names.hpp"
+ #include "strata/seabraid/file_ref.hpp"
++#include "strata/seabraid/peer_watch.hpp"
++#include "strata/seabraid/finite_rows.hpp"
+ #include "strata/core/device.hpp"   // primary_device() (STRATA_PRIMARY_DEVICE)
+ #include "strata/core/remote_expert_opt.hpp"
+ #include "strata/core/route_hist.hpp"
+@@ -88,6 +90,7 @@ bool check(cudaError_t result, const char* what, std::string& err, int device) {
+ }
+ } // namespace
+ 
++RemoteExperts::RemoteExperts() = default;
+ RemoteExperts::~RemoteExperts() { close(); }
+ 
+ bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
+@@ -142,6 +145,8 @@ void RemoteExperts::close() {
+         if (bl_pending_) { std::string ignored; seabraid_helper_finish(nullptr, ignored); }
+         bl_->header()->state.store(seabraid::kShutdown, std::memory_order_release);
+         bl_.reset();
++        watch_.reset();   // joins its thread; a reopened channel gets a fresh watch and a fresh closed state
++        bl_closed_ = 0; bl_off_ = 0; bl_rows_lost_ = false;
+         bl_held_.clear();
+         bl_resident_ = 0; bl_gib_ = 0; bl_pending_ = false;
+         pf_open_ = pf_dead_ = pf_pending_ = false;   // D4: a reopened channel is checked again by prefill_open
+@@ -588,14 +593,34 @@ bool RemoteExperts::seabraid_open(int slots, int64_t layers, int64_t experts,
+         device_ = -1; return false;
+     }
+     seabraid::Header* hd = ch->header();
++    bl_name_ = name;
++    // D9a (identity race): Channel::create publishes the magic BEFORE the helper writes its identity and kHelperUp, so an
++    // engine that attaches in between sees kNone.  That is "not ready yet", not a fault: wait for it, bounded.  120 s: the
++    // helper's own start-up (model open, card benchmark) is what this covers; preflight() has already waited up to 60 s.
++    if (!bl_wait([&] { return hd->state.load(std::memory_order_acquire) != seabraid::kNone; }, 120)) {
++        err = "seabraid: the helper on " + name + " is not ready (state 0 after 120 s); restart seabraid-helper";
++        device_ = -1; return false;
++    }
++    uint32_t st = 0;
+     {   // kHelperUp: fresh.  kLoaded / kFailed: an earlier engine died without kShutdown; the helper reloads on a new plan.
+-        const uint32_t st = hd->state.load(std::memory_order_acquire);
++        st = hd->state.load(std::memory_order_acquire);   // the acquire: helper_pid/helper_start below are complete after it (D9)
+         if (st != seabraid::kHelperUp && st != seabraid::kLoaded && st != seabraid::kFailed) {
+             err = "seabraid: the helper is not ready for a plan (state " + std::to_string(st) + "); restart seabraid-helper";
+             device_ = -1; return false;
+         }
+-        if (st != seabraid::kHelperUp) std::fprintf(stderr, "seabraid: the helper still held an earlier engine's plan; replacing it\n");
+     }
++    // D7 (a stale channel opens as a closed card, it does not refuse the start): a helper that is dead at start is the same
++    // fact as one lost a second after start, and refusing would turn a dead helper into a dead engine - routine, because
++    // systemd's RestartSec=5 leaves the old channel behind.  D9b: the identity is bound to a process, not trusted as a pid.
++    {
++        auto w = std::make_unique<seabraid::PeerWatch>();
++        std::string why;
++        if (!w->start(hd->helper_pid, hd->helper_start, why))
++            return seabraid_open_closed(std::move(ch), layers, experts, why);
++        watch_ = std::move(w);
++    }
++    auto fail = [&](const std::string& msg) { err = msg; device_ = -1; watch_.reset(); return false; };
++    if (st != seabraid::kHelperUp) std::fprintf(stderr, "seabraid: the helper still held an earlier engine's plan; replacing it\n");
+     // The same selection as the in-process tier: ranked order, nothing the primary or another tier holds.
+     const auto& lay = strata::kernels::cpu::expert_layout();
+     const uint64_t free_bytes = (uint64_t) (hd->free_gib * 1073741824.0);
+@@ -616,18 +641,21 @@ bool RemoteExperts::seabraid_open(int slots, int64_t layers, int64_t experts,
+         picked[index] = 1;
+         if (count >= slots) break;
+     }
+-    if (count == 0) { err = "seabraid: no unclaimed expert fits the helper"; device_ = -1; return false; }
++    if (count == 0) return fail("seabraid: no unclaimed expert fits the helper");
+     hd->plan_count = count;
+     hd->plan_slots = count;
+     hd->plan_auto = auto_size ? 1 : 0;
+     hd->state.store(seabraid::kPlanReady, std::memory_order_release);
+     std::fprintf(stderr, "seabraid: sent a plan of %lld experts (%.2f GiB) to %s; waiting for it to load\n",
+                  (long long) count, (double) needed / 1073741824.0, seabraid::bounded_text(hd->helper_name, sizeof hd->helper_name).c_str());
+-    if (!seabraid::Channel::wait([&] { const uint32_t st = hd->state.load(std::memory_order_acquire);
+-                                       return st == seabraid::kLoaded || st == seabraid::kFailed; }, 1800)) {
+-        err = "seabraid: the helper did not finish loading in 30 minutes"; device_ = -1; return false;
++    if (!bl_wait([&] { const uint32_t s2 = hd->state.load(std::memory_order_acquire);
++                       return s2 == seabraid::kLoaded || s2 == seabraid::kFailed; }, 1800)) {
++        // The helper died while it loaded (the watch fired) or never finished: a dead helper is a closed card (D7); only
++        // the 30-minute timeout with a live helper is a refusal, because the card may still be loading.
++        if (bl_loss_code() != 0) { watch_.reset(); return seabraid_open_closed(std::move(ch), layers, experts, "it exited while loading its plan"); }
++        return fail("seabraid: the helper did not finish loading in 30 minutes");
+     }
+-    if (hd->state.load() == seabraid::kFailed) { err = "seabraid helper: " + seabraid::bounded_text(hd->msg, sizeof hd->msg); device_ = -1; return false; }
++    if (hd->state.load() == seabraid::kFailed) return fail("seabraid helper: " + seabraid::bounded_text(hd->msg, sizeof hd->msg));
+     bl_held_.assign(ch->held(), ch->held() + (size_t) layers * (size_t) experts);
+     bl_resident_ = hd->resident;
+     bl_gib_ = hd->gib;
+@@ -647,13 +675,32 @@ bool RemoteExperts::seabraid_open(int slots, int64_t layers, int64_t experts,
+     {   // the channel's blob slots must hold this engine's largest blob
+         int64_t need = 0;
+         for (int64_t l = 0; l < layers; ++l) need = std::max<int64_t>(need, (int64_t) lay.blob_bytes(l));
+-        if (ch->limits().blob_max < need) { err = "seabraid: the helper's blob slots are smaller than this model's blobs"; device_ = -1; return false; }
++        if (ch->limits().blob_max < need) return fail("seabraid: the helper's blob slots are smaller than this model's blobs");
+     }
+     bl_thread_ = std::this_thread::get_id();   // the fence asserts against this
+     bl_ = std::move(ch);
+     return true;
+ }
+ 
++bool RemoteExperts::seabraid_open_closed(std::unique_ptr<seabraid::Channel> ch, int64_t layers, int64_t experts, const std::string& why) {
++    // The channel stays mapped (close() writes kShutdown to it as to any other) but nothing is published to it: no plan, no
++    // request.  The card holds nothing, so begin() owns nothing and every expert comes from RAM / the drive.
++    std::fprintf(stderr, "seabraid: WARN: the helper on %s is gone (%s); this card starts closed and its experts come from RAM / the drive\n",
++                 bl_name_.c_str(), why.c_str());
++    bl_held_.assign((size_t) layers * (size_t) experts, 0);
++    layers_present_.assign((size_t) layers, 0);
++    owned_.resize(CAP);
++    original_row_.reserve(CAP);
++    bl_resident_ = 0; bl_gib_ = 0; bl_pending_ = false;
++    computed_ = 0; launched_layers_ = 0; returned_bytes_ = full_row_bytes_ = 0;
++    bl_seq_ = ch->header()->req_seq.load(std::memory_order_acquire);
++    bl_blob_seq_ = ch->header()->blob_req_seq.load(std::memory_order_acquire);
++    bl_closed_ = 6;
++    bl_thread_ = std::this_thread::get_id();
++    bl_ = std::move(ch);
++    return true;
++}
++
+ bool RemoteExperts::seabraid_helper_begin(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k,
+                                   const int32_t* kind, const int32_t* primary_res, std::string& err) {
+     const int64_t n = n_tok * k;
+@@ -666,9 +713,19 @@ bool RemoteExperts::seabraid_helper_begin(int64_t layer, const float* x, const i
+         err = "seabraid experts: a layer request was published during a tier round";
+         return false;
+     }
+-    if (bl_pending_ && !seabraid_helper_finish(nullptr, err)) return false;   // never overwrite a request in flight
++    if (bl_pending_) {   // never overwrite a request in flight
++        if (!seabraid_helper_finish(nullptr, err)) return false;
++        // A request nobody collected was lost with its helper: its rows have no caller to compute them, so this is the old failure.
++        if (bl_rows_lost_) { err = "seabraid experts: the request still in flight was lost with its helper"; return false; }
++    }
+     std::fill(owned_.begin(), owned_.begin() + n, 0);
+     original_row_.clear();
++    bl_rows_lost_ = false;
++    // An idle death (or a loss the stager saw) is found here, at the engine thread's next request: close now, so layers_present_
++    // is zero and this request owns nothing (D3: only this thread rewrites the held bitmaps).
++    if (const int closed = seabraid_closed(); closed != 0 && bl_closed_.load(std::memory_order_relaxed) == 0)
++        seabraid_lose(closed, closed == 3 ? "the helper on " + bl_name_ + " exited (found at the next layer request)"
++                                         : "lost on the prompt path (logged there)");
+     if (!layers_present_[(size_t) layer]) return true;
+     int32_t* sid = bl_->ids();
+     for (int64_t i = 0; i < n; ++i) {
+@@ -719,38 +776,58 @@ bool RemoteExperts::seabraid_helper_finish(float* out, std::string& err) {
+     const auto w0 = std::chrono::steady_clock::now();
+     if (RouteHist::get().on()) ms_own_ += std::chrono::duration<double, std::milli>(w0 - begin_end_).count();
+     seabraid::Header* hd = bl_->header();
+-    if (!seabraid::Channel::wait([&] { return hd->resp_seq.load(std::memory_order_acquire) == bl_seq_; }, 30)) {
+-        err = "seabraid: the helper did not answer layer " + std::to_string(hd->layer) + " within 30 s";
+-        return false;
++    // FAIL OPEN FOR THE ENGINE, CLOSED FOR THE CARD (D6): every unusable answer - the helper exited, missed the deadline,
++    // reported an error or echoed the wrong shape - closes the card and returns true with rows_lost() set, so the caller
++    // computes the rows itself.  Before, each of these returned false, and the serve loop ended the engine (exit code 1).
++    if (!bl_wait([&] { return hd->resp_seq.load(std::memory_order_acquire) == bl_seq_; }, bl_deadline_s_)) {
++        ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
++        if (const int lost = bl_loss_code(); lost != 0)
++            seabraid_lose(lost, "the helper on " + bl_name_ + " exited with layer " + std::to_string(hd->layer) + " in flight");
++        else
++            seabraid_lose(4, "the helper on " + bl_name_ + " did not answer layer " + std::to_string(hd->layer) + " within " +
++                            std::to_string((long long) bl_deadline_s_) + " s");
++        return true;
+     }
+     bl_pending_ = false;
+     ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+-    if (!hd->ok) { err = "seabraid helper: " + seabraid::bounded_text(hd->err, sizeof hd->err); return false; }
+-    if (out == nullptr) return true;
++    if (!hd->ok) { seabraid_lose(5, "seabraid helper: " + seabraid::bounded_text(hd->err, sizeof hd->err)); return true; }
++    if (out != nullptr) seabraid_accept_rows(out);
++    return true;
++}
++
++void RemoteExperts::seabraid_copy_reply() {
++    // Copy only rows the protocol defines. A helper leaves unowned per-pick rows untouched.
++    const size_t count = bl_per_token_ ? (size_t) bl_ntok_ : original_row_.size();
++    bl_reply_.resize(count * H);
+     if (bl_per_token_) {
+-        // The helper must echo what it did.  A per-pick answer to a per-token request, or a different row count, means
+-        // the rows in `out` are not the n_tok weighted sums accumulate() expects: an error (like any helper error),
+-        // never partial or mixed data.
+-        if (hd->out_mode != seabraid::kOutPerToken || hd->out_rows != (int32_t) bl_ntok_) {
+-            err = "seabraid helper: answered out_mode " + std::to_string(hd->out_mode) + ", " + std::to_string(hd->out_rows) +
+-                  " rows to a per-token request of " + std::to_string((long long) bl_ntok_) + " tokens";
+-            return false;
+-        }
+-        remote_opt_->accumulate(bl_->out(), *this);   // h_sum_ / h_mask_ filled exactly as for an in-process remote
+-        return true;
++        std::memcpy(bl_reply_.data(), bl_->out(), bl_reply_.size() * sizeof(float));
++    } else {
++        for (size_t i = 0; i < count; ++i)
++            std::memcpy(bl_reply_.data() + i * H, bl_->out() + (size_t) original_row_[i] * H, H * sizeof(float));
+     }
+-    // The per-pick echo, checked like the per-token one above: the helper writes one row per pick at its pick index
+-    // and must report n_tok * k rows in kOutPerPick.  Any other answer means `out` is not laid out the way the copy
+-    // below reads it, so it is an error, never a silent mix of rows.
+-    if (hd->out_mode != seabraid::kOutPerPick || hd->out_rows != (int32_t) bl_npick_) {
+-        err = "seabraid helper: answered out_mode " + std::to_string(hd->out_mode) + ", " + std::to_string(hd->out_rows) +
+-              " rows to a per-pick request of " + std::to_string((long long) bl_npick_) + " picks";
+-        return false;
++}
++
++void RemoteExperts::seabraid_accept_rows(float* out) {
++    const auto* hd = bl_->header();
++    const int32_t mode = bl_per_token_ ? seabraid::kOutPerToken : seabraid::kOutPerPick;
++    const int64_t rows = bl_per_token_ ? bl_ntok_ : bl_npick_;
++    if (hd->out_mode != mode || hd->out_rows != rows) {
++        seabraid_lose(5, "seabraid helper: answered mode " + std::to_string(hd->out_mode) + " with " + std::to_string(hd->out_rows) +
++                        " rows; expected mode " + std::to_string(mode) + " with " + std::to_string(rows) + " rows");
++        return;
++    }
++    seabraid_copy_reply();
++    // Validate the same snapshot we publish: a late bad row must leave sums, masks and per-pick outputs untouched for CPU replay.
++    if (!seabraid::all_finite(bl_reply_.data(), bl_reply_.size())) {
++        seabraid_lose(5, "seabraid helper: non-finite decode result");
++        return;
++    }
++    if (bl_per_token_) {
++        remote_opt_->accumulate(bl_reply_.data(), *this);
++    } else {
++        for (size_t i = 0; i < original_row_.size(); ++i)
++            std::memcpy(out + (size_t) original_row_[i] * H, bl_reply_.data() + i * H, H * sizeof(float));
+     }
+-    const float* src = bl_->out();
+-    for (const int32_t row : original_row_)
+-        std::memcpy(out + (size_t) row * H, src + (size_t) row * H, (size_t) H * sizeof(float));
+-    return true;
+ }
+ 
+ 
+@@ -778,7 +855,7 @@ bool RemoteExperts::seabraid_retier_blob(const seabraid::TierWireOp& op, const u
+     plain.kind = seabraid::kTierSwap; plain.blob_slot = 0;
+     uint8_t r = seabraid::kTierPending;
+     // A closed card is refused before the slot is written (seabraid_round refuses it too, after the write, so this one saves the copy).
+-    if (bl_closed_.load(std::memory_order_relaxed) != 0) { err = "seabraid retier: this card is CLOSED (an earlier round timed out or tore a slot)"; return false; }
++    if (seabraid_closed() != 0) { err = "seabraid retier: this card is CLOSED (an earlier round timed out, tore a slot, or its helper is gone)"; return false; }
+     std::memcpy(bl_->blob(0), bytes, need);
+     const bool ok = seabraid_round(&wire, &plain, 1, &r, nullptr, err);
+     res = r;
+@@ -802,7 +879,7 @@ bool RemoteExperts::seabraid_retier_file(const seabraid::TierWireOp& op, const s
+     wire.kind = seabraid::kTierSwapFile; wire.blob_slot = 0; wire.helper = 0;
+     plain.kind = seabraid::kTierSwap; plain.blob_slot = 0;
+     uint8_t r = seabraid::kTierPending;
+-    if (bl_closed_.load(std::memory_order_relaxed) != 0) { err = "seabraid retier: this card is CLOSED (an earlier round timed out or tore a slot)"; return false; }
++    if (seabraid_closed() != 0) { err = "seabraid retier: this card is CLOSED (an earlier round timed out, tore a slot, or its helper is gone)"; return false; }
+     if (!seabraid::file_ref_to(bl_->blob(0), bl_->limits().blob_max, ref)) { err = "seabraid retier: a channel blob slot cannot hold a FileRef"; return false; }
+     const bool ok = seabraid_round(&wire, &plain, 1, &r, nullptr, err);
+     res = r;
+@@ -824,11 +901,12 @@ bool RemoteExperts::seabraid_round(const seabraid::TierWireOp* ops, const seabra
+         return false;
+     }
+     if (bl_fenced_) { err = "seabraid retier: re-entered while a tier round was already open"; return false; }
+-    if (bl_closed_.load(std::memory_order_relaxed) != 0) { err = "seabraid retier: this card is CLOSED (an earlier round timed out or tore a slot)"; return false; }
++    if (seabraid_closed() != 0) { err = "seabraid retier: this card is CLOSED (an earlier round timed out, tore a slot, or its helper is gone)"; return false; }
+ 
+     // (1) Drain.  A request still in flight would be answered out of a slot that is about to move, and that
+     // reply is well-formed and numerically wrong -- nothing in the protocol can detect it.
+     if (bl_pending_ && !seabraid_helper_finish(nullptr, err)) return false;
++    if (seabraid_closed() != 0) { err = "seabraid retier: the drained request closed this card"; return false; }
+ 
+     // (2) Close admission for the duration, on every exit path including the error ones.
+     bl_fenced_ = true;
+@@ -836,13 +914,15 @@ bool RemoteExperts::seabraid_round(const seabraid::TierWireOp* ops, const seabra
+ 
+     const uint64_t seq = bl_->tier_submit(ops, n);
+     bl_tier_seq_ = seq;
+-    if (!seabraid::Channel::wait([&] { return bl_->tier_done(seq); }, 60)) {
+-        err = "seabraid retier: the helper did not finish tier round " +
+-              std::to_string((unsigned long long) seq) + " within 60 s";
++    if (!bl_wait([&] { return bl_->tier_done(seq); }, 60)) {
++        const int lost = bl_loss_code();   // 3: the helper exited during the round; 1: it is alive and did not answer
++        err = lost != 0 ? "seabraid retier: the helper exited during tier round " + std::to_string((unsigned long long) seq)
++                        : "seabraid retier: the helper did not finish tier round " +
++                          std::to_string((unsigned long long) seq) + " within 60 s";
+         // FAIL CLOSED.  The Reopen above reopens admission on this return, and before this line it did so with
+         // bl_held_ unchanged while the helper might still be applying the round: the next request routed from a
+         // stale view and a well-formed wrong row was the result (N-card ladder review).  Now the card routes nothing.
+-        seabraid_close(1, err);
++        seabraid_close(lost != 0 ? lost : 1, err);
+         return false;
+     }
+ 
+@@ -921,8 +1001,27 @@ void RemoteExperts::seabraid_close(int why, const std::string& msg) {
+     std::fill(bl_held_.begin(), bl_held_.end(), 0);
+     std::fill(layers_present_.begin(), layers_present_.end(), 0);
+     if (bl_) bl_->bump_epoch();
++    static const char* const kWhy[] = {"open", "tier round timed out", "torn slot or stale residency", "helper exited",
++                                       "layer deadline missed", "helper error or bad echo", "helper gone at start"};
+     std::fprintf(stderr, "seabraid: card CLOSED (%s): %s; its experts now come from RAM / the drive for the rest of this session\n",
+-                 why == 1 ? "tier round timed out" : "torn slot or stale residency", msg.c_str());
++                 why >= 1 && why <= 6 ? kWhy[why] : "unknown", msg.c_str());
++}
++
++void RemoteExperts::seabraid_lose(int why, const std::string& msg) {
++    seabraid_close(why, msg);
++    bl_pending_ = false;                          // the request is over: nothing will answer it
++    bl_rows_lost_ = !original_row_.empty();       // and its rows were never delivered: the caller computes them (owns(i) still names them)
++}
++
++int RemoteExperts::bl_loss_code() const {
++    const int off = bl_off_.load(std::memory_order_acquire);
++    return off != 0 ? off : (watch_ && watch_->lost() ? 3 : 0);
++}
++
++void RemoteExperts::bl_note_loss(int why, const std::string& msg) {
++    int none = 0;
++    if (bl_off_.compare_exchange_strong(none, why, std::memory_order_acq_rel))   // first loss only: one log line
++        std::fprintf(stderr, "seabraid: %s; the engine thread closes the card at its next layer request\n", msg.c_str());
+ }
+ 
+ int64_t RemoteExperts::seabraid_free_slots() const {
+@@ -935,7 +1034,7 @@ bool RemoteExperts::copy_cached_blobs(const int32_t* layers, const int32_t* expe
+                                       size_t n, uint8_t* hit, std::string& err) {
+     std::fill(hit, hit + n, 0);
+     if (bl_) {   // seabraid: ask the helper process to copy them from its VRAM into the channel, 16 at a time
+-        if (bl_closed_.load(std::memory_order_relaxed) != 0) return true;   // a closed card lends nothing: all misses
++        if (seabraid_closed() != 0) return true;   // a closed card lends nothing: all misses
+         std::lock_guard<std::mutex> lock(read_mu_);
+         seabraid::Header* hd = bl_->header();
+         const auto& lay = strata::kernels::cpu::expert_layout();
+@@ -951,10 +1050,19 @@ bool RemoteExperts::copy_cached_blobs(const int32_t* layers, const int32_t* expe
+             hd->blob_n = nb;
+             const uint64_t want = ++bl_blob_seq_;
+             hd->blob_req_seq.store(want, std::memory_order_release);
+-            if (!seabraid::Channel::wait([&] { return hd->blob_resp_seq.load(std::memory_order_acquire) == want; }, 30)) {
+-                err = "seabraid: the helper did not answer a cache read within 30 s";
++            if (!bl_wait([&] { return hd->blob_resp_seq.load(std::memory_order_acquire) == want; }, bl_deadline_s_)) {
++                // A lost helper or a missed deadline is a closed card and all misses, not an error: the prompt falls back to
++                // the file source for these blobs (it used to fail the prompt and, through it, the engine).
++                const int lost = bl_loss_code();
++                const std::string msg = lost != 0 ? "the helper on " + bl_name_ + " exited during a cache read"
++                                                  : "the helper on " + bl_name_ + " did not answer a cache read within " +
++                                                    std::to_string((long long) bl_deadline_s_) + " s";
++                // This runs on the prompt path's stager threads as well as the engine thread, and only the engine thread may
++                // rewrite the held bitmaps (D3): the engine thread closes here, any other thread records the loss for it.
++                if (std::this_thread::get_id() == bl_thread_) seabraid_close(lost != 0 ? lost : 4, msg);
++                else bl_note_loss(lost != 0 ? lost : 4, msg);
+                 std::fill(hit, hit + n, 0);
+-                return false;
++                return true;
+             }
+             for (int i = 0; i < nb; ++i)
+                 if (hd->blob_hit[i]) {
+diff --git a/src/core/remote_prefill.cpp b/src/core/remote_prefill.cpp
+index 24b2dbe..12fa166 100644
+--- a/src/core/remote_prefill.cpp
++++ b/src/core/remote_prefill.cpp
+@@ -265,13 +265,15 @@ PrefillChoice RemoteExperts::prefill_choose(int64_t tokens, bool stream_all, int
+     PrefillChoice none;
+     if (!prefill_usable() || tokens <= 0) return none;
+     if (pf_pending_) {   // a prompt that failed between a request and its answer left it in flight: drain it, never read it
+-        if (!seabraid::Channel::wait([&] { return pf_seq_ == 0 || bl_->pf_answered(pf_seq_); }, 60)) pf_dead_ = true;
++        if (!bl_wait([&] { return pf_seq_ == 0 || bl_->pf_answered(pf_seq_); }, 60)) pf_dead_ = true;
+         pf_pending_ = false;
+         if (pf_dead_) return none;
+     }
+-    if (const pid_t pid = (pid_t) bl_->header()->helper_pid; pid > 0 && ::kill(pid, 0) != 0 && errno == ESRCH) {
++    // Liveness is the exit watch (pid + start time, never a signal-0 probe of a number a recycled pid can answer): one
++    // predicate for every reader, seabraid_closed().
++    if (seabraid_closed() != 0) {
+         pf_dead_ = true;   // between chunks: this chunk (and every later one) lends
+-        std::fprintf(stderr, "D4: the expert process (pid %d) is gone; the prompt lends\n", (int) pid);
++        std::fprintf(stderr, "D4: the expert process (pid %d) is gone; the prompt lends\n", (int) bl_->header()->helper_pid);
+         return none;
+     }
+     const auto& lay = strata::kernels::cpu::expert_layout();
+@@ -328,10 +330,10 @@ bool RemoteExperts::prefill_end(uint16_t* sums16, std::string& err) {
+     if (!pf_pending_) { err = "D4: no request in flight"; return false; }
+     pf_pending_ = false;
+     seabraid::Header* h = bl_->header();
+-    const pid_t pid = (pid_t) h->helper_pid;
++    const int pid = (int) h->helper_pid;   // for the message only: liveness is the exit watch, never a probe of this number
+     auto fail = [&](const std::string& why) {
+-        // WHAT BREAKS FIRST under a crash between send and receive: this wait.  The expert process's pid is checked every
+-        // 0.5 s and the wait gives up after 60 s, so card 1 never sums a stale region; it marks prompt reading on that card
++        // WHAT BREAKS FIRST under a crash between send and receive: this wait.  The exit watch ends it within ~0.1 s of the
++        // process dying (bl_wait) and the wait gives up after 60 s, so card 1 never sums a stale region; it marks prompt reading on that card
+         // dead (later chunks lend) and its caller computes this layer's picks itself.  Loud, once per failure.
+         err = why;
+         pf_dead_ = true;
+@@ -342,8 +344,8 @@ bool RemoteExperts::prefill_end(uint16_t* sums16, std::string& err) {
+     while (true) {
+         if (pf_seq_ != 0) {
+             const auto t0 = std::chrono::steady_clock::now();
+-            while (!seabraid::Channel::wait([&] { return bl_->pf_answered(pf_seq_); }, 0.5)) {
+-                if (pid > 0 && ::kill(pid, 0) != 0 && errno == ESRCH)
++            while (!bl_wait([&] { return bl_->pf_answered(pf_seq_); }, 0.5)) {
++                if (seabraid_closed() != 0)
+                     return fail("the expert process (pid " + std::to_string(pid) + ") died");
+                 if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60)) return fail("no answer within 60 s");
+             }
+diff --git a/tests/core/lost_rows_test.cpp b/tests/core/lost_rows_test.cpp
+new file mode 100644
+index 0000000..bee3b06
+--- /dev/null
++++ b/tests/core/lost_rows_test.cpp
+@@ -0,0 +1,64 @@
++// lost_rows_test (L10): the pure plan for the rows a lost expert helper owed (include/strata/core/lost_rows.hpp).  No pool, no
++// source, no GPU: which expert runs over which token rows, the MAXT split, and which tokens then need an activation.
++#include <cstdio>
++#include <vector>
++
++#include "strata/core/lost_rows.hpp"
++
++using strata::core::LostRowsPlan;
++using strata::core::plan_lost_rows;
++
++static int g_fail = 0;
++#define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); ++g_fail; } } while (0)
++
++int main() {
++    constexpr int K = 4, NE = 16;
++    LostRowsPlan p;
++    // ---- grouping: 3 tokens, the helper owned experts 5 and 9; first-seen order, ascending entries, one job per expert
++    {
++        const int32_t ids[3 * K] = {1, 5, 2, 9,    5, 3, 9, 4,    6, 7, 8, 5};
++        std::vector<uint8_t> lost(3 * K, 0);
++        for (int i = 0; i < 3 * K; ++i) lost[(size_t) i] = ids[i] == 5 || ids[i] == 9;
++        plan_lost_rows(ids, lost.data(), 3, K, NE, 16, p);
++        CHECK(p.jobs.size() == 2);
++        CHECK(p.jobs[0].expert == 5 && p.jobs[0].entries == (std::vector<int32_t>{1, 4, 11}));
++        CHECK(p.jobs[1].expert == 9 && p.jobs[1].entries == (std::vector<int32_t>{3, 6}));
++        // ---- the token set: every token here has a lost pick
++        CHECK(p.need_act == (std::vector<uint8_t>{1, 1, 1}));
++    }
++    // ---- the token set is only the tokens with a lost pick
++    {
++        const int32_t ids[3 * K] = {1, 2, 3, 4,    5, 6, 7, 8,    9, 10, 11, 12};
++        std::vector<uint8_t> lost(3 * K, 0);
++        lost[(size_t) (1 * K + 2)] = 1;   // token 1, slot 2 (expert 7)
++        plan_lost_rows(ids, lost.data(), 3, K, NE, 16, p);
++        CHECK(p.jobs.size() == 1 && p.jobs[0].expert == 7 && p.jobs[0].entries == (std::vector<int32_t>{6}));
++        CHECK(p.need_act == (std::vector<uint8_t>{0, 1, 0}));
++    }
++    // ---- the MAXT split: 17 tokens all routing expert 3 in slot 0 -> a job of 16 and a job of 1 over the same expert
++    {
++        constexpr int T = 17;
++        std::vector<int32_t> ids((size_t) T * K);
++        std::vector<uint8_t> lost((size_t) T * K, 0);
++        for (int t = 0; t < T; ++t) { for (int j = 0; j < K; ++j) ids[(size_t) (t * K + j)] = 10 + j; ids[(size_t) (t * K)] = 3; lost[(size_t) (t * K)] = 1; }
++        plan_lost_rows(ids.data(), lost.data(), T, K, NE, 16, p);
++        CHECK(p.jobs.size() == 2);
++        CHECK(p.jobs[0].expert == 3 && p.jobs[0].entries.size() == 16 && p.jobs[1].expert == 3 && p.jobs[1].entries.size() == 1);
++        CHECK(p.jobs[1].entries[0] == 16 * K);
++        // and a smaller max_t splits at that width
++        plan_lost_rows(ids.data(), lost.data(), T, K, NE, 8, p);
++        CHECK(p.jobs.size() == 3 && p.jobs[0].entries.size() == 8 && p.jobs[1].entries.size() == 8 && p.jobs[2].entries.size() == 1);
++    }
++    // ---- nothing lost -> nothing planned; an out-of-range id is skipped, not indexed
++    {
++        const int32_t ids[K] = {1, 2, 99, -1};
++        std::vector<uint8_t> none(K, 0), all(K, 1);
++        plan_lost_rows(ids, none.data(), 1, K, NE, 16, p);
++        CHECK(p.jobs.empty() && p.need_act == (std::vector<uint8_t>{0}));
++        plan_lost_rows(ids, all.data(), 1, K, NE, 16, p);
++        CHECK(p.jobs.size() == 2 && p.jobs[0].expert == 1 && p.jobs[1].expert == 2);
++    }
++    if (g_fail == 0) { std::printf("ALL OK\n"); return 0; }
++    std::printf("FAILED: %d\n", g_fail);
++    return 1;
++}
+diff --git a/tests/core/remote_experts_seabraid_opt_test.cpp b/tests/core/remote_experts_seabraid_opt_test.cpp
+index fdfc782..b80db8a 100644
+--- a/tests/core/remote_experts_seabraid_opt_test.cpp
++++ b/tests/core/remote_experts_seabraid_opt_test.cpp
+@@ -4,14 +4,15 @@
+ //
+ // What it pins: main writes the router weight of every helper-owned pick into the channel `weights` region and asks for
+ // kOutPerToken; the helper's n_tok weighted rows land in h_sum_ exactly as an in-process remote's would, with h_mask_ set
+-// for the helper's picks only; a helper that answers per-pick, or with the wrong row count, is an ERROR; without an active
+-// RemoteExpertOpt the request is the old per-pick one, and a wrong row count there is an ERROR too.
++// for the helper's picks only; a helper that answers per-pick, or with the wrong row count, is a LOSS (D6: card closed, code 5, rows handed back); without an active
++// RemoteExpertOpt the request is the old per-pick one, and a wrong row count there is a loss too.
+ #include <algorithm>
+ #include <atomic>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <limits>
+ #include <memory>
+ #include <string>
+ #include <thread>
+@@ -19,6 +20,7 @@
+ #include <vector>
+ 
+ #include "strata/seabraid/channel.hpp"
++#include "strata/seabraid/peer_watch.hpp"
+ #include "strata/core/expert_cache.hpp"
+ #include "strata/core/expert_source.hpp"
+ #include "strata/core/remote_expert_opt.hpp"
+@@ -35,7 +37,7 @@ static int g_fail = 0;
+ #define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); ++g_fail; } } while (0)
+ 
+ constexpr int H = strata::kernels::cpu::H, K = 10, MAXT = strata::kernels::kWindowMaxT, NL = 3, NE = 16, LAYER = 1;
+-enum Mode { kNormal, kAnswerPerPick, kWrongRows };
++enum Mode { kNormal, kAnswerPerPick, kWrongRows, kBadFloat, kForeignFloat };
+ 
+ // The fake helper's expert: expert e on activation x gives (e + 1) * x.  Known, so every merged value is predictable.
+ static float expert_val(int e, float xj) { return (float) (e + 1) * xj; }
+@@ -61,6 +63,7 @@ struct Fixture {
+         }
+         ch.header()->free_gib = 8.0;
+         std::strcpy(ch.header()->helper_name, "fake-helper");
++        bl::announce_identity(*ch.header());   // wire v10: pid + start time before kHelperUp (the engine binds its exit watch to them)
+         ch.header()->state.store(bl::kHelperUp, std::memory_order_release);
+         th = std::thread([this] { serve(); });
+         setenv("SEABRAID_STRATA_SHM", name.c_str(), 1);
+@@ -111,6 +114,10 @@ struct Fixture {
+                     for (int j = 0; j < H; ++j) out[(size_t) p * H + j] = expert_val(e, ch.x()[(p / K) * H + j]);
+                 }
+             }
++            // Row 0 and pick 2 belong to this helper; pick 1 belongs to the primary.
++            if (mode == kBadFloat) out[(per_token ? T - 1 : 2) * H + H - 1] = per_token
++                ? std::numeric_limits<float>::quiet_NaN() : std::numeric_limits<float>::infinity();
++            if (mode == kForeignFloat) out[H] = -std::numeric_limits<float>::infinity();
+             hd->ok = 1;
+             // A dishonest echo is how the mismatch tests make the helper misbehave.
+             hd->out_mode = mode == kAnswerPerPick ? bl::kOutPerPick : (per_token ? bl::kOutPerToken : bl::kOutPerPick);
+@@ -146,7 +153,24 @@ static double rel_err(const float* a, const std::vector<double>& ref) {
+     return worst;
+ }
+ 
++static void check_nonfinite(bool weighted) {
++    Fixture f(weighted ? "nan" : "inf", weighted);
++    Window win(3);
++    f.mode = kBadFloat;
++    if (weighted) f.opt->begin(win.w.data(), 0, win.T);
++    std::string err;
++    CHECK(f.re.begin(LAYER, win.x.data(), win.ids.data(), win.T, K, nullptr, nullptr, err));
++    std::vector<float> rows((size_t) win.T * K * H, -7.0f);
++    CHECK(f.re.finish(rows.data(), err));
++    CHECK(f.re.rows_lost() && f.re.seabraid_closed() == 5);
++    CHECK(std::all_of(rows.begin(), rows.end(), [](float v) { return v == -7.0f; }));
++    CHECK(std::all_of(f.sum_mem.begin(), f.sum_mem.end(), [](float v) { return v == 0.0f; }));
++    if (weighted) f.opt->end();
++}
++
+ int main() {
++    check_nonfinite(true);
++    check_nonfinite(false);
+     const int TB = 2, T = 3;   // a window of 3 tokens that starts at token 2 of the verify batch (token_begin != 0)
+     // ---- 1. per-token round trip with a token_begin offset
+     {
+@@ -181,7 +205,7 @@ int main() {
+         CHECK(mask_ok);
+         CHECK(rows[0] == -7.0f);   // the per-pick destination is untouched in per-token mode
+     }
+-    // ---- 2. the helper reports the wrong row count: an error, not partial data
++    // ---- 2. the helper reports the wrong row count: a loss (closed, rows returned), not partial data
+     {
+         Fixture f("b", true);
+         Window win(T);
+@@ -190,14 +214,15 @@ int main() {
+         std::string err;
+         CHECK(f.re.begin(LAYER, win.x.data(), win.ids.data(), T, K, nullptr, nullptr, err));
+         std::vector<float> rows((size_t) T * K * H);
+-        CHECK(!f.re.finish(rows.data(), err));
+-        CHECK(err.find("per-token request") != std::string::npos);
++        // D6: an unusable echo closes the card (code 5) and hands the rows back - finish() is true, the engine goes on
++        CHECK(f.re.finish(rows.data(), err));
++        CHECK(f.re.rows_lost() && f.re.seabraid_closed() == 5);
+         f.opt->end();
+         bool zero = true;   // nothing was accumulated
+         for (int i = 0; i < T * H; ++i) zero = zero && f.opt->sum_rows()[i] == 0.0f;
+         CHECK(zero);
+     }
+-    // ---- 3. the helper answers per-pick to a per-token request: an error
++    // ---- 3. the helper answers per-pick to a per-token request: a loss
+     {
+         Fixture f("c", true);
+         Window win(T);
+@@ -206,8 +231,8 @@ int main() {
+         std::string err;
+         CHECK(f.re.begin(LAYER, win.x.data(), win.ids.data(), T, K, nullptr, nullptr, err));
+         std::vector<float> rows((size_t) T * K * H);
+-        CHECK(!f.re.finish(rows.data(), err));
+-        CHECK(err.find("out_mode") != std::string::npos);
++        CHECK(f.re.finish(rows.data(), err));   // D6, as above: the wrong-shaped answer is a loss, never accumulated
++        CHECK(f.re.rows_lost() && f.re.seabraid_closed() == 5);
+         f.opt->end();
+         bool zero = true;   // and nothing was accumulated from the wrong-shaped rows
+         for (int i = 0; i < T * H; ++i) zero = zero && f.opt->sum_rows()[i] == 0.0f;
+@@ -233,6 +258,7 @@ int main() {
+     // ---- 5. no RemoteExpertOpt at all (today's engine): per-pick, unchanged
+     {
+         Fixture f("e", false);
++        f.mode = kForeignFloat;   // only the helper-owned rows have defined values
+         Window win(T);
+         std::string err;
+         CHECK(f.re.begin(LAYER, win.x.data(), win.ids.data(), T, K, nullptr, nullptr, err));
+@@ -241,7 +267,7 @@ int main() {
+         CHECK(f.last_req_mode.load() == (int) bl::kOutPerPick);
+         CHECK(rows[0] == (Window::held(win.ids[0]) ? expert_val(win.ids[0], win.x[0]) : -7.0f));
+     }
+-    // ---- 6. per-pick request, wrong row count echoed: an ERROR, and the per-pick destination is left untouched
++    // ---- 6. per-pick request, wrong row count echoed: a loss, and the per-pick destination is left untouched
+     {
+         Fixture f("g", false);
+         f.mode = kWrongRows;
+@@ -249,8 +275,8 @@ int main() {
+         std::string err;
+         CHECK(f.re.begin(LAYER, win.x.data(), win.ids.data(), T, K, nullptr, nullptr, err));
+         std::vector<float> rows((size_t) T * K * H, -7.0f);
+-        CHECK(!f.re.finish(rows.data(), err));
+-        CHECK(err.find("per-pick request") != std::string::npos);
++        CHECK(f.re.finish(rows.data(), err));   // D6: a wrong row count is a loss (code 5), the destination stays untouched
++        CHECK(f.re.rows_lost() && f.re.seabraid_closed() == 5);
+         bool untouched = true;
+         for (const float v : rows) untouched = untouched && v == -7.0f;
+         CHECK(untouched);
+diff --git a/tests/core/remote_prefill_test.cpp b/tests/core/remote_prefill_test.cpp
+index d3f7bfd..7fad847 100644
+--- a/tests/core/remote_prefill_test.cpp
++++ b/tests/core/remote_prefill_test.cpp
+@@ -26,6 +26,7 @@
+ 
+ #include "strata/seabraid/channel.hpp"
+ #include "strata/seabraid/prefill_wire.hpp"
++#include "strata/seabraid/peer_watch.hpp"
+ #include "strata/core/expert_cache.hpp"
+ #include "strata/core/expert_source.hpp"
+ #include "strata/core/remote_experts.hpp"
+@@ -105,7 +106,7 @@ struct Fixture {
+         if (!ch.create(name, H, (int64_t) MAXT * K, NL, NE, (uint32_t) MAXT, (int64_t) strata::kernels::cpu::expert_layout().max_blob, e,
+                        pf_tokens, pf_k)) { std::printf("create failed: %s\n", e.c_str()); std::exit(2); }
+         ch.header()->free_gib = 8.0;
+-        ch.header()->helper_pid = (int32_t) getpid();   // alive: card 1's liveness checks run and pass
++        bl::announce_identity(*ch.header());   // pid + start time, BEFORE kHelperUp: the engine binds its exit watch to them (wire v10)
+         std::strcpy(ch.header()->helper_name, "fake-expert-process");
+         ch.header()->state.store(bl::kHelperUp, std::memory_order_release);
+         th = std::thread([this] { serve(); });
+diff --git a/tests/core/seabraid_helper_loss_test.cpp b/tests/core/seabraid_helper_loss_test.cpp
+new file mode 100644
+index 0000000..4f96a44
+--- /dev/null
++++ b/tests/core/seabraid_helper_loss_test.cpp
+@@ -0,0 +1,341 @@
++// seabraid_helper_loss_test (L1-L9): a helper PROCESS that exits, goes mute or answers wrongly closes its card instead of
++// ending the engine, and a stale or recycled helper identity opens as a closed card (HL-FIX design, Piece B).
++//
++// REAL helpers: each card's helper is a forked child that runs the fake-helper serve loop on a real POSIX shm channel and dies
++// by raise(SIGKILL) when told to (a command word in anonymous shared memory).  The parent NEVER signals a pid: a test that
++// did would be a kill-by-number site of its own.  CPU only: no GPU is touched.
++// Lines tagged NEWAPI are the ones that need the HL-FIX API; the failure-first recipe removes exactly those with a sed and
++// runs the rest against the old engine, where every scenario times out or fails its timing check.
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <csignal>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fcntl.h>
++#include <memory>
++#include <string>
++#include <sys/mman.h>
++#include <sys/wait.h>
++#include <unistd.h>
++#include <vector>
++
++#include "strata/seabraid/channel.hpp"
++#include "strata/seabraid/peer_watch.hpp"   // NEWAPI
++#include "strata/core/expert_cache.hpp"
++#include "strata/core/expert_source.hpp"
++#include "strata/core/remote_experts.hpp"
++#include "strata/kernels/cpu/expert.hpp"
++#include "strata/kernels/cpu/expert_layout.hpp"
++#include "strata/kernels/window_limits.hpp"
++
++namespace bl = seabraid;
++using strata::core::RemoteExperts;
++
++static int g_fail = 0;
++#define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); ++g_fail; } } while (0)
++
++constexpr int H = strata::kernels::cpu::H, K = 10, MAXT = strata::kernels::kWindowMaxT, NL = 3, NE = 16, LAYER = 1;
++constexpr int64_t PF_TOK = 8;
++enum Cmd : int { kRun = 0, kDieIdle, kDieOnRequest, kMute, kDieOnBlob, kDieOnPrefill };
++struct Ctl { std::atomic<int> cmd; };   // lives in MAP_SHARED anonymous memory: the parent talks to the child through it
++
++static double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
++static float expert_val(int e, float xj) { return (float) (e + 1) * xj; }
++
++// The child: the fake helper of remote_experts_seabraid_opt_test (per-pick answers) plus the ways to die.  Never returns.
++[[noreturn]] static void child_main(bl::Channel& ch, Ctl* ctl, int announce_delay_ms, bool announce, bool exit_after_announce) {
++    bl::Header* hd = ch.header();
++    if (announce_delay_ms > 0) usleep((useconds_t) announce_delay_ms * 1000);
++    hd->free_gib = 8.0;
++    std::strcpy(hd->helper_name, "fake-helper");
++    if (announce) {
++        bl::announce_identity(*hd);   // NEWAPI: pid + start time BEFORE kHelperUp
++        hd->state.store(bl::kHelperUp, std::memory_order_release);
++    }
++    if (exit_after_announce) _exit(0);
++    while (hd->state.load(std::memory_order_acquire) != bl::kPlanReady) {
++        if (hd->state.load() == bl::kShutdown) _exit(0);
++        usleep(200);
++    }
++    for (int64_t i = 0; i < hd->plan_count; ++i) ch.held()[(size_t) ch.plan()[2 * i] * NE + (size_t) ch.plan()[2 * i + 1]] = 1;
++    hd->resident = hd->plan_count; hd->gib = 0.1;
++    hd->resp_seq.store(hd->req_seq.load(), std::memory_order_release);
++    hd->state.store(bl::kLoaded, std::memory_order_release);
++    uint64_t seen = hd->req_seq.load(), blob_seen = hd->blob_req_seq.load(), pf_done = 0;
++    while (hd->state.load(std::memory_order_acquire) != bl::kShutdown) {
++        const int cmd = ctl->cmd.load();
++        if (cmd == kDieIdle) raise(SIGKILL);
++        if (hd->blob_req_seq.load(std::memory_order_acquire) != blob_seen) {
++            if (cmd == kDieOnBlob) raise(SIGKILL);
++            blob_seen = hd->blob_req_seq.load();
++            hd->blob_ok = 1;
++            for (int i = 0; i < hd->blob_n; ++i) hd->blob_hit[i] = 0;
++            hd->blob_resp_seq.store(blob_seen, std::memory_order_release);
++        }
++        if (ch.pf_pending() != 0 && ch.pf_pending() != pf_done) {
++            if (cmd == kDieOnPrefill) raise(SIGKILL);
++            pf_done = ch.pf_pending();
++        }
++        if (hd->req_seq.load(std::memory_order_acquire) == seen) { usleep(50); continue; }
++        seen = hd->req_seq.load(std::memory_order_acquire);
++        if (cmd == kDieOnRequest) raise(SIGKILL);   // dies holding the request: no answer will ever come
++        if (cmd == kMute) continue;                 // alive, never answers
++        const int T = (int) hd->n_tok;
++        float* out = ch.out();
++        for (int p = 0; p < T * K; ++p) {
++            const int e = ch.ids()[p];
++            if (e < 0) continue;
++            for (int j = 0; j < H; ++j) out[(size_t) p * H + j] = expert_val(e, ch.x()[(p / K) * H + j]);
++        }
++        hd->ok = 1; hd->out_mode = bl::kOutPerPick; hd->out_rows = T * K;
++        hd->resp_seq.store(seen, std::memory_order_release);
++    }
++    _exit(0);
++}
++
++struct Opts { int announce_delay_ms = 0; bool announce = true, exit_after_announce = false, prefill = false; };
++
++// N cards, each with a channel made here and a forked helper.  Fork happens before any engine thread exists.
++struct Rig {
++    struct Card {
++        bl::Channel ch; pid_t pid = -1; Ctl* ctl = nullptr; RemoteExperts re;
++        strata::core::ExpertCache primary; strata::core::FileExpertSource src;
++    };
++    std::vector<std::unique_ptr<Card>> cards;
++    std::vector<uint8_t> claimed = std::vector<uint8_t>((size_t) NL * NE, 0);
++    std::string err;
++
++    Rig(int n, const char* tag, Opts o = {}) {
++        std::string list;
++        for (int c = 0; c < n; ++c) {
++            auto cd = std::make_unique<Card>();
++            const std::string name = "/hlt" + std::to_string(getpid()) + tag + std::to_string(c);
++            std::string e;
++            if (!cd->ch.create(name, H, (int64_t) MAXT * K, NL, NE, (uint32_t) MAXT, (int64_t) strata::kernels::cpu::expert_layout().max_blob, e,
++                               o.prefill ? PF_TOK : 0, o.prefill ? K : 0)) { std::printf("create failed: %s\n", e.c_str()); std::exit(2); }
++            cd->ctl = (Ctl*) mmap(nullptr, sizeof(Ctl), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++            cd->ctl->cmd = kRun;
++            cd->pid = fork();
++            if (cd->pid == 0) child_main(cd->ch, cd->ctl, o.announce_delay_ms, o.announce, o.exit_after_announce);
++            list += (c ? "," : "") + name;
++            cards.push_back(std::move(cd));
++        }
++        setenv("SEABRAID_STRATA_SHM", list.c_str(), 1);
++    }
++    ~Rig() {
++        for (auto& c : cards) { c->re.close(); c->ch.header()->state.store(bl::kShutdown, std::memory_order_release); }
++        for (auto& c : cards) { if (c->pid > 0) waitpid(c->pid, nullptr, 0); munmap(c->ctl, sizeof(Ctl)); }
++    }
++    void reap(int c) { waitpid(cards[(size_t) c]->pid, nullptr, 0); cards[(size_t) c]->pid = -1; }   // the child is gone; its identity stays in the channel
++    bool wait_state(int c, uint32_t s) { for (int i = 0; i < 4000; ++i) { if (cards[(size_t) c]->ch.header()->state.load() == s) return true; usleep(1000); } return false; }
++    bool open(int c, std::vector<int> experts) {
++        std::vector<std::pair<int32_t, int32_t>> ranked;
++        for (int e : experts) ranked.emplace_back(LAYER, e);
++        Card& cd = *cards[(size_t) c];
++        return cd.re.open(bl::kDeviceBase + c, 5, NL, NE, ranked, cd.primary, cd.src, claimed, err, false);
++    }
++    RemoteExperts& re(int c) { return cards[(size_t) c]->re; }
++    void say(int c, Cmd cmd) { cards[(size_t) c]->ctl->cmd = cmd; }
++};
++
++struct Window {   // T tokens whose picks include experts 2 3 5 (card 0) and 7 9 (card 1) and some nobody holds
++    int T; std::vector<float> x; std::vector<int32_t> ids;
++    explicit Window(int t) : T(t), x((size_t) t * H), ids((size_t) t * K) {
++        for (size_t i = 0; i < x.size(); ++i) x[i] = 0.25f + (float) (i % 5) * 0.5f;
++        const int pool[K] = {2, 11, 3, 5, 12, 7, 9, 13, 14, 15};
++        for (int tk = 0; tk < t; ++tk) for (int i = 0; i < K; ++i) ids[(size_t) (tk * K + i)] = pool[(i + tk) % K];
++    }
++};
++
++static int owned_count(RemoteExperts& re, int n) { int c = 0; for (int i = 0; i < n; ++i) c += re.owns(i) ? 1 : 0; return c; }
++
++// Redirects stderr to a file for the life of the object: the WARN lines are part of the contract.
++struct Capture {
++    int saved, fd; char path[64] = "/tmp/hltXXXXXX";
++    Capture() { fflush(stderr); saved = dup(2); fd = mkstemp(path); dup2(fd, 2); }
++    std::string finish() {
++        fflush(stderr); dup2(saved, 2); close(saved);
++        std::string s; char b[4096]; ssize_t n; lseek(fd, 0, SEEK_SET);
++        while ((n = read(fd, b, sizeof b)) > 0) s.append(b, (size_t) n);
++        close(fd); unlink(path); return s;
++    }
++};
++static int count_of(const std::string& s, const char* needle) { int n = 0; for (size_t p = s.find(needle); p != std::string::npos; p = s.find(needle, p + 1)) ++n; return n; }
++
++// `seabraid_helper_loss_test L3` runs one scenario (the failure-first recipe runs them one by one: each old-engine hang is its own 30 s).
++int main(int argc, char** argv) {
++    auto want = [&](const char* name) { return argc < 2 || std::strcmp(argv[1], name) == 0; };
++    const Window win(4);
++    // ---- L1: the helper dies holding a layer request.  finish() is TRUE within 2 s, the rows are handed back, the card is
++    //      closed (3), and the next layer's begin owns nothing.  (Before: false after 30 s, then the engine exited with code 1.)
++    if (want("L1")) {
++        alarm(20);
++        Rig r(1, "a");
++        CHECK(r.open(0, {2, 3, 5, 7, 9}));
++        r.say(0, kDieOnRequest);
++        std::string err;
++        CHECK(r.re(0).begin(LAYER, win.x.data(), win.ids.data(), win.T, K, nullptr, nullptr, err));
++        CHECK(owned_count(r.re(0), win.T * K) > 0);
++        std::vector<float> rows((size_t) win.T * K * H, -7.0f);
++        const double t0 = now_s();
++        CHECK(r.re(0).finish(rows.data(), err));
++        CHECK(now_s() - t0 < 2.0);
++        CHECK(r.re(0).rows_lost());   // NEWAPI
++        CHECK(r.re(0).seabraid_closed() == 3);
++        CHECK(rows[0] == -7.0f);      // nothing the helper half-wrote reached the caller's rows
++        CHECK(r.re(0).begin(LAYER, win.x.data(), win.ids.data(), win.T, K, nullptr, nullptr, err));
++        CHECK(owned_count(r.re(0), win.T * K) == 0);
++        CHECK(!r.re(0).rows_lost());  // NEWAPI
++        alarm(0);
++    }
++    // ---- L2: the helper dies while IDLE.  The card reads closed within 2 s with no request ever made.  (Before: stays 0.)
++    if (want("L2")) {
++        alarm(20);
++        Rig r(1, "b");
++        CHECK(r.open(0, {2, 3, 5, 7, 9}));
++        CHECK(r.re(0).seabraid_closed() == 0);
++        const double t0 = now_s();
++        r.say(0, kDieIdle);
++        while (r.re(0).seabraid_closed() == 0 && now_s() - t0 < 4.0) usleep(10000);
++        CHECK(now_s() - t0 < 2.0);
++        CHECK(r.re(0).seabraid_closed() == 3);
++        std::string err;
++        CHECK(r.re(0).begin(LAYER, win.x.data(), win.ids.data(), win.T, K, nullptr, nullptr, err));
++        CHECK(owned_count(r.re(0), win.T * K) == 0 && !r.re(0).holds(LAYER, 2));
++        alarm(0);
++    }
++    // ---- L3: a mute helper (alive, never answers) and a 1 s deadline: finish() is true, closed (4), rows lost.
++    if (want("L3")) {
++        alarm(20);
++        Rig r(1, "c");
++        CHECK(r.open(0, {2, 3, 5, 7, 9}));
++        r.re(0).set_seabraid_deadline_for_test(1.0);   // NEWAPI
++        r.say(0, kMute);
++        std::string err;
++        CHECK(r.re(0).begin(LAYER, win.x.data(), win.ids.data(), win.T, K, nullptr, nullptr, err));
++        std::vector<float> rows((size_t) win.T * K * H, -7.0f);
++        const double t0 = now_s();
++        CHECK(r.re(0).finish(rows.data(), err));
++        CHECK(now_s() - t0 < 3.0);
++        CHECK(r.re(0).seabraid_closed() == 4);
++        CHECK(r.re(0).rows_lost());   // NEWAPI
++        alarm(0);
++    }
++    // ---- L4: a STALE channel (its helper already exited and was reaped) opens as a closed card with ONE warning: open()
++    //      is true within 1 s (code 6), holds nothing, publishes no plan.  (Before: it waited 1800 s for a load.)
++    if (want("L4")) {
++        alarm(10);
++        Opts o; o.exit_after_announce = true;
++        Rig r(1, "d", o);
++        r.wait_state(0, bl::kHelperUp);
++        r.reap(0);
++        Capture cap;
++        const double t0 = now_s();
++        const bool ok = r.open(0, {2, 3, 5});
++        const std::string log = cap.finish();
++        CHECK(ok);
++        CHECK(now_s() - t0 < 1.0);
++        CHECK(r.re(0).seabraid_closed() == 6);
++        CHECK(!r.re(0).holds(LAYER, 2) && r.re(0).resident() == 0);
++        CHECK(r.cards[0]->ch.header()->state.load() != bl::kPlanReady);   // nothing was published
++        CHECK(count_of(log, "is gone") == 1);
++        alarm(0);
++    }
++    // ---- L5: a LIVE pid whose start time does not match the published identity (a recycled pid): closed at open.
++    if (want("L5")) {
++        alarm(10);
++        Rig r(1, "e");
++        r.wait_state(0, bl::kHelperUp);
++        r.cards[0]->ch.header()->helper_start ^= 0x5555;   // the pid is alive and is not the process the channel named
++        Capture cap;
++        const bool ok = r.open(0, {2, 3, 5});
++        const std::string log = cap.finish();
++        CHECK(ok);
++        CHECK(r.re(0).seabraid_closed() == 6);
++        CHECK(count_of(log, "pid reused") == 1);
++        alarm(0);
++    }
++    // ---- L6: two cards, two successive losses: card 1 dies mid-request, then card 0 dies idle; both end closed and the
++    //      next layer is all fallback.  Card 0 serves its own picks normally in between.
++    if (want("L6")) {
++        alarm(30);
++        Rig r(2, "f");
++        CHECK(r.open(0, {2, 3, 5}));
++        CHECK(r.open(1, {7, 9}));
++        r.say(1, kDieOnRequest);
++        std::string err;
++        CHECK(r.re(0).begin(LAYER, win.x.data(), win.ids.data(), win.T, K, nullptr, nullptr, err));
++        CHECK(r.re(1).begin(LAYER, win.x.data(), win.ids.data(), win.T, K, nullptr, nullptr, err));
++        std::vector<float> rows0((size_t) win.T * K * H, -7.0f), rows1((size_t) win.T * K * H, -7.0f);
++        double t0 = now_s();
++        CHECK(r.re(0).finish(rows0.data(), err));
++        CHECK(!r.re(0).rows_lost() && r.re(0).seabraid_closed() == 0);   // NEWAPI (rows_lost)
++        CHECK(r.re(1).finish(rows1.data(), err));
++        CHECK(now_s() - t0 < 2.0);
++        CHECK(r.re(1).rows_lost() && r.re(1).seabraid_closed() == 3);    // NEWAPI
++        r.say(0, kDieIdle);
++        t0 = now_s();
++        while (r.re(0).seabraid_closed() == 0 && now_s() - t0 < 4.0) usleep(10000);
++        CHECK(now_s() - t0 < 2.0 && r.re(0).seabraid_closed() == 3);
++        CHECK(r.re(0).begin(LAYER, win.x.data(), win.ids.data(), win.T, K, nullptr, nullptr, err));
++        CHECK(r.re(1).begin(LAYER, win.x.data(), win.ids.data(), win.T, K, nullptr, nullptr, err));
++        CHECK(owned_count(r.re(0), win.T * K) == 0 && owned_count(r.re(1), win.T * K) == 0);
++        alarm(0);
++    }
++    // ---- L7: copy_cached_blobs against a helper that dies on the cache read: true, all misses, closed (3).  (Before: false after 30 s.)
++    if (want("L7")) {
++        alarm(20);
++        Rig r(1, "g");
++        CHECK(r.open(0, {2, 3, 5, 7, 9}));
++        r.say(0, kDieOnBlob);
++        const int32_t layer = LAYER, expert = 2;
++        std::vector<uint8_t> buf((size_t) strata::kernels::cpu::expert_layout().max_blob);
++        uint8_t* dst = buf.data();
++        uint8_t hit = 1;
++        std::string err;
++        const double t0 = now_s();
++        CHECK(r.re(0).copy_cached_blobs(&layer, &expert, &dst, 1, &hit, err));
++        CHECK(now_s() - t0 < 2.5);
++        CHECK(hit == 0);
++        CHECK(r.re(0).seabraid_closed() == 3);
++        alarm(0);
++    }
++    // ---- L8: the channel is visible (kNone) one second BEFORE the helper's identity and kHelperUp: open() waits, then succeeds.
++    if (want("L8")) {
++        alarm(20);
++        Opts o; o.announce_delay_ms = 1000;
++        Rig r(1, "h", o);
++        const double t0 = now_s();
++        CHECK(r.open(0, {2, 3, 5, 7, 9}));
++        CHECK(now_s() - t0 >= 0.9);
++        CHECK(r.re(0).seabraid_closed() == 0 && r.re(0).holds(LAYER, 2));
++        alarm(0);
++    }
++    // ---- L9: D4 prefill_end with a helper that dies on the prefill request: false within 1 s, through the watch, never a 60 s wait.
++    if (want("L9")) {
++        alarm(20);
++        Opts o; o.prefill = true;
++        Rig r(1, "i", o);
++        CHECK(r.open(0, {2, 3, 5, 7, 9}));
++        std::string err;
++        CHECK(r.re(0).prefill_open(K, err));
++        const int T = 4;
++        std::vector<uint16_t> x16((size_t) T * H, 0x3C00);   // fp16 1.0
++        std::vector<float> w((size_t) T * K, 0.1f);
++        std::vector<uint8_t> mask(NE, 0);
++        for (int e = 0; e < NE; ++e) mask[(size_t) e] = r.re(0).holds(LAYER, e) ? 1 : 0;
++        r.say(0, kDieOnPrefill);
++        CHECK(r.re(0).prefill_begin(LAYER, x16.data(), bl::kPfRowsF16, w.data(), win.ids.data(), T, K, mask.data(), err));
++        std::vector<uint16_t> sums((size_t) T * H);
++        const double t0 = now_s();
++        CHECK(!r.re(0).prefill_end(sums.data(), err));
++        CHECK(now_s() - t0 < 1.0);
++        CHECK(!r.re(0).prefill_usable());
++        alarm(0);
++    }
++    if (g_fail == 0) { std::printf("ALL OK\n"); return 0; }
++    std::printf("FAILED: %d\n", g_fail);
++    return 1;
++}

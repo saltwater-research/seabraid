@@ -1,0 +1,55 @@
+{
+ "exe": "/path/to/seabraid/build-hip/strata",
+ "args": [
+  "--pack",
+  "/path/to/strata-data/packs/iq2_xs",
+  "--native",
+  "/path/to/strata-data/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+  "--ple-gguf",
+  "/path/to/strata-data/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf",
+  "--expert-profile",
+  "/path/to/strata/data/expert-profile.bin",
+  "--expert-cache",
+  "auto",
+  "--prefill",
+  "auto",
+  "--max-context",
+  "131072",
+  "--kv",
+  "int8",
+  "--resident-experts",
+  "--draft",
+  "dflash2",
+  "--draft-model",
+  "/path/to/strata-data/dflash2/qwen3.8-flash-next-dflash2.q4_0-selq4.pack",
+  "--draft-fallback",
+  "none",
+  "--mtp-draft-vocab",
+  "/path/to/strata-data/dflash2/draft_vocab.bin",
+  "--spec",
+  "6",
+  "--draft-conf",
+  "0.35",
+  "--expert-cache-device1",
+  "auto"
+ ],
+ "cwd": "/path/to/seabraid",
+ "tokenizer": "/path/to/strata-data/packs/iq2_xs/tokenizer",
+ "model_name": "qwen3.8-flash-next-iq2_xs",
+ "log": "/path/to/logs/both.log",
+ "lib_dirs": [
+  "/path/to/rocm/lib"
+ ],
+ "port": 8080,
+ "gpu": [
+  0
+ ],
+ "user_args": [
+  "--draft-conf",
+  "0.35"
+ ],
+ "env": {
+  "STRATA_ROUTE_TAIL_SKIP": "0",
+  "STRATA_VERIFY_QDEDUP": "1"
+ }
+}

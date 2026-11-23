@@ -1,0 +1,8 @@
+# CMake files whose cmake_minimum_required is LOWER than the root's (owner: checks/check_pins.py).  Format, TAB-separated:
+#   path<TAB>version<TAB>why (>= 20 chars).  The list only shrinks: raise the file to the root's floor and delete its row.
+# WHY these exist at all: nothing builds these files with CMake 3.16 (the cmake-floor CI job uses 3.22.6), so the 3.16 they
+# claim is untested; their owners (adapters, compat) raise them.  Recorded at R8 L4; the gate fails on any new one.
+adapters/ggml/CMakeLists.txt	3.16	R8 L4: claims 3.16, never built below 3.22; adapters owner raises it
+adapters/ggml/sdk_check/CMakeLists.txt	3.16	R8 L4: claims 3.16, built only by CI with the runner's CMake; adapters owner raises it
+adapters/strata/CMakeLists.txt	3.16	R8 L4: claims 3.16, never built below 3.22; adapters owner raises it
+compat/strata/tests/CMakeLists.txt	3.16	R8 L4: claims 3.16, never built below 3.22; compat owner raises it

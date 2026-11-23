@@ -1,0 +1,5 @@
+# Files check_names.py may skip.  Format: path-glob<TAB>why (why >= 10 characters; a glob matching no file is an error).
+# EMPTY ON PURPOSE: today no tracked file has to keep a retired name, and scripts/rename.py and tests/test_rename.py
+# (the only tools that name the old project) take it as an argument and never spell it.  Add a row only for a file that
+# must record the old name for lineage (for example the CHANGELOG line that says what the project was renamed from),
+# with that reason, and expect scripts/rename.py to need the same exemption (its SELF_EXEMPT set).

@@ -1,0 +1,7 @@
+# Copyright 2026 Saltwater Research LLC
+# SPDX-License-Identifier: Apache-2.0
+# Strata call sites that ask seabraid() (named-channel helper only) on purpose.  One row per site:
+# <fragment of the added line> | <why the private Seabraid helper must not take this branch>
+# Read by checks/check_helper_tier.py; a row that matches no call site fails, so remove it with its site.
+remote_experts[(size_t) r].seabraid()) { | helper_service() reads counters from the named channel's shared header; the private helper has no such header, so its stats line would print zeros
+if (r->seabraid()) d4_remote = r; | D4 needs the named channel's prompt region; the private helper has none, so the next line refuses D4 with an error

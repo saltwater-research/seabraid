@@ -1,0 +1,8 @@
+phase,source,n,mean_us,p50_us,p99_us,note
+helper submit->collect,helper 1,8,200.0,90,900,window summaries
+helper blocked in collect,helper 1,8,30.0,10,100,window summaries
+round (fence to publish),trace,2,6000.0,3000,9000,
+move stage,trace,3,750.0,150,2000,per swap
+move write,trace,3,383.3,350,500,per swap
+SSD wait (decode waited),engine log,2,10000.0,7500,12500,per request
+engine decode window,engine log,2,58000.0,55500,60500,ms/window x 1000

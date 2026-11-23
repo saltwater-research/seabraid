@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Seabraid <seabraid@example.invalid>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH 05/16] seabraid retier: helper publishes post-round residency;
+ main refuses a round whose held[] contradicts its applied ops
+
+held[] was written only at plan load, so after an applied SWAP main kept routing the displaced
+expert to a helper that skips experts it no longer holds (rows silently dropped), and re-proposed
+displacing it (21 of 47 rounds refused in the 2026-11-06 D7 arms).
+
+The include/strata/seabraid/channel.hpp (and expert_spec.hpp) half of this change lives in Seabraid's
+adapters/strata/wire, the wire's one owner; this patch keeps only the engine side.
+---
+ src/core/remote_experts.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/core/remote_experts.cpp b/src/core/remote_experts.cpp
+index 50c3a7c58..89bd22dae 100644
+--- a/src/core/remote_experts.cpp
++++ b/src/core/remote_experts.cpp
+@@ -716,6 +716,19 @@ bool RemoteExperts::seabraid_retier(const seabraid::TierWireOp* ops, int32_t n,
+         }
+     }
+ 
++    // (4b) The bitmap just adopted must show what the round reported applied.  If it does not, the helper's held[]
++    // is stale and this engine is now routing experts to slots that no longer hold them -- say so loudly.
++    if (cells > 0 && bl_held_.size() == cells) {
++        uint8_t rr[seabraid::kTierMaxOps];
++        for (int32_t i = 0; i < n; ++i) rr[i] = i < got ? hd->tier_res[i] : (uint8_t) seabraid::kTierPending;
++        std::string why2;
++        if (!seabraid::tier_residency_consistent(bl_held_.data(), (int64_t) layers_present_.size(), n_expert_, ops, rr, n, why2)) {
++            bl_->bump_epoch();
++            err = "seabraid retier: helper residency is STALE after an applied round (" + why2 + ")";
++            return false;
++        }
++    }
++
+     // (5) Only now move the epoch.  It advertises a placement this engine has already adopted, so a request
+     // published after it cannot be describing the old one.
+     bl_->bump_epoch();

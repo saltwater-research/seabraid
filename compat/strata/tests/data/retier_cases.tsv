@@ -1,0 +1,73 @@
+# The engine's --retier* startup rules as cases.  ONE file, TWO readers: tests/retier_rules_case_test.cpp runs the engine's own
+# retier_parse_flag / retier_check / retier_check_helpers on each row; tests/install/test_retier_rules.py runs the installer's mirror
+# (install/_retier_rules.py) on the same rows.  Both must give exactly the error text below ("-" = accepted).
+# Columns, TAB separated:  name  helpers  args (space separated, flag order = engine order)  expected error
+# Absent --adapt-every / --adapt-swaps mean the engine's defaults (4 and 96); the rows that pass them use 64 and 8.
+# WHAT THIS FILE CANNOT SHOW: the C++ reader is a fixture, not the engine.  It calls retier_parse_flag / retier_check /
+# retier_check_helpers (the real code) but re-implements generate.cpp's parse loop around them: the "unknown argument: X" and
+# "<flag> needs a value" texts and the adapt defaults (4, 96) are a COPY of generate.cpp, so a row on those compares the mirror to the copy.
+# Arguments split on one space (no quoted spaces); the token '' is an empty argument.  Numbers assume the engine's Linux LP64 (long 64 bit).
+# Not covered at all: real startup (--serve, the model's cell count vs the routing counts, a live helper tier, STRATA_EXPERT_NIBBLE).
+off_default	1	-	-
+pyramid_ok	3	--retier on --retier-promote seabraid --retier-fallback 1 --retier-hops 4 --retier-moves 8 --adapt-every 64 --adapt-swaps 8	-
+last_value_wins	3	--retier on --retier-promote seabraid --retier-hops 4 --retier-moves 1 --retier-moves 8 --adapt-every 64 --adapt-swaps 8	-
+moves_below_two_hops	3	--retier on --retier-promote seabraid --retier-hops 4 --retier-moves 1 --adapt-every 64 --adapt-swaps 8	--retier-hops 4 needs --retier-moves >= 8 (a hop is a LOAD and an EVICT), got --retier-moves 1
+moves_default_with_hops	3	--retier on --retier-promote seabraid --retier-hops 3 --adapt-every 64 --adapt-swaps 8	--retier-hops 3 needs --retier-moves >= 6 (a hop is a LOAD and an EVICT), got --retier-moves 4
+moves_wraps_to_int	3	--retier on --retier-promote seabraid --retier-hops 2 --retier-moves 4294967297 --adapt-every 64 --adapt-swaps 8	--retier-hops 2 needs --retier-moves >= 4 (a hop is a LOAD and an EVICT), got --retier-moves 1
+moves_over_wire_cap	1	--retier on --retier-promote seabraid --retier-moves 65 --adapt-every 64 --adapt-swaps 8	--retier-moves must be 1..64
+moves_zero	1	--retier on --retier-promote seabraid --retier-moves 0 --adapt-every 64 --adapt-swaps 8	--retier-moves must be 1..64
+every_zero	1	--retier on --retier-promote seabraid --retier-every 0 --adapt-every 64 --adapt-swaps 8	--retier-every must be >= 1
+margin_below_one	1	--retier on --retier-promote seabraid --retier-margin 0.5 --adapt-every 64 --adapt-swaps 8	--retier-margin must be >= 1
+margin_unreadable	1	--retier on --retier-promote seabraid --retier-margin high --adapt-every 64 --adapt-swaps 8	--retier-margin: cannot read 'high'
+margin_infinite	1	--retier on --retier-promote seabraid --retier-margin inf --adapt-every 64 --adapt-swaps 8	--retier-margin: cannot read 'inf'
+cooldown_negative	1	--retier on --retier-promote seabraid --retier-cooldown -1 --adapt-every 64 --adapt-swaps 8	--retier-cooldown must be >= 0
+ceiling_above_one	1	--retier on --retier-promote seabraid --retier-ceiling 1.5 --adapt-every 64 --adapt-swaps 8	--retier-ceiling must be in [0, 1]
+ceiling_exponent_ok	1	--retier on --retier-promote seabraid --retier-ceiling 1e-1 --adapt-every 64 --adapt-swaps 8	-
+fallback_two	1	--retier on --retier-promote seabraid --retier-fallback 2 --adapt-every 64 --adapt-swaps 8	--retier-fallback must be 0 or 1
+fallback_huge_is_clamped	1	--retier on --retier-promote seabraid --retier-fallback 99999999999 --adapt-every 64 --adapt-swaps 8	--retier-fallback must be 0 or 1
+hops_zero	1	--retier on --retier-promote seabraid --retier-hops 0 --adapt-every 64 --adapt-swaps 8	--retier-hops must be 1..64
+hops_over_cap	1	--retier on --retier-promote seabraid --retier-hops 65 --retier-moves 64 --adapt-every 64 --adapt-swaps 8	--retier-hops must be 1..64
+fallback_without_seabraid	1	--retier on --retier-promote legacy --retier-fallback 1 --adapt-every 64 --adapt-swaps 8	--retier-fallback 1 and --retier-hops > 1 need --retier-promote seabraid (only its planner moves a cell between a card and the fallback, or climbs)
+file_moves_ok	2	--retier on --retier-promote seabraid --retier-file-moves 1 --adapt-every 64 --adapt-swaps 8	-
+file_moves_two	2	--retier on --retier-promote seabraid --retier-file-moves 2 --adapt-every 64 --adapt-swaps 8	--retier-file-moves must be 0 or 1
+file_moves_needs_seabraid	1	--retier on --retier-file-moves 1 --adapt-every 64 --adapt-swaps 8	--retier-file-moves 1 needs --retier-promote seabraid (only its swap can take an expert's bytes from the model file)
+promote_without_retier	1	--retier-promote seabraid	--retier-promote legacy|seabraid needs --retier on: it is a mode of the retier round
+promote_seabraid_zero_op	1	--retier zero-op --retier-promote seabraid --adapt-every 64 --adapt-swaps 8	--retier-promote seabraid needs --retier on (zero-op sends no ops)
+mode_unknown	1	--retier maybe	--retier: expected off, on or zero-op, got 'maybe'
+promote_unknown	1	--retier on --retier-promote both	--retier-promote: expected legacy, seabraid or off (on = legacy), got 'both'
+equals_promote_refused	3	--retier on --retier-promote=seabraid --adapt-every 64 --adapt-swaps 8	unknown argument: --retier-promote=seabraid
+equals_retier_refused	1	--retier=on --adapt-every 64 --adapt-swaps 8	unknown argument: --retier=on
+equals_moves_refused	1	--retier on --retier-promote seabraid --retier-moves=8 --adapt-every 64 --adapt-swaps 8	unknown argument: --retier-moves=8
+unknown_retier_flag	1	--retier-bogus 1	unknown argument: --retier-bogus
+moves_unreadable	1	--retier on --retier-promote seabraid --retier-moves 8x --adapt-every 64 --adapt-swaps 8	--retier-moves: cannot read '8x'
+ceiling_underflow_refused	1	--retier on --retier-promote seabraid --retier-ceiling 1e-999	--retier-ceiling: cannot read '1e-999'
+ceiling_hex_float_accepted	1	--retier on --retier-promote seabraid --retier-ceiling 0x1p-1	-
+ceiling_hex_float_out_of_range	1	--retier on --retier-promote seabraid --retier-ceiling 0x1p+1	--retier-ceiling must be in [0, 1]
+margin_overflow_refused	1	--retier on --retier-promote seabraid --retier-margin 1e999	--retier-margin: cannot read '1e999'
+moves_unicode_digit_refused	1	--retier on --retier-promote seabraid --retier-moves ٨	--retier-moves: cannot read '٨'
+moves_empty_value_refused	1	--retier on --retier-promote seabraid --retier-moves ''	--retier-moves: cannot read ''
+ceiling_empty_value_refused	1	--retier on --retier-promote seabraid --retier-ceiling ''	--retier-ceiling: cannot read ''
+mode_empty_value_refused	1	--retier ''	--retier: expected off, on or zero-op, got ''
+trailing_unknown_flag	1	--retier-bogus	unknown argument: --retier-bogus
+trailing_equals_flag	1	--retier=on	unknown argument: --retier=on
+trailing_valued_flag_needs_a_value	1	--retier-moves	--retier-moves needs a value
+trailing_mode_flag_needs_a_value	1	--retier	--retier needs a value
+trailing_adapt_flag_needs_a_value	1	--retier on --retier-promote seabraid --adapt-every	--adapt-every needs a value
+moves_long_max_refused_by_int_wrap	1	--retier on --retier-promote seabraid --retier-moves 9223372036854775807	--retier-moves must be 1..64
+moves_past_long_unreadable	1	--retier on --retier-promote seabraid --retier-moves 9223372036854775808	--retier-moves: cannot read '9223372036854775808'
+moves_long_min_unreadable_wraps_to_zero	1	--retier on --retier-promote seabraid --retier-moves -9223372036854775808	--retier-moves must be 1..64
+adapt_every_past_long_is_minus_one	1	--retier on --retier-promote seabraid --adapt-every 99999999999999999999	--retier needs the adaptive tier's routing counts, which exist only with --adapt-every > 0 AND --adapt-swaps > 0 (got --adapt-every -1, --adapt-swaps 96; counts not allocated)
+adapt_swaps_unicode_digit_reads_zero	1	--retier on --retier-promote seabraid --adapt-swaps ٨	--retier needs the adaptive tier's routing counts, which exist only with --adapt-every > 0 AND --adapt-swaps > 0 (got --adapt-every 4, --adapt-swaps 0; counts not allocated)
+no_adapt_flags_take_engine_defaults	1	--retier on --retier-promote seabraid	-
+adapt_every_zero	1	--retier on --retier-promote seabraid --adapt-every 0	--retier needs the adaptive tier's routing counts, which exist only with --adapt-every > 0 AND --adapt-swaps > 0 (got --adapt-every 0, --adapt-swaps 96; counts not allocated)
+both_adapt_zero	1	--retier on --retier-promote seabraid --adapt-every 0 --adapt-swaps 0	--retier needs the adaptive tier's routing counts, which exist only with --adapt-every > 0 AND --adapt-swaps > 0 (got --adapt-every 0, --adapt-swaps 0; counts not allocated)
+adapt_swaps_atoi_prefix	1	--retier on --retier-promote seabraid --adapt-swaps 8x	-
+adapt_swaps_zero	1	--retier on --retier-promote seabraid --adapt-every 64 --adapt-swaps 0	--retier needs the adaptive tier's routing counts, which exist only with --adapt-every > 0 AND --adapt-swaps > 0 (got --adapt-every 64, --adapt-swaps 0; counts not allocated)
+no_helper_open	0	--retier on --retier-promote seabraid --adapt-every 64 --adapt-swaps 8	--retier needs a seabraid helper tier (SEABRAID_STRATA_SHM with --expert-cache-device1); none is open
+legacy_one_helper_ok	1	--retier on --retier-promote legacy --adapt-every 64 --adapt-swaps 8	-
+legacy_alias_on_one_helper_ok	1	--retier on --retier-promote on --adapt-every 64 --adapt-swaps 8	-
+legacy_two_helpers	2	--retier on --retier-promote legacy --adapt-every 64 --adapt-swaps 8	--retier with --retier-promote legacy serves ONE helper, but SEABRAID_STRATA_SHM lists 2; use --retier-promote seabraid
+legacy_alias_on_two_helpers	2	--retier on --retier-promote on --adapt-every 64 --adapt-swaps 8	--retier with --retier-promote legacy serves ONE helper, but SEABRAID_STRATA_SHM lists 2; use --retier-promote seabraid
+retier_on_alone_two_helpers	2	--retier on --adapt-every 64 --adapt-swaps 8	--retier without --retier-promote seabraid serves ONE helper, but SEABRAID_STRATA_SHM lists 2; use --retier-promote seabraid
+zero_op_alone_three_helpers	3	--retier zero-op --adapt-every 64 --adapt-swaps 8	--retier without --retier-promote seabraid serves ONE helper, but SEABRAID_STRATA_SHM lists 3; use --retier-promote seabraid
+retier_off_two_helpers_ok	2	--retier off	-

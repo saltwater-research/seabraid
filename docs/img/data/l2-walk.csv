@@ -1,0 +1,9 @@
+hop,round,from,to,kind,verified
+1,28,SSD,RAM,fallback,n/a
+2,79,RAM,helper2,fallback,0
+3,79,helper2,helper1,card,1
+4,79,helper1,main,card,1
+5,118,main,helper1,card,1
+6,176,helper1,helper2,card,1
+7,274,helper2,RAM,fallback,0
+8,278,RAM,SSD,fallback,n/a

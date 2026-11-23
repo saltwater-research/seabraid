@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 232" width="880" height="232" role="img" aria-labelledby="t d">
+<title id="t">Decode-path KL and top-1 agreement against the main card alone</title>
+<desc id="d">Pyramid runs C1a and C1b score KL 0.00132 and 0.00130 with top-1 agreement 0.9817 and 0.9858; the noise floor is 0.00135 and 0.985. Gates are KL at most 0.03 and top-1 at least 0.95.</desc>
+<style>
+text{font-family:'Times New Roman',Times,Georgia,serif;fill:#000;font-size:13px}
+.s{font-size:12px}.e{text-anchor:end}.c{text-anchor:middle}
+.rule{stroke:#bbb;stroke-width:.75;fill:none}.box{fill:#fff;stroke:#000;stroke-width:1}
+.up{fill:#1f3a6e;stroke:#1f3a6e}.dn{fill:#888;stroke:#888}.ref{fill:#fff;stroke:#000;stroke-width:1}
+.gate{stroke:#000;stroke-width:1;stroke-dasharray:5 4;fill:none}.ln{stroke-width:1.5;fill:none}.dash{stroke-dasharray:5 3}
+</style>
+<rect width="880" height="232" fill="#fff"/>
+<text x="250" y="24">KL divergence (lower is better)</text>
+<line x1="250" y1="42" x2="250" y2="176" class="rule"/>
+<text x="250" y="194" class="s c">0</text>
+<line x1="312.857" y1="42" x2="312.857" y2="176" class="rule"/>
+<text x="312.857" y="194" class="s c">0.01</text>
+<line x1="375.714" y1="42" x2="375.714" y2="176" class="rule"/>
+<text x="375.714" y="194" class="s c">0.02</text>
+<line x1="438.571" y1="42" x2="438.571" y2="176" class="rule"/>
+<text x="438.571" y="194" class="s c">0.03</text>
+<line x1="438.571" y1="42" x2="438.571" y2="178" class="gate"/>
+<text x="438.571" y="214" class="s c">gate ≤ 0.03</text>
+<circle cx="258.297" cy="64" r="6" class="up"/>
+<text x="258.297" y="52" class="c">0.00132</text>
+<circle cx="258.171" cy="108" r="6" class="dn"/>
+<text x="258.171" y="96" class="c">0.00130</text>
+<circle cx="258.486" cy="152" r="6" class="ref"/>
+<text x="258.486" y="140" class="c">0.00135</text>
+<text x="610" y="24">top-1 agreement (higher is better)</text>
+<line x1="610" y1="42" x2="610" y2="176" class="rule"/>
+<text x="610" y="194" class="s c">0.94</text>
+<line x1="690" y1="42" x2="690" y2="176" class="rule"/>
+<text x="690" y="194" class="s c">0.96</text>
+<line x1="770" y1="42" x2="770" y2="176" class="rule"/>
+<text x="770" y="194" class="s c">0.98</text>
+<line x1="850" y1="42" x2="850" y2="176" class="rule"/>
+<text x="850" y="194" class="s c">1</text>
+<line x1="650" y1="42" x2="650" y2="178" class="gate"/>
+<text x="650" y="214" class="s c">gate ≥ 0.95</text>
+<circle cx="776.8" cy="64" r="6" class="up"/>
+<text x="776.8" y="52" class="c">0.9817</text>
+<circle cx="793.2" cy="108" r="6" class="dn"/>
+<text x="793.2" y="96" class="c">0.9858</text>
+<circle cx="790" cy="152" r="6" class="ref"/>
+<text x="790" y="140" class="c">0.9850</text>
+<text x="20" y="69">pyramid C1a</text>
+<text x="20" y="113">pyramid C1b</text>
+<text x="20" y="157">main card alone M2 (noise floor)</text>
+</svg>

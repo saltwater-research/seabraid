@@ -1,0 +1,46 @@
+[package]
+name = "seabraid"
+version = "0.5.0-alpha.8"
+edition = "2021"
+rust-version = "1.79"
+license = "Apache-2.0"
+description = "Engine-neutral runtime that lets GPUs from different vendors serve one Mixture-of-Experts model at the same layer"
+authors = ["Saltwater Research LLC <dev@saltyresearch.com>"]
+# Public source URL checked by the release export.
+repository = "https://github.com/saltwater-research/seabraid"
+readme = "README.md"
+keywords = ["mixture-of-experts", "moe", "gpu", "inference", "ffi"]
+categories = ["hardware-support", "concurrency"]
+# WHY an allow-list and not exclude: a new top-level directory (scratch, logs, an SDK prefix, tests, docs, compat) must not
+# ride into the crate by default. These are exactly the files `cargo build` reads: src/ (the ABI layout tables it embeds
+# live in src/layout/), the C headers and placement ABI document read by unit tests, build.rs, the lock file (published builds
+# use --locked), and the licence, notice and README. `cargo package --list` in scripts/release shows the result.
+include = [
+    "/src/**",
+    "/include/**",
+    "/docs/PLACEMENT-ABI.md",
+    "/build.rs",
+    "/Cargo.lock",
+    "/VERSION",
+    "/README.md",
+    "/LICENSE",
+    "/LICENSE-MIT",
+    "/NOTICE",
+]
+
+[lib]
+# WHY cdylib only: no Rust code outside src/ links this crate (no integration tests, benches or examples), so an
+# rlib would only be built and thrown away. `cargo test` still runs the unit tests in src/.
+crate-type = ["cdylib"]
+
+[profile.release]
+lto = "thin"
+# Release builds keep integer overflow checks: a wrapped size or count must fail loudly, not index wrongly.
+overflow-checks = true
+# WHY strip: the exported (dynamic) symbols stay, so nothing links or loads differently, and the shipped library
+# is a fifth smaller (813 kB to 628 kB measured). For a symbolised backtrace build with
+# CARGO_PROFILE_RELEASE_STRIP=none.
+strip = "symbols"
+# WHY unwind (the default, stated so nobody "optimises" it to abort): the FFI entry points run behind catch_unwind
+# (src/ffi/guard.rs), so a panic returns SEABRAID_INTERNAL instead of aborting the host process.
+panic = "unwind"

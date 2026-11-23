@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 264" width="720" height="264" role="img" aria-labelledby="t d">
+<title id="t">Placement round step costs</title>
+<desc id="d">Mean and 99th percentile per step over 513 rounds: fence 18.7 and 52.0 ms, stage 7.9 and 35.1, replace 6.0 and 20.2, plan 2.2 and 7.1, publish 0.1 and 0.5.</desc>
+<style>
+text{font-family:'Times New Roman',Times,Georgia,serif;fill:#000;font-size:13px}
+.s{font-size:12px}.e{text-anchor:end}.c{text-anchor:middle}
+.rule{stroke:#bbb;stroke-width:.75;fill:none}.box{fill:#fff;stroke:#000;stroke-width:1}
+.up{fill:#1f3a6e;stroke:#1f3a6e}.dn{fill:#888;stroke:#888}.ref{fill:#fff;stroke:#000;stroke-width:1}
+.gate{stroke:#000;stroke-width:1;stroke-dasharray:5 4;fill:none}.ln{stroke-width:1.5;fill:none}.dash{stroke-dasharray:5 3}
+</style>
+<rect width="720" height="264" fill="#fff"/>
+<rect x="120" y="10" width="10" height="10" class="up"/>
+<text x="136" y="20" class="s">mean</text>
+<circle cx="210" cy="15" r="5" class="ref"/>
+<text x="220" y="20" class="s">99th percentile</text>
+<text x="700" y="20" class="s e">mean / median / p99 (ms)</text>
+<line x1="120" y1="32" x2="120" y2="212" class="rule"/>
+<text x="120" y="230" class="s c">0</text>
+<line x1="206" y1="32" x2="206" y2="212" class="rule"/>
+<text x="206" y="230" class="s c">10</text>
+<line x1="292" y1="32" x2="292" y2="212" class="rule"/>
+<text x="292" y="230" class="s c">20</text>
+<line x1="378" y1="32" x2="378" y2="212" class="rule"/>
+<text x="378" y="230" class="s c">30</text>
+<line x1="464" y1="32" x2="464" y2="212" class="rule"/>
+<text x="464" y="230" class="s c">40</text>
+<line x1="550" y1="32" x2="550" y2="212" class="rule"/>
+<text x="550" y="230" class="s c">50</text>
+<text x="335" y="250" class="s c">time per step (ms)</text>
+<text x="110" y="57" class="e">fence</text>
+<rect x="120" y="42" width="160.82" height="20" class="up"/>
+<line x1="280.82" y1="52" x2="562.2" y2="52" class="ln up"/>
+<circle cx="567.2" cy="52" r="5" class="ref"/>
+<text x="700" y="57" class="e">18.7 / 16.7 / 52.0</text>
+<text x="110" y="93" class="e">stage</text>
+<rect x="120" y="78" width="67.94" height="20" class="up"/>
+<line x1="187.94" y1="88" x2="416.86" y2="88" class="ln up"/>
+<circle cx="421.86" cy="88" r="5" class="ref"/>
+<text x="700" y="93" class="e">7.9 / 6.7 / 35.1</text>
+<text x="110" y="129" class="e">replace</text>
+<rect x="120" y="114" width="51.6" height="20" class="up"/>
+<line x1="171.6" y1="124" x2="288.72" y2="124" class="ln up"/>
+<circle cx="293.72" cy="124" r="5" class="ref"/>
+<text x="700" y="129" class="e">6.0 / 5.5 / 20.2</text>
+<text x="110" y="165" class="e">plan</text>
+<rect x="120" y="150" width="18.92" height="20" class="up"/>
+<line x1="138.92" y1="160" x2="176.06" y2="160" class="ln up"/>
+<circle cx="181.06" cy="160" r="5" class="ref"/>
+<text x="700" y="165" class="e">2.2 / 2.1 / 7.1</text>
+<text x="110" y="201" class="e">publish</text>
+<rect x="120" y="186" width="1.5" height="20" class="up"/>
+<line x1="120.86" y1="196" x2="119.3" y2="196" class="ln up"/>
+<circle cx="124.3" cy="196" r="5" class="ref"/>
+<text x="700" y="201" class="e">0.1 / 0.0 / 0.5</text>
+</svg>

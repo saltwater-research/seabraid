@@ -1,0 +1,228 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Seabraid <seabraid@example.invalid>
+Date: Sat, 1 Jan 2000 00:00:00 +0000
+Subject: [PATCH 18/18] seabraid: name where an expert's bytes live, and send a
+ file reference (wire v9)
+
+FileExpertSource::file_paths() is the files it reads, in the order of
+file_extents(layer, expert, out[3], n): one extent for experts.bin, three
+(gate, up, down) for the GGUF in place, each {file index, length, offset}.
+The extents come from spans(), the function copy_from_files and the page-cache
+probes already read, so a reader that preads them cannot disagree with the
+bytes this source assembles (Span gains the file index it already knew).
+
+RemoteExperts::seabraid_retier_file sends one kTierSwapFile: the FileRef goes
+through channel blob slot 0, same fence, same residency adoption and same
+fail-closed rules as seabraid_retier_blob. Main validates the ref with the wire's
+one file_ref_valid before it submits, and refuses a helper that announced
+file_io 0. Results: kTierApplied; kTierRejected (use bytes); kTierBadSum (the
+helper read other bytes than the manifest); kTierFailed (closes the card).
+
+file_expert_source_test proves, for every cell of a synthetic canonical pack,
+that the bytes at file_extents are the bytes copy_blob assembles, and that a
+cell outside the model or a closed source names nothing.
+---
+ include/strata/core/expert_source.hpp  | 16 +++++++--
+ include/strata/core/remote_experts.hpp |  9 +++++
+ src/core/expert_source.cpp             | 15 ++++++--
+ src/core/remote_experts.cpp            | 25 ++++++++++++++
+ tests/core/file_expert_source_test.cpp | 48 ++++++++++++++++++++++++++
+ 5 files changed, 109 insertions(+), 4 deletions(-)
+
+diff --git a/include/strata/core/expert_source.hpp b/include/strata/core/expert_source.hpp
+index 77e0db42f..ee0d584bf 100644
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -754,6 +754,17 @@ public:
+     void set_extra_drop_files(std::vector<std::string> paths) { extra_drop_files_ = std::move(paths); }
+     /// Whether the experts are read from the GGUF shards in place (no experts.bin).
+     bool gguf_mode() const { return !role_ptr_.empty(); }
++    /// seabraid file moves: the files this source reads, in the order `file_extents` indexes them (experts.bin alone, or the
++    /// GGUF shards native_experts.txt names, in the order they were first mapped).  Empty before `open`.
++    const std::vector<std::string>& file_paths() const { return paths_; }
++    /// One piece of an expert's blob: `length` bytes at `offset` of `file_paths()[file]`.  Integers only, the layout of the
++    /// helper wire's FileExtent (adapters/strata/wire/strata/seabraid/channel_layout.hpp), so a caller copies it across.
++    struct FileExtent { uint32_t file; uint32_t length; uint64_t offset; };
++    /// Where blob (layer, expert) lives in the files, in blob order: one extent for experts.bin, three (gate, up, down) for the
++    /// GGUF in place.  False (n = 0) for a cell outside the model, after drop_mapping, or for a piece over 4 GiB.
++    /// WHY here: the addressing has ONE owner.  The extents come from spans(), the function copy_from_files and the page-cache
++    /// probes already read, so a reader that preads them cannot disagree with the bytes this source assembles.
++    bool file_extents(int64_t layer, int64_t expert, FileExtent out[3], int& n) const;
+     /// Pin a compact host mirror of experts absent from a fully filled static GPU cache. The mmap remains open
+     /// as a fallback for later cache reloads. This is opt-in because the complement may still be a large allocation.
+     ///
+@@ -1220,8 +1231,9 @@ private:
+     mutable std::atomic<uint64_t> io_cached_{0}, io_uncached_{0}, io_pread_bytes_{0}, io_pread_us_{0}, io_pread_n_{0};
+     std::atomic<uint64_t> io_pf_jobs_{0}, io_pf_demand_{0}, io_pf_blobs_{0}, io_pf_skips_{0}, io_pf_dropped_{0}, io_pf_used_{0}, io_pf_unused_{0},
+         io_crit_us_{0}, io_crit_n_{0};
+-    struct Span { const uint8_t* p; uint64_t n; int fd; uint64_t off; uint64_t at; };
+-    /// The (up to 3) file ranges of a blob: pointer in the mapping, size, descriptor and file offset, offset in the blob.
++    struct Span { const uint8_t* p; uint64_t n; int fd; uint64_t off; uint64_t at; size_t file; };
++    /// The (up to 3) file ranges of a blob: pointer in the mapping, size, descriptor and file offset, offset in the blob, index of the
++    /// file in paths_.
+     int spans(int64_t layer, int64_t expert, Span* out) const;
+     /// Bytes of the blob's pages in the page cache (mincore); `total` the blob's bytes.
+     /// `exact` false: four sampled pages (a blob is cached when they are; a handful of syscalls, not hundreds of pages' walk).
+diff --git a/include/strata/core/remote_experts.hpp b/include/strata/core/remote_experts.hpp
+index 65bf4437f..738b26491 100644
+--- a/include/strata/core/remote_experts.hpp
++++ b/include/strata/core/remote_experts.hpp
+@@ -149,6 +149,15 @@ public:
+     /// reads them back before it acks, so "from RAM / the pack to a card" is literally true.  `op` is a kTierSwap (or
+     /// kTierSwapBlob) shape; same fence, same residency adoption, same fail-closed rules as seabraid_retier.  ENGINE THREAD ONLY.
+     bool seabraid_retier_blob(const seabraid::TierWireOp& op, const uint8_t* bytes, size_t n, uint8_t& res, std::string& err);
++    /// seabraid_retier_blob for a swap whose new bytes the HELPER reads itself from the model file (wire v9 kTierSwapFile): the
++    /// FileRef (up to 3 extents + the manifest's XXH3-64 of the blob) goes through channel blob slot 0 and nothing else crosses.
++    /// `file_size[0..file_count)` are the sizes of the files MAIN believes the helper opened (the manifest's), so main refuses a
++    /// ref the helper would refuse (file_ref_valid, the one shared validation) before it submits.  A refused ref, or a helper
++    /// that announced file_io == 0, returns false with `res` untouched and nothing sent.  Otherwise `res` is the helper's result:
++    /// kTierApplied, kTierRejected (bytes are the way), kTierBadSum (the helper read other bytes than the manifest: stop using
++    /// file moves for it) or kTierFailed (closes the card, as for seabraid_retier_blob).  ENGINE THREAD ONLY.
++    bool seabraid_retier_file(const seabraid::TierWireOp& op, const seabraid::FileRef& ref, const uint64_t* file_size,
++                             int32_t file_count, uint8_t& res, std::string& err);
+ 
+     // ---- D4 (STRATA_PREFILL_REMOTE_COMPUTE): while a prompt is read, the expert process computes the experts it holds
+     // (remote_prefill.cpp).  CARD 1 SIDE (a seabraid tier):
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index fe808fdcc..3a5309da6 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -1057,17 +1057,28 @@ int FileExpertSource::spans(int64_t layer, int64_t expert, Span* out) const {
+             const uint64_t per = role_bytes_[i];
+             const uint8_t* p = role_ptr_[i] + (size_t) ((uint64_t) expert * per);
+             const size_t f = (size_t) role_file_[i];
+-            out[r] = {p, per, f < io_fds_.size() ? io_fds_[f] : -1, (uint64_t) (p - maps_[f].base), at};
++            out[r] = {p, per, f < io_fds_.size() ? io_fds_[f] : -1, (uint64_t) (p - maps_[f].base), at, f};
+             at += per;
+         }
+         return 3;
+     }
+     const uint8_t* b = mapped_blob(layer, expert);
+     if (b == nullptr) return 0;
+-    out[0] = {b, layer_blob_bytes_[(size_t) layer], io_fds_.empty() ? -1 : io_fds_[0], (uint64_t) (b - base_), 0};
++    out[0] = {b, layer_blob_bytes_[(size_t) layer], io_fds_.empty() ? -1 : io_fds_[0], (uint64_t) (b - base_), 0, 0};
+     return 1;
+ }
+ 
++bool FileExpertSource::file_extents(int64_t layer, int64_t expert, FileExtent out[3], int& n) const {
++    n = 0;
++    Span sp[3];
++    const int ns = out != nullptr ? spans(layer, expert, sp) : 0;
++    for (int i = 0; i < ns; ++i)   // refuse the whole blob if any piece cannot be named (a FileExtent length is 32 bits)
++        if (sp[i].n == 0 || sp[i].n > 0xFFFFFFFFull || sp[i].file >= paths_.size()) return false;
++    for (int i = 0; i < ns; ++i) out[i] = {(uint32_t) sp[i].file, (uint32_t) sp[i].n, sp[i].off};
++    n = ns;
++    return ns > 0;
++}
++
+ uint64_t FileExpertSource::cached_bytes(int64_t layer, int64_t expert, uint64_t& total, bool exact) const {
+     total = 0;
+ #if defined(__linux__)
+diff --git a/src/core/remote_experts.cpp b/src/core/remote_experts.cpp
+index 3f83654ae..171acd70c 100644
+--- a/src/core/remote_experts.cpp
++++ b/src/core/remote_experts.cpp
+@@ -1,5 +1,6 @@
+ #include "strata/core/remote_experts.hpp"
+ #include "strata/seabraid/channel_names.hpp"
++#include "strata/seabraid/file_ref.hpp"
+ #include "strata/core/device.hpp"   // primary_device() (STRATA_PRIMARY_DEVICE)
+ #include "strata/core/remote_expert_opt.hpp"
+ #include "strata/core/route_hist.hpp"
+@@ -784,6 +785,30 @@ bool RemoteExperts::seabraid_retier_blob(const seabraid::TierWireOp& op, const u
+     return ok;
+ }
+ 
++bool RemoteExperts::seabraid_retier_file(const seabraid::TierWireOp& op, const seabraid::FileRef& ref, const uint64_t* file_size,
++                                        int32_t file_count, uint8_t& res, std::string& err) {
++    if (!bl_) { err = "seabraid retier: no helper channel is open"; return false; }
++    if (op.kind != seabraid::kTierSwap && op.kind != seabraid::kTierSwapFile) { err = "seabraid retier: a file round carries one swap"; return false; }
++    if (op.layer_old != op.layer_new || op.layer_new < 0 || (size_t) op.layer_new >= layers_present_.size()) {
++        err = "seabraid retier: a file swap is same-layer and inside the model"; return false;
++    }
++    if (bl_->header()->file_io == seabraid::kFileIoOff) { err = "seabraid retier: this helper serves no file moves (file_io 0)"; return false; }
++    // The same validation the helper runs, before anything is written: a ref the helper would refuse never reaches the channel.
++    std::string why;
++    const int64_t need = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(op.layer_new);
++    if (!seabraid::file_ref_valid(ref, file_size, file_count, need, bl_->limits().blob_max, why)) { err = "seabraid retier: " + why; return false; }
++    std::lock_guard<std::mutex> lock(read_mu_);   // slot 0 is also the prompt path's, as for a blob swap
++    seabraid::TierWireOp wire = op, plain = op;
++    wire.kind = seabraid::kTierSwapFile; wire.blob_slot = 0; wire.helper = 0;
++    plain.kind = seabraid::kTierSwap; plain.blob_slot = 0;
++    uint8_t r = seabraid::kTierPending;
++    if (bl_closed_.load(std::memory_order_relaxed) != 0) { err = "seabraid retier: this card is CLOSED (an earlier round timed out or tore a slot)"; return false; }
++    if (!seabraid::file_ref_to(bl_->blob(0), bl_->limits().blob_max, ref)) { err = "seabraid retier: a channel blob slot cannot hold a FileRef"; return false; }
++    const bool ok = seabraid_round(&wire, &plain, 1, &r, nullptr, err);
++    res = r;
++    return ok;
++}
++
+ bool RemoteExperts::seabraid_round(const seabraid::TierWireOp* ops, const seabraid::TierWireOp* plain, int32_t n, uint8_t* res,
+                                   std::vector<uint8_t>* claimed, std::string& err) {
+     if (!bl_) { err = "seabraid retier: no helper channel is open"; return false; }
+diff --git a/tests/core/file_expert_source_test.cpp b/tests/core/file_expert_source_test.cpp
+index 1cd85ba0a..4663e35cd 100644
+--- a/tests/core/file_expert_source_test.cpp
++++ b/tests/core/file_expert_source_test.cpp
+@@ -1053,6 +1053,53 @@ void test_replace_resident(bool pin) {
+ 
+ }  // namespace
+ 
++// seabraid file moves: file_extents names exactly the bytes copy_blob assembles (one owner of addressing), for every cell, and
++// refuses a cell outside the model.  A canonical experts.bin pack (one extent per blob); the GGUF in place (three) shares spans().
++void test_file_extents_canonical() {
++    using namespace strata::core;
++    using namespace strata::kernels::cpu;
++    constexpr int64_t layers = 2;
++    constexpr int64_t experts = 3;
++    TempDirectory dir;
++    std::string err;
++    require(expert_layout_load(dir.path.string(), layers, experts, err), "could not load canonical layout: " + err);
++    const uint64_t total = (uint64_t) layers * (uint64_t) experts * BLOB;
++    create_pack(dir.path, total);
++    {   // distinct bytes everywhere, so a wrong offset cannot read the right bytes by luck
++        std::vector<char> bytes((size_t) total);
++        for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = (char) ((i * 131u) ^ (i >> 7) ^ (i >> 15));
++        std::ofstream out(dir.path / "experts.bin", std::ios::binary | std::ios::trunc);
++        out.write(bytes.data(), (std::streamsize) bytes.size());
++        require((bool) out, "could not fill synthetic experts.bin");
++    }
++    FileExpertSource source;
++    require(source.open(dir.path.string(), layers, experts, err), "could not map canonical pack: " + err);
++    require(source.file_paths().size() == 1 && fs::path(source.file_paths()[0]).filename() == "experts.bin",
++            "a canonical pack reads exactly one file, experts.bin");
++    std::ifstream file(source.file_paths()[0], std::ios::binary);
++    std::vector<char> assembled((size_t) BLOB), from_file((size_t) BLOB);
++    for (int64_t l = 0; l < layers; ++l)
++        for (int64_t e = 0; e < experts; ++e) {
++            FileExpertSource::FileExtent ex[3];
++            int n = -1;
++            require(source.file_extents(l, e, ex, n) && n == 1 && ex[0].file == 0 && ex[0].length == (uint32_t) BLOB,
++                    "a canonical blob is one extent of BLOB bytes in file 0");
++            require(source.copy_blob(l, e, (uint8_t*) assembled.data()), "copy_blob failed");
++            file.clear();
++            file.seekg((std::streamoff) ex[0].offset);
++            file.read(from_file.data(), (std::streamsize) from_file.size());
++            require((bool) file && assembled == from_file, "the bytes at file_extents are not the bytes copy_blob assembles");
++        }
++    FileExpertSource::FileExtent ex[3];
++    int n = 7;
++    require(!source.file_extents(-1, 0, ex, n) && n == 0 && !source.file_extents(0, -1, ex, n) &&
++                !source.file_extents(layers, 0, ex, n) && !source.file_extents(0, experts, ex, n) &&
++                !source.file_extents(0, 0, nullptr, n),
++            "file_extents accepted a cell outside the model or a null output");
++    source.close();
++    require(source.file_paths().empty() && !source.file_extents(0, 0, ex, n), "a closed source still names files");
++}
++
+ int main(int argc, char** argv) {
+     try {
+         test_complement_plan();
+@@ -1066,6 +1113,7 @@ int main(int argc, char** argv) {
+         test_cgroup_memory_budget();
+         test_host_memory();
+         test_canonical_layout();
++        test_file_extents_canonical();
+         test_unbuffered_reads();
+         test_io_prefetch();
+ #if defined(STRATA_NATIVE_EXPERTS)
