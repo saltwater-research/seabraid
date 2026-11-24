@@ -126,13 +126,18 @@ def commit_tree(ctx: core.Ctx, root: Path, version: str) -> str:
         rc, out = core.git(ctx, root, *args)
         if rc != 0:
             raise core.Refuse(f"git {args[0]} failed: {out}")
-    env = core.author_env()
+    env = core.author_env(ctx.repo)
     for args in (["commit", "-q", "-m", f"{ctx.name} {version}"], ["tag", "-a", tag, "-m", f"{ctx.name} {version}"]):
         rc, out = core.git(ctx, root, *args, extra_env=env)
         if rc != 0:
             raise core.Refuse(f"git {args[0]} failed: {out}")
     rc, sha = core.git(ctx, root, "rev-parse", "HEAD")
     return sha.strip()
+
+
+def commit_identity(ctx: core.Ctx, root: Path) -> str:
+    """The author and committer actually recorded in the export commit, read back from git, never assumed."""
+    return core.git(ctx, root, "log", "-1", "--format=%an <%ae>")[1].strip()
 
 
 def junk_problems(root: Path) -> list[str]:
@@ -214,7 +219,7 @@ def fill_and_check(ctx: core.Ctx, dest: Path) -> bool:
 def commit_and_prove(ctx: core.Ctx, dest: Path, version: str) -> bool:
     sha = commit_tree(ctx, dest, version)
     problems = prove_commit_complete(ctx, dest)
-    ctx.rep.add(STAGE, "FAIL" if problems else "PASS", f"one commit {sha[:12]} by {core.AUTHOR_NAME} <{core.AUTHOR_EMAIL}>, tag v{version}, holding every file" if not problems else "the export commit is wrong", "\n".join(problems[:20]))
+    ctx.rep.add(STAGE, "FAIL" if problems else "PASS", f"one commit {sha[:12]} by {commit_identity(ctx, dest)}, tag v{version}, holding every file" if not problems else "the export commit is wrong", "\n".join(problems[:20]))
     ctx.state.update(export_commit=sha, tag=f"v{version}")
     return not problems
 

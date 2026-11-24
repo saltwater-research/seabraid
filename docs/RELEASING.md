@@ -106,7 +106,7 @@ the same patch series.  A unit file written by an older installer is never edite
   example). If `--name` is the tree's own name (Seabraid), no rename happens; the export is still checked that the retired name is gone.
 - **The private dev repository keeps its full history.** The first public version goes to a fresh repository: one
   commit of the scrubbed tree (hardware models, tests and benchmarks stay; machine paths, addresses, tokens and personal
-  addresses go), author and committer `Saltwater Research LLC <dev@saltyresearch.com>` (owner decision, 2026-11-21; the private dev repository keeps its own identity), no trailers, UTC timestamps, and the tag `v<VERSION>`.
+  addresses go), authored and committed by whoever runs the release, under their own git identity (`git config user.name` and `user.email` of the dev repository; owner decision, 2026-11-24: each member or associate is responsible for their own releases). The email must be a GitHub noreply address (`<id>+<login>@users.noreply.github.com`, see github.com/settings/emails) or the project contact, because a public commit's email is permanent; the script refuses anything else. Also turn on GitHub's "Keep my email addresses private" so web merges do not expose a personal address. No trailers, UTC timestamps, and the tag `v<VERSION>`.
 - **A dry run is the default.** Without `--publish` every stage runs for real up to the uploads (checks, export,
   builds, `twine check`, `cargo package`, `cargo publish --dry-run`), then the publish stage only prints the commands it
   would run and stops.
