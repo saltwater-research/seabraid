@@ -35,10 +35,7 @@ GATES = ("local-checks", "pytest", "manual")  # names accepted by --skip-gate
 STAGE_GATES = {"preflight": GATES, "export": ("local-checks", "pytest"), "build": ()}
 # WHY a default: the owner decided on 2026-11-21 that the public repository lives under this organisation; --github-owner still overrides it.
 DEFAULT_OWNER = "saltwater-research"
-# WHY the LLC and not the dev identity: owner, 2026-11-21, "This project specifically will be tagged with dev@saltyresearch.com";
-# the public squash names the copyright holder. The private dev repository keeps its own commit identity.
-AUTHOR_NAME = "Saltwater Research LLC"
-AUTHOR_EMAIL = rel_secrets.PUBLIC_CONTACT
+NOREPLY = re.compile(r"^[^@\s]+@users\.noreply\.github\.com$", re.IGNORECASE)
 SENSITIVE_ENV = re.compile(r"(?i)(TOKEN|PASSWORD|PASSWD|SECRET|API_?KEY|CREDENTIAL)")
 
 
@@ -275,12 +272,35 @@ def git(ctx: Ctx, cwd: Path | str, *args: str, extra_env: dict | None = None) ->
     return ctx.run(["git", *args], cwd, extra_env)
 
 
-def author_env() -> dict:
-    """Identity and a UTC timestamp for the one export commit.  WHY UTC: a local offset would tell where the owner lives."""
+def release_identity(repo: Path | str) -> tuple[str, str]:
+    """The (name, email) of whoever runs the release: ``git config user.name`` and ``user.email`` of the dev repository.
+
+    WHY the runner and not a fixed identity: owner, 2026-11-24, each member merges and releases under their own identity.
+    WHY the email is restricted: a public commit's email is permanent, and an LLC member's personal address leaked through
+    a web merge on 2026-11-24; only a GitHub noreply address or the project contact may reach a public commit.
+    FAILURE: unset name or email, or any other address, is a ``Refuse`` with the fix in the message.
+    """
+    def read(key: str) -> str:
+        done = subprocess.run(["git", "config", "--get", key], cwd=str(repo), capture_output=True, text=True)
+        return done.stdout.strip() if done.returncode == 0 else ""
+    name, email = read("user.name"), read("user.email")
+    if not name or not email:
+        raise Refuse("git user.name and user.email are not both set in the dev repository; the export commit is authored by you. "
+                     "Fix: git config user.name \"<your name>\" and git config user.email <id>+<login>@users.noreply.github.com")
+    if not (NOREPLY.match(email) or email.lower() == rel_secrets.PUBLIC_CONTACT):
+        raise Refuse(f"git user.email is {email!r}; a public commit's email is permanent, so only a GitHub noreply address or "
+                     f"{rel_secrets.PUBLIC_CONTACT} is allowed. Fix: git config user.email <id>+<login>@users.noreply.github.com "
+                     "(your id and login are at github.com/settings/emails)")
+    return name, email
+
+
+def author_env(repo: Path | str) -> dict:
+    """Identity (see ``release_identity``) and a UTC timestamp for the one export commit.  WHY UTC: a local offset would tell where the runner lives."""
+    name, email = release_identity(repo)
     stamp = f"{int(time.time())} +0000"
     return {
-        "GIT_AUTHOR_NAME": AUTHOR_NAME, "GIT_AUTHOR_EMAIL": AUTHOR_EMAIL, "GIT_AUTHOR_DATE": stamp,
-        "GIT_COMMITTER_NAME": AUTHOR_NAME, "GIT_COMMITTER_EMAIL": AUTHOR_EMAIL, "GIT_COMMITTER_DATE": stamp,
+        "GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email, "GIT_AUTHOR_DATE": stamp,
+        "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email, "GIT_COMMITTER_DATE": stamp,
     }
 
 

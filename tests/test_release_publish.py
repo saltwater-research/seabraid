@@ -44,7 +44,7 @@ FINAL = "tidewrack" if OLD != "tidewrack" else "reefmark"  # any name other than
 OWNER = "acme-test"
 REPO_URL = urllib.parse.urlunsplit(("https", "github.com", f"/{OWNER}/{FINAL}", "", ""))
 SKIP = ["--skip-gate", "local-checks", "--skip-gate", "pytest", "--skip-gate", "manual"]
-ID = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+ID = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "1+t@users.noreply.github.com", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "1+t@users.noreply.github.com"}
 
 
 
@@ -78,6 +78,8 @@ def dev(tmp_path_factory):
     cff = (root / "CITATION.cff").read_text(encoding="utf-8")
     (root / "CITATION.cff").write_text(re.sub(r"(?m)^date-released: \S+", f"date-released: {datetime.date.today().isoformat()}", cff), encoding="utf-8", newline="\n")
     git(root, "init", "-q", "-b", "main")
+    git(root, "config", "user.name", "t")
+    git(root, "config", "user.email", ID["GIT_AUTHOR_EMAIL"])
     git(root, "config", "core.autocrlf", "false")
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "dev tree")
@@ -161,11 +163,11 @@ def is_outward(line: str) -> bool:
     return line.startswith("gh ") or "upload" in line or (line.startswith("cargo publish") and "--dry-run" not in line)
 
 
-def test_export_is_one_commit_by_the_public_identity_with_no_trailers(dry):
+def test_export_is_one_commit_by_the_runner_with_no_trailers(dry):
     work, _, _ = dry
     export = work / "export"
     assert git(export, "rev-list", "--count", "HEAD").strip() == "1"
-    assert git(export, "log", "-1", "--format=%an|%ae|%cn|%ce").strip() == "Saltwater Research LLC|dev@saltyresearch.com|Saltwater Research LLC|dev@saltyresearch.com"
+    assert git(export, "log", "-1", "--format=%an|%ae|%cn|%ce").strip() == "t|1+t@users.noreply.github.com|t|1+t@users.noreply.github.com"
     message = git(export, "log", "-1", "--format=%B").strip()
     assert "\n" not in message and "Co-Authored" not in message
     assert git(export, "log", "-1", "--format=%(trailers)").strip() == ""

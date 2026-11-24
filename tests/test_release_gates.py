@@ -14,6 +14,8 @@ import json
 import os
 import sys
 
+import pytest
+
 from conftest import REPO, run_tool
 
 sys.path.insert(0, os.path.join(REPO, "scripts", "release"))
@@ -65,3 +67,51 @@ def test_zenodo_metadata_names_no_paper_doi():
     with open(os.path.join(REPO, ".zenodo.json"), encoding="utf-8") as fh:
         meta = json.load(fh)
     assert "related_identifiers" not in meta, "no paper DOI exists yet; an entry would be published as a real citation"
+
+
+# ---- the release identity: the runner's own git identity, never a fixed one ---------------------------------------------
+
+def _repo_with(tmp_path, name=None, email=None):
+    import subprocess
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    for key, value in (("user.name", name), ("user.email", email)):
+        if value:
+            subprocess.run(["git", "config", key, value], cwd=tmp_path, check=True)
+    return tmp_path
+
+
+@pytest.fixture()
+def isolated_git(monkeypatch, tmp_path):
+    """WHY: the machine's global and system git config must not supply an identity the test did not set."""
+    empty = tmp_path / "empty-gitconfig"
+    empty.write_text("", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(empty))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
+@pytest.mark.parametrize("name,email", [(None, None), ("t", None), (None, "1+t@users.noreply.github.com")])
+def test_identity_refuses_when_name_or_email_is_unset(isolated_git, tmp_path, name, email):
+    from rel_core import Refuse, release_identity
+    with pytest.raises(Refuse, match="user.name and user.email are not both set"):
+        release_identity(_repo_with(tmp_path / "r", name, email))
+
+
+def test_identity_refuses_a_personal_address_with_the_fix(isolated_git, tmp_path):
+    from rel_core import Refuse, release_identity
+    personal = "someone" + "@" + "gmail" + ".com"  # WHY assembled: the tree scan must not see a literal address
+    with pytest.raises(Refuse) as err:
+        release_identity(_repo_with(tmp_path / "r", "t", personal))
+    assert "git config user.email <id>+<login>@users.noreply.github.com" in str(err.value) and "github.com/settings/emails" in str(err.value)
+
+
+def test_identity_accepts_noreply_and_the_project_contact(isolated_git, tmp_path):
+    import rel_secrets
+    from rel_core import release_identity
+    assert release_identity(_repo_with(tmp_path / "a", "t", "1+t@users.noreply.github.com")) == ("t", "1+t@users.noreply.github.com")
+    assert release_identity(_repo_with(tmp_path / "b", "t", rel_secrets.PUBLIC_CONTACT)) == ("t", rel_secrets.PUBLIC_CONTACT)
+
+
+def test_author_env_gives_author_and_committer_the_same_runner_identity(isolated_git, tmp_path):
+    from rel_core import author_env
+    env = author_env(_repo_with(tmp_path / "r", "t", "1+t@users.noreply.github.com"))
+    assert (env["GIT_AUTHOR_NAME"], env["GIT_AUTHOR_EMAIL"]) == (env["GIT_COMMITTER_NAME"], env["GIT_COMMITTER_EMAIL"]) == ("t", "1+t@users.noreply.github.com")

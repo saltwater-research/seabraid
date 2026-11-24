@@ -38,7 +38,7 @@ import rel_upload  # noqa: E402
 OLD = guard.PROVISIONAL[0]  # WHY read, never spelled: scripts/rename.py would rewrite a spelled name in the export of this very file
 NAME, OWNER, VERSION = "tidewrack", "acme-test", "0.5.0-alpha.2"
 SECRETS = {"TWINE_PASSWORD": "pypi-AgENsecretvalue123", "CARGO_REGISTRY_TOKEN": "cioSECRETvalue456789", "GH_TOKEN": "ghp_" + "a" * 36}
-ID = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+ID = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "1+t@users.noreply.github.com", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "1+t@users.noreply.github.com"}
 
 
 REGISTRY_ASKS = (["gh", "repo", "view"], ["gh", "release", "view"], ["cargo", "info"])
@@ -287,6 +287,8 @@ def tree(tmp_path):
     (root / "VERSION").write_text("1.0.0\n", encoding="utf-8")
     (root / ".zenodo.json").write_text('{"title": "t"}', encoding="utf-8")
     git(root, "init", "-q", "-b", "main")
+    git(root, "config", "user.name", "t")
+    git(root, "config", "user.email", ID["GIT_AUTHOR_EMAIL"])
     git(root, "config", "core.autocrlf", "false")
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "dev")
