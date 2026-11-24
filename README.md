@@ -169,15 +169,21 @@ It was tested on one Linux machine. The build requirements are listed below.
 
 ## Quickstart
 
-The product name is final: Seabraid (decided 2026-11-21).
-
 Use the [user guide](docs/USER-GUIDE.md) to choose a setup path. If you're
 developing an engine, start with [engine integration](docs/ENGINE-INTEGRATION.md).
 
-You can run the Python example without a GPU. `pip install seabraid` is
-**not available yet** because nothing has been published. Stock Ubuntu blocks
-`pip install` outside a virtual environment (PEP 668) and provides no `python`
-command outside one. Create a venv from the repository root.
+Install the published package on Linux x86-64 (glibc 2.34 or newer). Stock Ubuntu
+blocks `pip install` outside a virtual environment (PEP 668), so use a venv:
+
+```sh
+python3 -m venv .venv && . .venv/bin/activate
+pip install seabraid
+```
+
+For Rust, run `cargo add seabraid`. PyPI has a Linux x86-64 wheel only, so on
+Windows and macOS build from source as shown below.
+
+You can run the Python example without a GPU. From a checkout of this repository:
 
 ```sh
 python3 -m venv .venv && . .venv/bin/activate
