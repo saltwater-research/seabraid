@@ -20,8 +20,18 @@ KEY = "k" * 24
 SH = shutil.which("sh")
 
 
+_REAL_FSTAT = os.fstat
+
+
 def fake_stat(mode=0o600, uid=1000, kind=stat.S_IFREG):
-    return lambda path: SimpleNamespace(st_mode=kind | mode, st_uid=uid)
+    """Override mode and owner on top of the real fstat result.  WHY keep the other fields: the patch is process-wide and
+    pytest 9 itself calls os.fstat (it reads st_size) while it is active, so a two-field namespace broke the run."""
+    def fake(fd):
+        real = _REAL_FSTAT(fd)
+        fields = {name: getattr(real, name) for name in dir(real) if name.startswith("st_")}
+        fields.update(st_mode=kind | mode, st_uid=uid)
+        return SimpleNamespace(**fields)
+    return fake
 
 
 @pytest.mark.parametrize("host", ["127.0.0.1", "127.1.2.3", "localhost", "LOCALHOST", "::1", "[::1]"])
