@@ -101,6 +101,6 @@ The ABI is not frozen. Status of each item, checked against the tree:
   source build. Done: `scripts/build_wheel.py` builds a Linux x86_64 wheel that
   bundles the library (`seabraid.bundled_library()`) with a glibc-derived
   manylinux tag. Remaining: the Windows and macOS wheels exist only as a CI job
-  that has not run, so they are unbuilt until it does; nothing is published.
+  that has not run, so they are unbuilt until it does. Only the Linux x86_64 wheel is on PyPI.
 - A published SDK archive per platform.
 - Windows build and handoff support for the Strata adapter.
