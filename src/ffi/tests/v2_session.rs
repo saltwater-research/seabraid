@@ -38,12 +38,13 @@ unsafe extern "C" fn record_half(
     seen.epoch = batch.placement_epoch;
     seen.origins = batch.source_modalities;
     seen.called = 1;
-    for i in 0..4.min(batch.activation_count) {
-        seen.halves[i] = unsafe { *halves.add(i) };
+    let given = batch.activation_count;
+    for (i, half) in seen.halves.iter_mut().enumerate().take(given) {
+        *half = unsafe { *halves.add(i) };
     }
     // The output carries the raw bits so the test also checks the bytes survive a round trip to the caller.
-    for i in 0..count.min(4) {
-        unsafe { *output.add(i) = f32::from(seen.halves[i]) };
+    for (i, half) in seen.halves.iter().enumerate().take(count) {
+        unsafe { *output.add(i) = f32::from(*half) };
     }
     0
 }
