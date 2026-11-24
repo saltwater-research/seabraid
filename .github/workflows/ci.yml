@@ -42,7 +42,7 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
           # PyYAML and numpy keep workflow-policy and provider tests from skipping. Require wheels for both pins.
-          python -m pip install --disable-pip-version-check --only-binary=:all: pytest PyYAML==6.0.3 numpy==2.4.6
+          python -m pip install --disable-pip-version-check --only-binary=:all: pytest PyYAML==6.0.3 numpy==2.4.6 "setuptools>=77"
       - name: Install lizard
         # WHY here: the complexity checker (CCN <= 10; documented exceptions up to 15 live in checks/complexity_allow.txt;
         # checks/check_complexity.py owns the rule) needs lizard, and it runs in the Release checkers step below.
@@ -399,12 +399,12 @@ jobs:
           nvidia/cuda:12.9.1-devel-ubuntu24.04 sh -c 'apt-get update &&
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build &&
           sh /source/compat/strata/tests/run_engine_helper_loss.sh /source/strata /tmp/strata-tests'
-      - name: Compat host tests with pinned xxHash, then helper syntax checks
+      - name: Compat host tests with pinned xxHash, then helper syntax checks (CUDA image, the helpers include cuda_runtime.h)
         run: |
           cmake -S compat/strata/tests -B build-compat -DCMAKE_BUILD_TYPE=Release -DSTRATA_SOURCE="$GITHUB_WORKSPACE/strata"
           cmake --build build-compat --parallel
           ctest --test-dir build-compat --no-tests=error --output-on-failure
-          for f in helper helper_serve card_bench card_bench_run; do g++ -std=c++20 -fsyntax-only -Wall -Wextra -Icompat/strata/strata-ext/include -Icompat/strata/strata-ext/src -Iadapters/strata/wire -I"$GITHUB_WORKSPACE/strata/include" "compat/strata/strata-ext/src/$f.cpp"; done
+          docker run --rm -v "$GITHUB_WORKSPACE:/source:ro" -w /source nvidia/cuda:12.9.1-devel-ubuntu24.04 sh -c 'for f in helper helper_serve card_bench card_bench_run; do g++ -std=c++20 -fsyntax-only -Wall -Wextra -I/usr/local/cuda/include -Icompat/strata/strata-ext/include -Icompat/strata/strata-ext/src -Iadapters/strata/wire -I/source/strata/include "compat/strata/strata-ext/src/$f.cpp" || exit 1; done'
 
   miri:
     # Miri checks the Rust FFI layer for undefined behaviour (aliasing, bad pointers, uninitialised reads), which ASan and
