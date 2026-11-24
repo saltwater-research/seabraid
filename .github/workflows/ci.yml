@@ -42,7 +42,7 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
           # PyYAML and numpy keep workflow-policy and provider tests from skipping. Require wheels for both pins.
-          python -m pip install --disable-pip-version-check --only-binary=:all: pytest PyYAML==6.0.3 numpy==2.4.6
+          python -m pip install --disable-pip-version-check --only-binary=:all: pytest PyYAML==6.0.3 numpy==2.4.6 "setuptools>=77"
       - name: Install lizard
         # WHY here: the complexity checker (CCN <= 10; documented exceptions up to 15 live in checks/complexity_allow.txt;
         # checks/check_complexity.py owns the rule) needs lizard, and it runs in the Release checkers step below.
